@@ -1,0 +1,99 @@
+name: Uyku ve Tarih - Pilot Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: "Video konusu"
+        required: true
+        default: "MÖ 1200'de Hattuşa'nın son gecesi"
+        type: string
+      duration_minutes:
+        description: "Hedef süre"
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "2"
+          - "5"
+          - "10"
+      visual_count:
+        description: "Kullanılacak görsel sayısı"
+        required: true
+        default: "8"
+        type: choice
+        options:
+          - "6"
+          - "8"
+          - "12"
+          - "18"
+      test_mode:
+        description: "İlk denemede açık bırak; Gemini anahtarı istemez"
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: uyku-tarih-video
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    name: Videoyu üret
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    env:
+      VIDEO_TOPIC: ${{ inputs.topic }}
+      DURATION_MINUTES: ${{ inputs.duration_minutes }}
+      VISUAL_COUNT: ${{ inputs.visual_count }}
+      TEST_MODE: ${{ inputs.test_mode }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: gemini-2.5-flash-lite
+      PIPER_VOICE: tr_TR-dfki-medium
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Projeyi al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Sistem araçlarını kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg espeak-ng fonts-dejavu-core
+
+      - name: Python paketlerini kur
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Türkçe Piper sesini önbelleğe al
+        uses: actions/cache@v4
+        with:
+          path: voices
+          key: piper-tr_TR-dfki-medium-v1
+
+      - name: Türkçe ses modelini indir
+        run: |
+          mkdir -p voices
+          if [ ! -f "voices/tr_TR-dfki-medium.onnx" ]; then
+            python -m piper.download_voices tr_TR-dfki-medium --data-dir voices
+          fi
+
+      - name: Videoyu oluştur
+        run: python src/main.py
+
+      - name: Sonucu indirilebilir dosya olarak kaydet
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uyku-tarih-cikti-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7
