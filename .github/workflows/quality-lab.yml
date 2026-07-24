@@ -1,0 +1,87 @@
+name: Uyku ve Tarih - Profesyonel Kalite Testi
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: "Test konusu"
+        required: true
+        default: "MÖ 1200'de Hattuşa'nın son gecesi"
+        type: string
+      preview_seconds:
+        description: "Önizleme süresi"
+        required: true
+        default: "75"
+        type: choice
+        options:
+          - "60"
+          - "75"
+          - "90"
+      visual_count:
+        description: "Storyboard sahne sayısı"
+        required: true
+        default: "12"
+        type: choice
+        options:
+          - "10"
+          - "12"
+          - "15"
+
+concurrency:
+  group: uyku-tarih-quality-lab
+  cancel-in-progress: true
+
+jobs:
+  quality-lab:
+    name: Ses ve görsel kalite testini üret
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      VIDEO_TOPIC: ${{ inputs.topic }}
+      PREVIEW_SECONDS: ${{ inputs.preview_seconds }}
+      VISUAL_COUNT: ${{ inputs.visual_count }}
+      TEXT_MODEL: gemini-2.5-flash
+      TTS_MODEL: gemini-2.5-flash-preview-tts
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Projeyi al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements-v2.txt
+
+      - name: FFmpeg ve fontları kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: V2 paketlerini kur
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-v2.txt
+
+      - name: Anahtar kontrolü
+        run: |
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "::error::GEMINI_API_KEY GitHub Secret bulunamadı."
+            exit 1
+          fi
+
+      - name: Profesyonel kalite testini üret
+        run: python src/quality_lab.py
+
+      - name: Sonuçları kaydet
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profesyonel-kalite-testi-${{ github.run_number }}
+          path: output-v2/
+          if-no-files-found: warn
+          retention-days: 7
