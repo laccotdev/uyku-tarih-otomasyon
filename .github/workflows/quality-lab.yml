@@ -42,8 +42,8 @@ jobs:
       VIDEO_TOPIC: ${{ inputs.topic }}
       PREVIEW_SECONDS: ${{ inputs.preview_seconds }}
       VISUAL_COUNT: ${{ inputs.visual_count }}
-      TEXT_MODEL: gemini-2.5-flash
-      TTS_MODEL: gemini-2.5-flash-preview-tts
+     TEXT_MODEL: gemini-3.5-flash
+TTS_MODEL: gemini-3.1-flash-tts-preview
       PYTHONUNBUFFERED: "1"
 
     steps:
