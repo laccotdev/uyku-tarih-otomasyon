@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/6.0"
+USER_AGENT = "UykuTarihTopicToVideo/6.1"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -1081,6 +1081,126 @@ def generate_json_with_parts(
     raise RuntimeError(f"Görsel inceleme başarısız: {last_error}")
 
 
+def _fatal_candidate_reason(reason: str, score: int) -> bool:
+    normalized = re.sub(r"\s+", " ", str(reason or "")).lower()
+    fatal_markers = (
+        "tamamen siyah",
+        "completely black",
+        "boş görüntü",
+        "blank image",
+        "hiçbir sahne unsuru",
+        "geçerli sahne yok",
+        "yazı veya logo",
+        "text or logo",
+        "filigran",
+        "watermark",
+        "ağır anatomi",
+        "severe anatomy",
+    )
+    return score < 28 or any(marker in normalized for marker in fatal_markers)
+
+
+def _deterministic_repair_prompt(
+    topic: str,
+    payload: dict[str, Any],
+    scene: dict[str, Any],
+    critic_reason: str,
+) -> tuple[str, str]:
+    world = _compact_text(_world_bible_text(payload), 480)
+    goal = _compact_text(scene.get("visual_goal", ""), 330)
+    narration = _compact_text(
+        scene.get("narration_text") or scene.get("narration_idea", ""),
+        260,
+    )
+    reason = _compact_text(critic_reason, 230)
+
+    prompt = _fit_prompt([
+        f"Historically accurate reconstruction for this topic: {topic}",
+        f"Show exactly this scene: {goal}",
+        f"Narrative context: {narration}",
+        f"Historical production bible: {world}",
+        f"Correct the previous generation problem: {reason}",
+        (
+            "One clear cinematic 16:9 documentary frame, physically plausible "
+            "period architecture, clothing, tools and geography. No generic "
+            "fantasy, no later-era architecture, no modern urban features."
+        ),
+    ])
+    negative = _compact_text(
+        (
+            f"{combined_negative(scene)}, modern city, medieval town, "
+            "renaissance palace, fantasy set, generic catalog composition, "
+            "wrong civilization, wrong century"
+        ),
+        MAX_NEGATIVE_PROMPT_CHARS,
+    )
+    return prompt, negative
+
+
+def _critic_guided_repair_prompt(
+    client: genai.Client,
+    topic: str,
+    payload: dict[str, Any],
+    scene: dict[str, Any],
+    critic_reason: str,
+) -> tuple[str, str]:
+    world = _compact_text(_world_bible_text(payload), 1500)
+    prompt = f"""
+Yalnızca geçerli JSON üret:
+{{
+  "image_prompt": "English prompt",
+  "negative_prompt": "English negative prompt"
+}}
+
+You are repairing a rejected historical documentary image prompt.
+
+TOPIC:
+{topic}
+
+SCENE GOAL:
+{scene.get("visual_goal", "")}
+
+SCENE NARRATION:
+{scene.get("narration_text") or scene.get("narration_idea", "")}
+
+HISTORICAL WORLD BIBLE:
+{world}
+
+CRITIC FEEDBACK ABOUT THE FAILED IMAGE:
+{critic_reason}
+
+Write one concise English image prompt that fixes the critic feedback.
+It must identify the correct era, location, architecture, materials, clothing,
+lighting, camera distance and the exact action or setting.
+Do not write a generic ancient city.
+Keep image_prompt below 900 characters.
+Keep negative_prompt below 260 characters.
+No text, logos, modern objects, fantasy, later-era architecture or wrong civilization.
+"""
+    try:
+        repaired, _ = generate_json(client, prompt, max_tokens=1600)
+        image_prompt = _fit_prompt([
+            str(repaired.get("image_prompt", "")),
+            (
+                "Photorealistic premium historical documentary frame, "
+                "restrained blue-black moonlight and subtle amber practical light, "
+                "16:9, coherent with the same film."
+            ),
+        ])
+        negative = _compact_text(
+            str(repaired.get("negative_prompt", "")) + ", " + GLOBAL_NEGATIVE,
+            MAX_NEGATIVE_PROMPT_CHARS,
+        )
+        if len(image_prompt) >= 80:
+            return image_prompt, negative
+    except Exception as exc:
+        print("Critic-guided prompt rewrite failed; deterministic repair used:", exc)
+
+    return _deterministic_repair_prompt(
+        topic, payload, scene, critic_reason
+    )
+
+
 def generate_scene_image(
     client: genai.Client,
     topic: str,
@@ -1098,6 +1218,7 @@ def generate_scene_image(
     best_file = WORK / f"best-scene-{int(scene['scene_id']):02d}.jpg"
     best_file.unlink(missing_ok=True)
 
+    # First pass: normal scene prompt and model fallbacks.
     for attempt, model in enumerate(models[:max_attempts], start=1):
         seed = deterministic_seed(topic, int(scene["scene_id"]), attempt)
         try:
@@ -1106,7 +1227,11 @@ def generate_scene_image(
                 f"deneme={attempt}/{max_attempts}"
             )
             cloudflare_image_request(
-                combined_prompt(payload, scene), combined_negative(scene), seed, target, model
+                combined_prompt(payload, scene),
+                combined_negative(scene),
+                seed,
+                target,
+                model,
             )
             passed, score, reason = image_review(client, scene, target)
             print(f"Görsel değerlendirmesi: pass={passed}; score={score}; {reason}")
@@ -1140,21 +1265,99 @@ def generate_scene_image(
                 ) from exc
             time.sleep(min(8, 2 * attempt))
 
-    if best_file.exists() and best_score >= 48:
+    # Second pass: use the critic's reason to rewrite only this scene prompt.
+    repair_reason = best_reason or str(last_error or "The image did not match the scene.")
+    repair_prompt, repair_negative = _critic_guided_repair_prompt(
+        client, topic, payload, scene, repair_reason
+    )
+    preferred_models = list(dict.fromkeys([
+        "@cf/black-forest-labs/flux-2-klein-4b",
+        *models,
+    ]))[:2]
+
+    for repair_attempt, model in enumerate(preferred_models, start=1):
+        seed = deterministic_seed(
+            topic,
+            int(scene["scene_id"]),
+            100 + repair_attempt,
+        )
+        try:
+            print(
+                f"QUALITY RECOVERY scene={scene['scene_id']}, "
+                f"model={model}, repair={repair_attempt}/{len(preferred_models)}"
+            )
+            cloudflare_image_request(
+                repair_prompt,
+                repair_negative,
+                seed,
+                target,
+                model,
+            )
+            passed, score, reason = image_review(client, scene, target)
+            print(
+                f"QUALITY RECOVERY review: pass={passed}; "
+                f"score={score}; {reason}"
+            )
+
+            if score > best_score:
+                shutil.copyfile(target, best_file)
+                best_score = score
+                best_reason = reason
+                best_model = model
+                best_seed = seed
+
+            # Repair result receives a slightly lower acceptance threshold,
+            # because the critic-guided prompt has already addressed the failure.
+            if passed or (
+                score >= 58
+                and not _fatal_candidate_reason(reason, score)
+            ):
+                return {
+                    "scene_id": scene["scene_id"],
+                    "model": model,
+                    "seed": seed,
+                    "review_score": score,
+                    "review": reason,
+                    "quality_recovery": True,
+                    "file": target.name,
+                }
+            target.unlink(missing_ok=True)
+        except Exception as exc:
+            last_error = exc
+            target.unlink(missing_ok=True)
+            print(f"QUALITY RECOVERY failed ({model}): {exc}")
+
+    # Do not throw away the entire video for a usable but imperfect image.
+    if (
+        best_file.exists()
+        and best_score >= 38
+        and not _fatal_candidate_reason(best_reason, best_score)
+    ):
         shutil.copyfile(best_file, target)
+        print(
+            f"QUALITY RECOVERY fallback accepted: scene={scene['scene_id']}, "
+            f"score={best_score}"
+        )
         return {
             "scene_id": scene["scene_id"],
             "model": best_model,
             "seed": best_seed,
             "review_score": best_score,
-            "review": f"En iyi aday kullanıldı: {best_reason}",
+            "review": f"En iyi kullanılabilir aday: {best_reason}",
             "quality_fallback": True,
+            "needs_manual_review": best_score < 52,
             "file": target.name,
         }
 
-    raise RuntimeError(
-        f"Sahne {scene['scene_id']} için uygun görsel üretilemedi: {last_error}"
+    detail = (
+        f"best_score={best_score}; best_reason={best_reason}; "
+        f"last_error={last_error}"
     )
+    raise RuntimeError(
+        f"Sahne {scene['scene_id']} için kullanılabilir görsel üretilemedi: "
+        f"{detail}"
+    )
+
 
 
 def generate_thumbnail_background(
@@ -2239,7 +2442,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V6.txt").write_text(
+    (OUTPUT / "HATA-V6-1.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -2266,9 +2469,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V6 — STORY DIRECTOR ACTIVE")
+    print("UYKU VE TARİH V6.1 — QUALITY RECOVERY ACTIVE")
     print("Konu:", topic)
-    print("STORY DIRECTOR: ACTIVE — intro + scene-synced narration")
+    print("QUALITY RECOVERY: critic-guided scene regeneration enabled")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -2354,7 +2557,7 @@ def main() -> None:
     final_audio = OUTPUT / "ses-tasarim.wav"
     concat_audio_files([intro_audio, story_audio], final_audio)
 
-    video = OUTPUT / "pilot-video-v6-story-director.mp4"
+    video = OUTPUT / "pilot-video-v6-1-quality-recovery.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -2399,6 +2602,8 @@ def main() -> None:
             "true_intro_in_active_render_path": True,
             "three_act_story": True,
             "scene_level_tts_sync": True,
+            "critic_guided_image_recovery": True,
+            "usable_best_candidate_fallback": True,
             "wide_detail_editorial_cuts": True,
         },
         "editor_brain": {
@@ -2425,8 +2630,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V6 Story Director yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce pilot-video-v6-story-director.mp4 dosyasını izle.\n"
+            "V6.1 Quality Recovery yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce pilot-video-v6-1-quality-recovery.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -2435,7 +2640,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V6 STORY DIRECTOR TAMAMLANDI")
+    print("V6.1 QUALITY RECOVERY TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
