@@ -1,4 +1,4 @@
-name: Uyku ve Tarih - Konudan Videoya V3
+name: Uyku ve Tarih - Konudan Videoya V3.1
 
 on:
   workflow_dispatch:
@@ -23,11 +23,11 @@ jobs:
       VIDEO_TOPIC: ${{ inputs.topic }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
-      TARGET_SECONDS: "90"
-      SCENE_COUNT: "12"
+      TARGET_SECONDS: "75"
+      SCENE_COUNT: "8"
       TEXT_MODEL: "gemini-3.5-flash-lite"
       TTS_MODEL: "gemini-3.1-flash-tts-preview"
-      IMAGE_MODEL: "flux"
+      IMAGE_MODEL: "auto"
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -69,7 +69,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: konudan-videoya-v3-${{ github.run_number }}
+          name: konudan-videoya-v3-1-${{ github.run_number }}
           path: output-v3/
           if-no-files-found: warn
           retention-days: 7
