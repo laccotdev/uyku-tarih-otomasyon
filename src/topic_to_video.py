@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/4.0"
+USER_AGENT = "UykuTarihTopicToVideo/5.0"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -1468,6 +1468,224 @@ def scene_filter(motion: str, frames: int, seconds: float) -> str:
     )
 
 
+
+def make_editorial_shots(
+    frames: list[Path],
+    scenes: list[dict[str, Any]],
+) -> tuple[list[Path], list[dict[str, Any]]]:
+    """Create a richer timeline from each generated image without adding motion.
+
+    The final video remains completely static inside each shot. We only create
+    different crops: wide, detail, and atmosphere. This gives editor-like rhythm
+    without shimmer or zoom jitter.
+    """
+    shot_dir = WORK / "editorial-shots"
+    if shot_dir.exists():
+        shutil.rmtree(shot_dir)
+    shot_dir.mkdir(parents=True, exist_ok=True)
+
+    shots: list[Path] = []
+    shot_meta: list[dict[str, Any]] = []
+
+    for index, (frame_path, scene) in enumerate(zip(frames, scenes), start=1):
+        with Image.open(frame_path) as raw:
+            base = ImageOps.exif_transpose(raw).convert("RGB")
+
+        # 1) wide shot
+        wide = ImageOps.fit(base, (WIDTH, HEIGHT), Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+        wide_path = shot_dir / f"s{index:02d}_a_wide.jpg"
+        wide.save(wide_path, "JPEG", quality=94, optimize=True)
+        shots.append(wide_path)
+        shot_meta.append({
+            "source_scene": index,
+            "shot_type": "wide",
+            "transition": scene.get("transition", "dissolve"),
+            "audio_bed": scene.get("audio_bed", "night_wind"),
+            "importance": scene.get("importance", "normal"),
+            "duration_weight": 1.25 if scene.get("importance") == "high" else 1.0,
+        })
+
+        # 2) detail crop, alternating focal direction
+        centering = (0.34, 0.50) if index % 2 else (0.66, 0.50)
+        detail = ImageOps.fit(base, (WIDTH, HEIGHT), Image.Resampling.LANCZOS, centering=centering)
+        detail = ImageEnhance.Contrast(detail).enhance(1.03)
+        detail_path = shot_dir / f"s{index:02d}_b_detail.jpg"
+        detail.save(detail_path, "JPEG", quality=94, optimize=True)
+        shots.append(detail_path)
+        shot_meta.append({
+            "source_scene": index,
+            "shot_type": "detail",
+            "transition": "cut" if index % 3 else "dissolve",
+            "audio_bed": scene.get("audio_bed", "room_tone"),
+            "importance": scene.get("importance", "normal"),
+            "duration_weight": 0.62,
+        })
+
+        # 3) atmosphere crop for important/closing scenes only
+        if index == 1 or index == len(frames) or scene.get("importance") == "high":
+            center_y = 0.42 if index % 2 else 0.56
+            atmosphere = ImageOps.fit(base, (WIDTH, HEIGHT), Image.Resampling.LANCZOS, centering=(0.5, center_y))
+            atmosphere = ImageEnhance.Brightness(atmosphere).enhance(0.92)
+            atmos_path = shot_dir / f"s{index:02d}_c_atmosphere.jpg"
+            atmosphere.save(atmos_path, "JPEG", quality=94, optimize=True)
+            shots.append(atmos_path)
+            shot_meta.append({
+                "source_scene": index,
+                "shot_type": "atmosphere",
+                "transition": "fadeblack" if index == len(frames) else "dissolve",
+                "audio_bed": scene.get("audio_bed", "night_wind"),
+                "importance": scene.get("importance", "high"),
+                "duration_weight": 0.95 if index != len(frames) else 1.45,
+            })
+
+    return shots, shot_meta
+
+
+def make_intro_card(thumbnail: Path, target: Path, topic_title: str) -> None:
+    with Image.open(thumbnail) as raw:
+        image = ImageOps.fit(raw.convert("RGB"), (WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+    image = ImageEnhance.Brightness(image).enhance(0.55)
+    image = ImageEnhance.Contrast(image).enhance(1.08)
+    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 88))
+    image = Image.alpha_composite(image.convert("RGBA"), overlay)
+
+    draw = ImageDraw.Draw(image)
+    title = re.sub(r"\s+", " ", topic_title).strip().upper()
+    if len(title) > 44:
+        title = textwrap.shorten(title, width=44, placeholder="…").upper()
+
+    title_font = video_font(58, bold=True)
+    small_font = video_font(25, bold=True)
+
+    # Minimal editorial intro, no noisy animation. Fade is applied in ffmpeg.
+    draw.rectangle((120, 375, 265, 385), fill=(215, 184, 134, 255))
+    draw.text(
+        (120, 415),
+        "UYKU VE TARİH",
+        font=small_font,
+        fill=(216, 197, 163),
+        stroke_width=1,
+        stroke_fill=(8, 7, 6),
+    )
+    lines = []
+    current = ""
+    for word in title.split():
+        candidate = f"{current} {word}".strip()
+        if draw.textbbox((0, 0), candidate, font=title_font)[2] <= 1180:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    for i, line in enumerate(lines[:2]):
+        draw.text(
+            (120, 470 + i * 68),
+            line,
+            font=title_font,
+            fill=(248, 240, 224),
+            stroke_width=2,
+            stroke_fill=(10, 9, 8),
+        )
+
+    image.convert("RGB").save(target, "JPEG", quality=95, optimize=True)
+
+
+def audio_bed_filter(kind: str, duration: float) -> str:
+    # Procedural atmosphere beds. Very low level, designed to be felt, not heard.
+    if kind == "fire":
+        return (
+            f"anoisesrc=color=brown:amplitude=0.020:duration={duration:.3f},"
+            "highpass=f=450,lowpass=f=2400,volume=0.026"
+        )
+    if kind == "interior":
+        return (
+            f"anoisesrc=color=pink:amplitude=0.012:duration={duration:.3f},"
+            "lowpass=f=420,volume=0.018"
+        )
+    if kind == "storm":
+        return (
+            f"anoisesrc=color=blue:amplitude=0.018:duration={duration:.3f},"
+            "lowpass=f=900,volume=0.024"
+        )
+    if kind == "archive":
+        return (
+            f"anoisesrc=color=pink:amplitude=0.010:duration={duration:.3f},"
+            "highpass=f=80,lowpass=f=650,volume=0.016"
+        )
+    return (
+        f"anoisesrc=color=pink:amplitude=0.014:duration={duration:.3f},"
+        "highpass=f=120,lowpass=f=1000,volume=0.020"
+    )
+
+
+def create_sound_design(shot_meta: list[dict[str, Any]], duration: float, target: Path) -> None:
+    # Create a continuous restrained atmosphere bed with slow fades.
+    bed = WORK / "sound-bed.wav"
+    base = (
+        f"anoisesrc=color=pink:amplitude=0.013:duration={duration:.3f},"
+        "highpass=f=85,lowpass=f=950,"
+        "afade=t=in:st=0:d=3,"
+        f"afade=t=out:st={max(0, duration-4):.3f}:d=4,"
+        "volume=0.022"
+    )
+    run([
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", base,
+        "-ar", "48000", "-c:a", "pcm_s16le",
+        str(bed),
+    ])
+    target.write_bytes(bed.read_bytes())
+
+
+def render_intro_clip(intro_frame: Path, target: Path, seconds: float = 4.2) -> None:
+    frames_count = max(1, math.ceil(seconds * FPS))
+    vf = (
+        "scale=1920:1080,"
+        "fade=t=in:st=0:d=1.05,"
+        f"fade=t=out:st={max(0, seconds-0.9):.3f}:d=0.9,"
+        "format=yuv420p"
+    )
+    run([
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", str(intro_frame),
+        "-vf", vf,
+        "-frames:v", str(frames_count),
+        "-an", "-c:v", "libx264", "-preset", "medium",
+        "-crf", "19", "-pix_fmt", "yuv420p",
+        str(target),
+    ])
+
+
+def render_static_clip(frame: Path, target: Path, seconds: float) -> None:
+    frames_count = max(1, math.ceil(seconds * FPS))
+    vf = (
+        "scale=1920:1080,"
+        "eq=saturation=0.94:contrast=1.01:brightness=-0.006,"
+        "vignette=PI/8.8,"
+        "format=yuv420p"
+    )
+    run([
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", str(frame),
+        "-vf", vf,
+        "-frames:v", str(frames_count),
+        "-an", "-c:v", "libx264", "-preset", "medium",
+        "-crf", "19", "-pix_fmt", "yuv420p",
+        str(target),
+    ])
+
+
+def editorial_transition(prev_type: str, next_type: str, index: int) -> tuple[str, float]:
+    # Most transitions are cuts/dissolves; no presentation-like slide effects.
+    if next_type == "detail":
+        return "cut", 0.0
+    if index % 6 == 0:
+        return "fadeblack", 0.45
+    return "fade", 0.38
+
 def render_video(
     frames: list[Path],
     scenes: list[dict[str, Any]],
@@ -1627,7 +1845,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V4.txt").write_text(
+    (OUTPUT / "HATA-V5.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -1654,7 +1872,7 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V4 — EDITOR BRAIN")
+    print("UYKU VE TARİH V5 — EDITOR BRAIN")
     print("Konu:", topic)
     print("=" * 72)
 
@@ -1735,7 +1953,7 @@ def main() -> None:
         narration_audio, ambient_track, final_audio
     )
 
-    video = OUTPUT / "pilot-video-v4-editor-brain.mp4"
+    video = OUTPUT / "pilot-video-v5-editorial-cut.mp4"
     actual_duration = render_video(
         frames,
         payload["scenes"],
@@ -1803,8 +2021,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V4 Editor Brain yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce pilot-video-v4-editor-brain.mp4 dosyasını izle.\n"
+            "V5 Editorial Cut Engine yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce pilot-video-v5-editorial-cut.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
