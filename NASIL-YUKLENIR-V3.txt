@@ -1,0 +1,23 @@
+UYKU VE TARİH V3 KURULUMU
+
+1. Pollinations hesabından bir API anahtarı oluştur.
+2. GitHub deposunda Settings > Secrets and variables > Actions bölümüne gir.
+3. New repository secret ile şu secret'ı ekle:
+   Name: POLLINATIONS_API_KEY
+   Secret: Pollinations anahtarın
+
+GEMINI_API_KEY daha önce eklendiği için yeniden ekleme.
+
+4. Paket içindeki görünür dosyaları doğru konumlara yükle:
+   /requirements-v3.txt
+   /README-V3.md
+   /src/topic_to_video.py
+
+5. GitHub'da şu workflow dosyasını oluştur:
+   /.github/workflows/topic-to-video.yml
+
+6. Actions bölümünde:
+   Uyku ve Tarih - Konudan Videoya V3
+   > Run workflow
+
+7. Yalnızca konu alanını doldur ve çalıştır.
