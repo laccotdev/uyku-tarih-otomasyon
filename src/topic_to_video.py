@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -13,7 +14,6 @@ import time
 import wave
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import requests
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
@@ -27,7 +27,8 @@ WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
 USER_AGENT = "UykuTarihTopicToVideo/3.0"
-POLLINATIONS_IMAGE_URL = "https://gen.pollinations.ai/image"
+POLLINATIONS_IMAGES_ENDPOINT = "https://gen.pollinations.ai/v1/images/generations"
+POLLINATIONS_MODELS_ENDPOINT = "https://gen.pollinations.ai/image/models"
 VOICE_NAME = "Schedar"
 
 STYLE_BIBLE = """
@@ -291,6 +292,45 @@ def deterministic_seed(topic: str, scene_id: int, attempt: int) -> int:
     return int(digest[:8], 16) % 2_000_000_000
 
 
+def pollinations_image_models() -> list[str]:
+    """Return image models available to this API key, in a quality/speed order."""
+    key = os.getenv("POLLINATIONS_API_KEY", "").strip()
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+    }
+    preferred = ["zimage", "klein", "flux", "sana"]
+    configured = os.getenv("IMAGE_MODEL", "auto").strip()
+    if configured and configured.lower() != "auto":
+        preferred.insert(0, configured)
+    preferred = list(dict.fromkeys(preferred))
+
+    try:
+        response = requests.get(
+            POLLINATIONS_MODELS_ENDPOINT,
+            headers=headers,
+            timeout=(15, 30),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        available = {
+            str(item.get("name", "")).strip()
+            for item in payload
+            if isinstance(item, dict)
+            and item.get("category") == "image"
+            and "image" in (item.get("output_modalities") or [])
+        }
+        filtered = [name for name in preferred if name in available]
+        if filtered:
+            print("Kullanılabilir görsel modeli zinciri:", ", ".join(filtered))
+            return filtered
+    except Exception as exc:
+        print("Pollinations model kataloğu alınamadı; sabit zincir kullanılacak:", exc)
+
+    return preferred
+
+
 def pollinations_request(
     prompt: str,
     negative: str,
@@ -298,43 +338,71 @@ def pollinations_request(
     target: Path,
     model: str,
 ) -> None:
+    """Generate through Pollinations' current OpenAI-compatible POST endpoint."""
     key = os.getenv("POLLINATIONS_API_KEY", "").strip()
     if not key:
         raise RuntimeError("POLLINATIONS_API_KEY bulunamadı.")
 
-    encoded_prompt = quote(prompt, safe="")
-    url = f"{POLLINATIONS_IMAGE_URL}/{encoded_prompt}"
-    params = {
+    final_prompt = (
+        f"{prompt}\n\n"
+        f"STRICT EXCLUSIONS:\n{negative}\n\n"
+        f"Composition variation reference: {seed}."
+    )
+    request_body = {
+        "prompt": final_prompt,
         "model": model,
-        "width": 1280,
-        "height": 720,
-        "seed": seed,
-        "negative_prompt": negative,
-        "enhance": "true",
-        "safe": "true",
-        "nologo": "true",
-        "key": key,
+        "n": 1,
+        "size": "1024x576",
+        "quality": "medium",
+        "response_format": "b64_json",
+        "safe": True,
+        "user": f"uyku-tarih-{seed}",
     }
     headers = {
         "User-Agent": USER_AGENT,
         "Authorization": f"Bearer {key}",
-        "Accept": "image/*",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
-    response = requests.get(url, params=params, headers=headers, timeout=240)
+    response = requests.post(
+        POLLINATIONS_IMAGES_ENDPOINT,
+        json=request_body,
+        headers=headers,
+        timeout=(25, 150),
+    )
     response.raise_for_status()
-    content_type = response.headers.get("content-type", "").lower()
-    if "image" not in content_type:
-        preview = response.text[:500] if response.content else "boş yanıt"
-        raise RuntimeError(f"Görsel yerine farklı yanıt geldi: {preview}")
+    payload = response.json()
+    items = payload.get("data") or []
+    if not items or not isinstance(items[0], dict):
+        raise RuntimeError(f"Pollinations geçerli görsel verisi döndürmedi: {str(payload)[:500]}")
+
+    item = items[0]
+    raw_bytes: bytes | None = None
+    encoded = item.get("b64_json")
+    if encoded:
+        raw_bytes = base64.b64decode(encoded)
+    elif item.get("url"):
+        image_response = requests.get(
+            str(item["url"]),
+            headers={"User-Agent": USER_AGENT},
+            timeout=(20, 90),
+        )
+        image_response.raise_for_status()
+        raw_bytes = image_response.content
+
+    if not raw_bytes:
+        raise RuntimeError("Pollinations görsel gövdesi boş döndü.")
 
     temp = target.with_suffix(".download")
-    temp.write_bytes(response.content)
+    temp.write_bytes(raw_bytes)
     try:
         with Image.open(temp) as raw:
             image = ImageOps.exif_transpose(raw).convert("RGB")
             if image.width < 700 or image.height < 390:
-                raise ValueError("Üretilen görsel çözünürlüğü düşük.")
+                raise ValueError(
+                    f"Üretilen görsel çözünürlüğü düşük: {image.width}x{image.height}"
+                )
             image.save(target, "JPEG", quality=94, optimize=True)
     finally:
         temp.unlink(missing_ok=True)
@@ -420,18 +488,16 @@ def generate_scene_image(
     scene: dict[str, Any],
     target: Path,
 ) -> dict[str, Any]:
-    configured_model = os.getenv("IMAGE_MODEL", "flux").strip() or "flux"
-    models = [configured_model, "flux", "turbo"]
-    models = list(dict.fromkeys(models))
+    models = pollinations_image_models()
     last_error: Exception | None = None
 
-    for attempt in range(1, 4):
-        model = models[min(attempt - 1, len(models) - 1)]
+    # Move to another model quickly instead of waiting four minutes three times.
+    for attempt, model in enumerate(models[:4], start=1):
         seed = deterministic_seed(topic, int(scene["scene_id"]), attempt)
         try:
             print(
                 f"Sahne görseli: {scene['scene_id']}, model={model}, "
-                f"deneme={attempt}/3"
+                f"deneme={attempt}/{min(4, len(models))}"
             )
             pollinations_request(
                 combined_prompt(payload, scene),
@@ -454,8 +520,8 @@ def generate_scene_image(
         except Exception as exc:
             last_error = exc
             target.unlink(missing_ok=True)
-            print(f"Sahne görseli başarısız: {exc}")
-            time.sleep(7 * attempt)
+            print(f"Sahne görseli başarısız ({model}): {exc}")
+            time.sleep(min(20, 4 * attempt))
 
     raise RuntimeError(
         f"Sahne {scene['scene_id']} için uygun görsel üretilemedi: {last_error}"
@@ -481,16 +547,18 @@ def generate_thumbnail_background(
     )
 
     last_error: Exception | None = None
-    for attempt, model in enumerate(("flux", "turbo"), start=1):
+    models = pollinations_image_models()
+    for attempt, model in enumerate(models[:4], start=1):
         seed = deterministic_seed(topic, 999, attempt)
         try:
+            print(f"Kapak arka planı: model={model}, deneme={attempt}/{min(4, len(models))}")
             pollinations_request(prompt, negative, seed, target, model)
             return {"model": model, "seed": seed, "file": target.name}
         except Exception as exc:
             last_error = exc
             target.unlink(missing_ok=True)
-            print("Kapak arka planı yeniden denenecek:", exc)
-            time.sleep(8 * attempt)
+            print(f"Kapak arka planı başarısız ({model}): {exc}")
+            time.sleep(min(20, 4 * attempt))
 
     raise RuntimeError(f"Kapak arka planı üretilemedi: {last_error}")
 
@@ -976,7 +1044,7 @@ def main() -> None:
         "text_model": text_model,
         "tts_model": tts_model,
         "image_engine": "Pollinations",
-        "image_model_default": os.getenv("IMAGE_MODEL", "flux"),
+        "image_model_default": os.getenv("IMAGE_MODEL", "auto"),
         "actual_duration_seconds": round(actual_duration, 2),
         "scene_count": len(frames),
         "images": image_manifest,
