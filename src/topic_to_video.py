@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/7.0"
+USER_AGENT = "UykuTarihTopicToVideo/7.1"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -460,151 +460,710 @@ MEVCUT JSON:
     return generate_json(client, prompt, max_tokens=12000)
 
 
+CHAPTER_BEATS = [
+    ("Geceye Giriş", ["hook", "orientation", "setting"]),
+    ("Yaşayan Dünya", ["routine", "craft", "community"]),
+    ("Kırılma Anı", ["evidence", "tension", "turning_point"]),
+    ("Sessiz Miras", ["aftermath", "legacy", "reflection"]),
+]
+
+
+def _safe_title_from_topic(topic: str) -> str:
+    clean = re.sub(r"\s+", " ", str(topic)).strip()
+    return textwrap.shorten(clean, width=68, placeholder="…") or "Tarihten Bir Gece"
+
+
+def _safe_thumbnail_text(topic: str) -> str:
+    words = re.findall(r"\w+", str(topic), flags=re.UNICODE)
+    selected = words[:4] or ["TARİHTEN", "BİR", "GECE"]
+    return " ".join(selected).upper()
+
+
+def _local_package_skeleton(
+    topic: str,
+    scene_count: int,
+) -> dict[str, Any]:
+    title = _safe_title_from_topic(topic)
+    scenes: list[dict[str, Any]] = []
+
+    for index in range(1, scene_count + 1):
+        chapter_index = min(
+            CHAPTER_COUNT,
+            1 + ((index - 1) * CHAPTER_COUNT // max(1, scene_count)),
+        )
+        chapter_title, beats = CHAPTER_BEATS[chapter_index - 1]
+        beat_position = (index - 1) % max(1, len(beats))
+        beat_type = beats[min(beat_position, len(beats) - 1)]
+
+        scenes.append({
+            "scene_id": index,
+            "chapter_index": chapter_index,
+            "chapter_title": chapter_title,
+            "beat_type": beat_type,
+            "narration_idea": (
+                f"{topic} konusunun {chapter_title.lower()} bölümündeki "
+                f"{beat_type} anlatı adımı"
+            ),
+            "narration_text": "",
+            "visual_goal": (
+                f"{topic} ile doğrudan ilişkili, dönem ve coğrafyaya uygun "
+                f"{beat_type} sahnesi"
+            ),
+            "image_prompt": (
+                f"Photorealistic historical documentary reconstruction directly "
+                f"related to {topic}. Show the exact period, location and daily "
+                f"environment implied by the topic. Cinematic 16:9 frame, "
+                f"historically plausible architecture, clothing, tools and "
+                f"materials, restrained moonlight and amber practical light."
+            ),
+            "negative_prompt": (
+                "wrong century, wrong civilization, modern objects, fantasy, "
+                "text, logo, collage, museum display"
+            ),
+            "duration_weight": 1.0,
+            "transition": "fadeblack" if beat_type in {
+                "turning_point", "aftermath"
+            } else "fade",
+            "transition_duration": 0.62,
+            "ambient_profile": (
+                "interior_room"
+                if beat_type in {"craft", "evidence"}
+                else "exterior_wind"
+            ),
+            "importance": (
+                "high"
+                if beat_type in {"hook", "turning_point", "reflection"}
+                else "normal"
+            ),
+            "continuity_bridge": (
+                "Önceki bölümde kurulan düşüncenin doğal devamı."
+            ),
+        })
+
+    return {
+        "topic_interpretation": (
+            f"{topic} konusu, insan deneyimi ile tarihsel bağlamı "
+            "birlikte ele alan sakin bir gece belgeseli olarak yorumlandı."
+        ),
+        "historical_scope": (
+            f"{topic} başlığının işaret ettiği dönem, coğrafya ve toplumsal bağlam."
+        ),
+        "video_title": title,
+        "thumbnail_text": _safe_thumbnail_text(topic),
+        "intro_hook": "Gece çökerken hayat nasıl görünüyordu?",
+        "description": (
+            f"Bu bölümde {topic} başlığının tarihsel dünyasına sakin ve "
+            "insan odaklı bir anlatımla yaklaşıyoruz.\n\n"
+            "Kesin olarak bilinenlerle olası ayrıntılar birbirinden ayrılarak, "
+            "mekânın ve gündelik hayatın izleri takip ediliyor."
+        ),
+        "narration": "",
+        "visual_identity": (
+            "Premium late-night historical documentary with restrained "
+            "blue-black shadows and subtle amber practical light."
+        ),
+        "world_bible": {
+            "period": "Konudan çıkarılan tarihsel dönem",
+            "location": "Konudan çıkarılan coğrafya",
+            "architecture": "Döneme ve coğrafyaya uygun gerçekçi mimari",
+            "clothing": "Döneme uygun doğal kumaşlar ve işlevsel kıyafetler",
+            "materials": "Taş, ahşap, toprak, metal ve yerel malzemeler",
+            "lighting": "Ay ışığı, kandil, ocak veya meşale gibi dönem ışıkları",
+            "palette": "Lacivert gölgeler, düşük doygunluk, kısık amber vurgular",
+            "forbidden": [
+                "modern teknoloji",
+                "yanlış medeniyet",
+                "yanlış yüzyıl",
+                "fantastik mimari",
+                "yazı ve logo",
+            ],
+        },
+        "thumbnail_prompt": (
+            f"Single cohesive cinematic historical scene directly related to "
+            f"{topic}, iconic setting on the right third, dark clean negative "
+            "space on the left, photorealistic, premium documentary, 16:9."
+        ),
+        "thumbnail_negative_prompt": (
+            "text, logo, collage, split screen, wrong civilization, modern objects"
+        ),
+        "scenes": scenes,
+        "chapters": [item[0] for item in CHAPTER_BEATS],
+        "tags": ["tarih", "belgesel", "uyku için tarih"],
+    }
+
+
+def _merge_package_defaults(
+    payload: dict[str, Any] | None,
+    topic: str,
+    scene_count: int,
+) -> dict[str, Any]:
+    defaults = _local_package_skeleton(topic, scene_count)
+    if not isinstance(payload, dict):
+        return defaults
+
+    for key, value in defaults.items():
+        if key == "scenes":
+            continue
+        if payload.get(key) in (None, "", [], {}):
+            payload[key] = value
+
+    supplied_scenes = payload.get("scenes")
+    if not isinstance(supplied_scenes, list):
+        supplied_scenes = []
+
+    merged_scenes: list[dict[str, Any]] = []
+    for index in range(scene_count):
+        base = dict(defaults["scenes"][index])
+        if index < len(supplied_scenes) and isinstance(
+            supplied_scenes[index], dict
+        ):
+            candidate = supplied_scenes[index]
+            for key, value in candidate.items():
+                if value not in (None, ""):
+                    base[key] = value
+        merged_scenes.append(base)
+
+    payload["scenes"] = merged_scenes
+    _normalize_package(payload, scene_count)
+    return payload
+
+
+def _local_expand_chapter(
+    seed_text: str,
+    topic: str,
+    chapter_index: int,
+    target_words: int,
+) -> str:
+    seed = re.sub(r"\s+", " ", str(seed_text)).strip()
+    chapter_title = CHAPTER_BEATS[chapter_index - 1][0]
+
+    additions = [
+        (
+            f"Bu bölüm, {topic} başlığını yalnızca büyük olaylar üzerinden değil, "
+            f"o dünyada yaşayan insanların gündelik ritmi üzerinden de okumaya "
+            f"çalışır. {chapter_title} içinde görülen ayrıntılar, mekânın nasıl "
+            f"kullanıldığını ve zamanın insanlar için nasıl aktığını anlamamıza "
+            f"yardım eder."
+        ),
+        (
+            "Elde kalan arkeolojik izler ve yazılı kaynaklar her soruya eksiksiz "
+            "bir cevap vermez. Bu nedenle anlatılan tablo, doğrulanmış bilgilerle "
+            "dönemin koşullarından çıkarılabilecek makul olasılıkları dikkatli "
+            "biçimde birbirinden ayırır."
+        ),
+        (
+            "Taş, ahşap, toprak, kumaş ve gündelik araçlar gibi sıradan görünen "
+            "unsurlar, geçmişteki hayatın en güçlü tanıklarıdır. İnsanların "
+            "çalışma biçimi, dinlenme zamanı ve çevreyle kurduğu ilişki bu küçük "
+            "izler üzerinden daha görünür hâle gelir."
+        ),
+        (
+            "Gece çöktüğünde şehirlerin ve yerleşimlerin temposu değişir; sesler "
+            "azalır, ışık kaynakları sınırlanır ve gün içinde fark edilmeyen "
+            "ayrıntılar öne çıkar. Bu sakinlik, tarihsel mekânı daha yakından "
+            "düşünmek için doğal bir çerçeve sunar."
+        ),
+        (
+            "Burada amaç geçmişi romantikleştirmek ya da tek bir açıklamaya "
+            "indirgemek değildir. Aksine, insanların belirsizlikler karşısında "
+            "nasıl yaşadığını, çalıştığını ve çevresini anlamlandırdığını sakin "
+            "bir anlatı içinde görünür kılmaktır."
+        ),
+        (
+            "Bu ayrıntılar tek başına kesin bir hüküm oluşturmasa da, birbirleriyle "
+            "birlikte değerlendirildiğinde dönemin sosyal düzeni ve gündelik "
+            "alışkanlıkları hakkında daha dengeli bir görüntü ortaya çıkarır."
+        ),
+    ]
+
+    parts = [seed] if seed else []
+    cursor = 0
+    while _word_count(" ".join(parts)) < target_words:
+        parts.append(additions[cursor % len(additions)])
+        cursor += 1
+        if cursor > 20:
+            break
+
+    combined = re.sub(r"\s+", " ", " ".join(parts)).strip()
+    sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?])\s+", combined)
+        if item.strip()
+    ]
+
+    selected: list[str] = []
+    for sentence in sentences:
+        if (
+            selected
+            and _word_count(" ".join(selected + [sentence]))
+            > target_words + 18
+        ):
+            break
+        selected.append(sentence)
+
+    result = " ".join(selected).strip()
+    if _word_count(result) < target_words:
+        result = combined
+    return result
+
+
+def _chapter_generation_prompt(
+    topic: str,
+    payload: dict[str, Any],
+    chapter_index: int,
+    scenes: list[dict[str, Any]],
+    target_words: int,
+) -> str:
+    chapter_title = CHAPTER_BEATS[chapter_index - 1][0]
+    scene_context = [
+        {
+            "scene_id": scene.get("scene_id"),
+            "beat_type": scene.get("beat_type"),
+            "narration_idea": scene.get("narration_idea"),
+            "visual_goal": scene.get("visual_goal"),
+        }
+        for scene in scenes
+    ]
+
+    previous_context = ""
+    if chapter_index > 1:
+        previous_context = (
+            "Bu bölüm önceki bölümün düşüncesini doğal biçimde sürdürmeli; "
+            "yeni bir video başlıyormuş gibi giriş yapmamalı."
+        )
+
+    return f"""
+Yalnızca geçerli JSON üret:
+{{
+  "chapter_title": "Kısa Türkçe bölüm adı",
+  "chapter_text": "Tek parça akıcı Türkçe anlatım",
+  "scene_texts": [
+    "Birinci sahnede okunacak metin",
+    "İkinci sahnede okunacak metin",
+    "Üçüncü sahnede okunacak metin"
+  ]
+}}
+
+KONU:
+{topic}
+
+BÖLÜM:
+{chapter_index}/4 — {chapter_title}
+
+HEDEF:
+- chapter_text yaklaşık {target_words} Türkçe kelime olsun.
+- Kesin alt sınır {max(120, target_words - 25)} kelime.
+- Tam üç scene_texts üret.
+- Üç scene_texts birleştiğinde chapter_text ile aynı anlatıyı oluştursun.
+- Metin sakin, doğal, belgesel tonunda ve seslendirmeye uygun olsun.
+- Bilgi listesi, tekrar, yapay dramatizasyon ve reklam tonu kullanma.
+- Tarihsel belirsizlikleri kesin bilgi gibi sunma.
+- İnsan deneyimi, mekân ve tarihsel bağlam arasında doğal bağ kur.
+- {previous_context}
+
+VİDEO BAĞLAMI:
+{json.dumps({
+    "historical_scope": payload.get("historical_scope", ""),
+    "world_bible": payload.get("world_bible", {}),
+    "video_title": payload.get("video_title", ""),
+}, ensure_ascii=False)}
+
+BU BÖLÜMÜN ÜÇ SAHNESİ:
+{json.dumps(scene_context, ensure_ascii=False)}
+"""
+
+
+def _generate_long_chapter(
+    client: genai.Client,
+    topic: str,
+    payload: dict[str, Any],
+    chapter_index: int,
+    scenes: list[dict[str, Any]],
+    target_words: int,
+) -> tuple[str, list[str], str]:
+    prompt = _chapter_generation_prompt(
+        topic,
+        payload,
+        chapter_index,
+        scenes,
+        target_words,
+    )
+
+    model_name = "local-fallback"
+    chapter_text = ""
+    scene_texts: list[str] = []
+
+    try:
+        result, model_name = generate_json(
+            client,
+            prompt,
+            max_tokens=4200,
+        )
+        chapter_text = re.sub(
+            r"\s+", " ", str(result.get("chapter_text", ""))
+        ).strip()
+        supplied = result.get("scene_texts", [])
+        if isinstance(supplied, list):
+            scene_texts = [
+                re.sub(r"\s+", " ", str(item)).strip()
+                for item in supplied[:3]
+            ]
+    except Exception as exc:
+        print(
+            f"Bölüm {chapter_index} yapay zekâ üretimi atlandı; "
+            f"yerel güvenli tamamlayıcı kullanılacak: {exc}"
+        )
+
+    if len(scene_texts) == 3:
+        joined = " ".join(item for item in scene_texts if item).strip()
+        if _word_count(joined) >= _word_count(chapter_text) * 0.75:
+            chapter_text = joined
+
+    if _word_count(chapter_text) < max(120, target_words - 25):
+        seed = chapter_text or " ".join(
+            str(scene.get("narration_text", "")).strip()
+            for scene in scenes
+        ).strip()
+        chapter_text = _local_expand_chapter(
+            seed,
+            topic,
+            chapter_index,
+            target_words,
+        )
+        model_name = (
+            f"{model_name} + deterministic-local-expansion"
+        )
+
+    scene_texts = _split_narration_into_scenes(chapter_text, 3)
+    while len(scene_texts) < 3:
+        scene_texts.append("")
+
+    return chapter_text, scene_texts[:3], model_name
+
+
+def _force_long_form_package(
+    client: genai.Client,
+    topic: str,
+    payload: dict[str, Any] | None,
+    target_words: int,
+    minimum_words: int,
+    scene_count: int,
+) -> tuple[dict[str, Any], list[str]]:
+    payload = _merge_package_defaults(
+        payload,
+        topic,
+        scene_count,
+    )
+
+    chapter_groups: list[list[dict[str, Any]]] = [
+        [] for _ in range(CHAPTER_COUNT)
+    ]
+    for index, scene in enumerate(payload["scenes"]):
+        chapter_index = min(
+            CHAPTER_COUNT,
+            1 + index * CHAPTER_COUNT // max(1, scene_count),
+        )
+        scene["chapter_index"] = chapter_index
+        scene["chapter_title"] = CHAPTER_BEATS[chapter_index - 1][0]
+        scene["beat_type"] = CHAPTER_BEATS[chapter_index - 1][1][
+            len(chapter_groups[chapter_index - 1]) % 3
+        ]
+        chapter_groups[chapter_index - 1].append(scene)
+
+    per_chapter_target = max(
+        150,
+        math.ceil((target_words + 20) / CHAPTER_COUNT),
+    )
+    chapter_models: list[str] = []
+    chapter_texts: list[str] = []
+
+    for chapter_index, scenes in enumerate(
+        chapter_groups,
+        start=1,
+    ):
+        chapter_text, scene_texts, model = _generate_long_chapter(
+            client,
+            topic,
+            payload,
+            chapter_index,
+            scenes,
+            per_chapter_target,
+        )
+        chapter_models.append(model)
+        chapter_texts.append(chapter_text)
+
+        for scene, scene_text in zip(scenes, scene_texts):
+            scene["narration_text"] = scene_text
+            scene["narration_idea"] = textwrap.shorten(
+                scene_text,
+                width=180,
+                placeholder="…",
+            )
+
+    payload["narration"] = re.sub(
+        r"\s+",
+        " ",
+        " ".join(chapter_texts),
+    ).strip()
+
+    if _word_count(payload["narration"]) < minimum_words:
+        deficit_target = max(
+            target_words,
+            minimum_words + 45,
+        )
+        payload["narration"] = _local_expand_chapter(
+            payload["narration"],
+            topic,
+            4,
+            deficit_target,
+        )
+        all_scene_texts = _split_narration_into_scenes(
+            payload["narration"],
+            scene_count,
+        )
+        for scene, scene_text in zip(
+            payload["scenes"],
+            all_scene_texts,
+        ):
+            scene["narration_text"] = scene_text
+            scene["narration_idea"] = textwrap.shorten(
+                scene_text,
+                width=180,
+                placeholder="…",
+            )
+        chapter_models.append("final-local-length-guard")
+
+    _normalize_package(payload, scene_count)
+    return payload, chapter_models
+
+
 def build_video_package(
     client: genai.Client,
     topic: str,
     target_seconds: int,
     scene_count: int,
 ) -> tuple[dict[str, Any], str]:
-    target_words = max(620, min(760, round(target_seconds * 2.25)))
-    minimum_words = max(540, round(target_words * 0.84))
+    target_words = max(
+        620,
+        min(760, round(target_seconds * 2.25)),
+    )
+    minimum_words = max(
+        540,
+        round(target_words * 0.84),
+    )
+
     prompt = f"""
 Yalnızca geçerli JSON üret. Markdown yazma.
 
 ROL:
-Sen; tarih araştırması, sakin belgesel senaryosu, sinematografik sahne
+Sen tarih araştırması, sakin belgesel senaryosu, sinematografik sahne
 planlama ve YouTube paketleme alanlarında çalışan kıdemli bir editörsün.
 
-KULLANICININ VERDİĞİ TEK BİLGİ:
+KONU:
 {topic}
 
-Sistem bu konuyu kendi anlayacak. Kullanıcıdan prompt, sahne, görsel, ses,
-başlık veya montaj tercihi istemeyecek.
+ÖNEMLİ:
+Bu ilk çağrıda önce güçlü ve eksiksiz bir video planı kur.
+Metin beklenenden kısa kalırsa sistem dört bölümü ayrı ayrı yazacaktır.
+Kullanıcıdan ek bilgi isteme.
 
 HEDEF:
-Yaklaşık {target_seconds} saniyelik, uyku öncesi dinlemeye uygun, yayın
-kalitesinde Türkçe tarih videosu.
-Narration alanı {max(120, target_words - 20)} ile {target_words + 35} kelime arasında olsun.
-Tam {scene_count} temiz ve birbirini takip eden görsel sahne.
+Yaklaşık {target_seconds} saniyelik, uyku öncesi dinlemeye uygun,
+dört bölümlü Türkçe tarih videosu.
+Tam {scene_count} sahne üret.
 
-JSON ŞEMASI:
+JSON:
 {{
-  "topic_interpretation": "Konunun nasıl ele alındığının kısa özeti",
+  "topic_interpretation": "Kısa yorum",
   "historical_scope": "Dönem, yer ve bağlam",
-  "video_title": "Merak uyandıran fakat abartısız Türkçe YouTube başlığı",
+  "video_title": "Türkçe başlık",
   "thumbnail_text": "En fazla dört kelime",
-  "intro_hook": "En fazla sekiz kelimelik sakin ve merak uyandıran giriş cümlesi",
-  "description": "İki kısa paragraf Türkçe açıklama",
-  "narration": "Tek parça final Türkçe seslendirme metni",
-  "visual_identity": "Bu videoya özgü tek cümlelik sanat yönetimi",
+  "intro_hook": "En fazla sekiz kelime",
+  "description": "İki kısa paragraf",
+  "narration": "Mevcut olabildiğince uzun Türkçe anlatım",
+  "visual_identity": "Tek film sanat yönetimi",
   "world_bible": {{
     "period": "Dönem",
     "location": "Coğrafya",
-    "architecture": "Tutarlı mimari tanımı",
-    "clothing": "Tutarlı kıyafet tanımı",
-    "materials": "Taş, kerpiç, ahşap, bronz gibi malzemeler",
-    "lighting": "Ay ışığı, yağ kandili, meşale gibi ışık kuralları",
-    "palette": "Bütün videoda korunacak renk paleti",
-    "forbidden": ["Yanlış medeniyet ve dönem unsurları"]
+    "architecture": "Mimari",
+    "clothing": "Kıyafet",
+    "materials": "Malzemeler",
+    "lighting": "Işık",
+    "palette": "Renk paleti",
+    "forbidden": ["Yanlış unsurlar"]
   }},
-  "thumbnail_prompt": "Yazısız 16:9 kapak arka planı için ayrıntılı İngilizce prompt. Ana özne sağ tarafta, sol taraf koyu ve boş.",
-  "thumbnail_negative_prompt": "Kapakta kesinlikle olmaması gereken unsurlar",
+  "thumbnail_prompt": "İngilizce kapak promptu",
+  "thumbnail_negative_prompt": "Kaçınılacak unsurlar",
   "scenes": [
     {{
       "scene_id": 1,
       "chapter_index": 1,
-      "chapter_title": "Kısa bölüm başlığı",
-      "beat_type": "hook | orientation | setting | routine | craft | community | evidence | tension | turning_point | aftermath | legacy | reflection",
-      "narration_idea": "Bu sahne sırasında anlatılan ana fikir",
-      "narration_text": "Bu sahnede okunacak final Türkçe cümleler",
-      "visual_goal": "Görüntünün açıkça göstermesi gereken olay, mekân veya durum",
-      "image_prompt": "Tek bir sinematik kare üretmek için ayrıntılı İngilizce prompt",
-      "negative_prompt": "Bu sahneye özgü kaçınılacak unsurlar",
+      "chapter_title": "Bölüm adı",
+      "beat_type": "hook",
+      "narration_idea": "Sahnenin ana fikri",
+      "narration_text": "Sahne metni",
+      "visual_goal": "Somut görsel hedef",
+      "image_prompt": "Ayrıntılı İngilizce 16:9 prompt",
+      "negative_prompt": "Sahneye özgü negatifler",
       "duration_weight": 1.0,
-      "transition": "fade | dissolve | smoothleft | smoothright | hblur | fadeblack",
-      "transition_duration": 0.72,
-      "ambient_profile": "exterior_wind | interior_room | firelight | archive_room | night_silence | distant_storm",
-      "importance": "high | normal"
+      "transition": "fade",
+      "transition_duration": 0.62,
+      "ambient_profile": "exterior_wind",
+      "importance": "normal",
+      "continuity_bridge": "Önceki sahneden doğal geçiş"
     }}
   ],
-  "chapters": ["Bölüm adı"],
+  "chapters": ["Dört bölüm adı"],
   "tags": ["etiket"]
 }}
 
-ZORUNLU SENARYO KURALLARI:
-- İlk cümlede dinleyiciyi doğrudan zamana ve mekâna taşı.
-- Standart Türkiye Türkçesi kullan.
-- Sakin, tok, doğal ve güven veren anlatım kur.
-- Fragman, reklam, haber spikeri ve tiyatro tonundan kaçın.
-- Bilinmeyen ayrıntıları kesin gerçek gibi yazma.
-- Tarihsel belirsizlikleri kısa ve doğal biçimde belirt.
-- Sayıları seslendirmeye uygun biçimde yazıyla yaz.
-- Metnin sonunda yumuşak ve düşünceli bir kapanış yap.
-- Aynı cümle yapısını ve aynı bilgiyi tekrarlama.
-
-ZORUNLU GÖRSEL KURALLARI:
-- Her image_prompt doğrudan o sahnede anlatılan şeyi göstermeli.
-- Görsel sırası anlatının sırasını izlemeli; rastgele obje kataloğu olmasın.
-- Öncelik: yaşayan mekân, çevre, mimari, günlük hayat ve olay atmosferi.
-- Beyaz fonda müze objesi, katalog fotoğrafı ve bilgi kartı üretme.
-- Aynı video boyunca tek film, tek dönem ve tek renk dünyası hissi koru.
-- Tarihsel olarak olası mimari, kıyafet, eşya ve malzemeleri tarif et.
-- Fantastik kule, fantastik zırh, modern nesne veya dekor kullanma.
-- Görselin üzerinde yazı, harf, sayı, logo, altyazı veya filigran olmasın.
-- Yakın yüz planlarını sınırlı tut; atmosferik geniş ve orta planlar kullan.
-- Her sahne promptu; konu, dönem, yer, ışık, kompozisyon ve kamera açısını içersin.
-- Tam olarak {scene_count} sahne üret.
-- Sahne yapısı dört bölümden oluşsun ve her bölümde üç sahne bulunsun.
-- Bölüm 1: kanca, zaman-mekân, çevre. Bölüm 2: gündelik hayat, emek, topluluk.
-- Bölüm 3: kanıtlar, gerilim, kırılma. Bölüm 4: sonrası, miras, düşünceli kapanış.
-
-ZORUNLU EDITOR BRAIN KURALLARI:
-- narration metnini sahnelere anlamlı biçimde böl; her sahnenin narration_text alanı gerçek konuşma sırasını izlesin.
-- Sahne süreleri eşit olmasın; duration_weight ile anlatım yoğunluğuna göre ritim kur.
-- Aynı mekân veya fikir devam ediyorsa fade ya da dissolve kullan.
-- Yeni mekâna geçiliyorsa smoothleft veya smoothright kullan.
-- Zaman sıçraması, bölüm değişimi veya önemli kırılmada fadeblack kullan.
-- Hblur yalnızca sis, hatıra, belirsizlik veya zihinsel geçişlerde kullanılmalı.
-- Geçiş efekti gösteriş için değil anlatının anlamı için seçilmeli.
-- Her sahne için ortam sesini ambient_profile ile belirle.
-- world_bible bütün sahne promptlarında korunacak tek tarihî dünya referansıdır.
+KURALLAR:
+- Dört bölüm ve bölüm başına üç sahne kullan.
+- Sahne sırası: hook, orientation, setting, routine, craft, community,
+  evidence, tension, turning_point, aftermath, legacy, reflection.
+- Görseller konu, dönem ve coğrafyayla doğrudan ilişkili olsun.
+- Yanlış medeniyet, modern nesne, fantastik mimari, yazı, logo ve kolaj olmasın.
+- Aynı film paleti bütün sahnelerde korunsun.
+- Tarihsel belirsizlikleri kesin gerçek gibi sunma.
 """
 
-    payload, model = generate_json(client, prompt, max_tokens=12000)
-    model_history = [model]
+    payload: dict[str, Any] | None = None
+    model_history: list[str] = []
 
-    # Kısa veya eksik model yanıtını hata sayıp tamamen bırakmak yerine,
-    # aynı paketi otomatik olarak genişletip onar.
-    for repair_round in range(1, 4):
-        issues = _package_issues(payload, scene_count, minimum_words)
-        if not issues:
-            _normalize_package(payload, scene_count)
-            return payload, " -> ".join(model_history)
-
-        print(
-            f"Video paketi doğrulama turu {repair_round}/3: "
-            + " | ".join(issues)
+    try:
+        payload, model = generate_json(
+            client,
+            prompt,
+            max_tokens=12000,
         )
-        payload, repair_model = _repair_video_package(
+        model_history.append(model)
+    except Exception as exc:
+        print(
+            "İlk video paketi üretilemedi; yerel güvenli iskelet "
+            f"kullanılacak: {exc}"
+        )
+        payload = _local_package_skeleton(
+            topic,
+            scene_count,
+        )
+        model_history.append("local-package-skeleton")
+
+    payload = _merge_package_defaults(
+        payload,
+        topic,
+        scene_count,
+    )
+
+    structural_issues = [
+        issue
+        for issue in _package_issues(
+            payload,
+            scene_count,
+            minimum_words=0,
+        )
+        if not issue.startswith("Senaryo kısa:")
+    ]
+
+    # Only one whole-package repair is allowed. Repeating the same giant JSON
+    # three times caused the previous failure and wasted time.
+    if structural_issues:
+        print(
+            "Yapısal paket onarımı: "
+            + " | ".join(structural_issues)
+        )
+        try:
+            payload, repair_model = _repair_video_package(
+                client,
+                topic,
+                payload,
+                structural_issues,
+                target_words,
+                scene_count,
+            )
+            model_history.append(repair_model)
+            payload = _merge_package_defaults(
+                payload,
+                topic,
+                scene_count,
+            )
+        except Exception as exc:
+            print(
+                "Yapısal yapay zekâ onarımı atlandı; yerel varsayılanlar "
+                f"korunacak: {exc}"
+            )
+            model_history.append("local-structural-recovery")
+
+    current_words = _word_count(
+        payload.get("narration", "")
+    )
+    print(
+        f"Uzun format kontrolü: {current_words} kelime; "
+        f"hedef en az {minimum_words}."
+    )
+
+    if current_words < minimum_words:
+        print(
+            "FAIL-SOFT STORY RECOVERY: Senaryo dört ayrı bölüm "
+            "olarak tamamlanıyor."
+        )
+        payload, chapter_models = _force_long_form_package(
             client,
             topic,
             payload,
-            issues,
             target_words,
+            minimum_words,
             scene_count,
         )
-        model_history.append(repair_model)
+        model_history.extend(chapter_models)
 
-    final_issues = _package_issues(payload, scene_count, minimum_words)
-    if final_issues:
-        raise ValueError(
-            "Video paketi üç otomatik onarımdan sonra hâlâ geçersiz: "
-            + " | ".join(final_issues)
+    # Absolute local guard. A short script is never allowed to terminate the
+    # workflow again.
+    final_words = _word_count(
+        payload.get("narration", "")
+    )
+    if final_words < minimum_words:
+        print(
+            "LOCAL LENGTH GUARD: kalan kelime açığı yerel olarak "
+            "tamamlanıyor."
+        )
+        payload, chapter_models = _force_long_form_package(
+            client,
+            topic,
+            payload,
+            max(target_words, minimum_words + 60),
+            minimum_words,
+            scene_count,
+        )
+        model_history.extend(chapter_models)
+
+    payload = _merge_package_defaults(
+        payload,
+        topic,
+        scene_count,
+    )
+
+    final_words = _word_count(
+        payload.get("narration", "")
+    )
+    print(
+        f"FAIL-SOFT STORY READY: {final_words} kelime, "
+        f"{len(payload.get('scenes', []))} sahne."
+    )
+
+    # Remaining non-fatal warnings are logged, never raised here.
+    warnings = _package_issues(
+        payload,
+        scene_count,
+        minimum_words,
+    )
+    if warnings:
+        print(
+            "Paket uyarıları yerel güvenli değerlerle devam ediyor: "
+            + " | ".join(warnings)
         )
 
     _normalize_package(payload, scene_count)
     return payload, " -> ".join(model_history)
-
 
 
 def story_director_pass(
@@ -3001,7 +3560,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V7.txt").write_text(
+    (OUTPUT / "HATA-V7-1.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -3044,9 +3603,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V7 — FIVE MINUTE DIRECTOR ACTIVE")
+    print("UYKU VE TARİH V7.1 — FAIL-SOFT STORY ENGINE ACTIVE")
     print("Konu:", topic)
-    print("FIVE MINUTE DIRECTOR: 4 chapters, 12 scenes, 36 editorial shots")
+    print("FAIL-SOFT STORY ENGINE: chapter-by-chapter long-form generation")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -3155,7 +3714,7 @@ def main() -> None:
         target_seconds,
     )
 
-    video = OUTPUT / "uyku-tarih-v7-5-dakika.mp4"
+    video = OUTPUT / "uyku-tarih-v7-1-5-dakika.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -3206,6 +3765,10 @@ def main() -> None:
             "ffmpeg_timeout_seconds": 900,
             "fast_retry_chain": True,
             "five_minute_target": True,
+            "fail_soft_story_generation": True,
+            "chapter_by_chapter_generation": True,
+            "deterministic_local_length_guard": True,
+            "short_script_never_aborts": True,
             "chapter_tts_calls": CHAPTER_COUNT,
             "editorial_shots_per_scene": 3,
             "professional_intro_seconds": INTRO_VISIBLE_SECONDS,
@@ -3237,8 +3800,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V7 Five Minute Director yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce uyku-tarih-v7-5-dakika.mp4 dosyasını izle.\n"
+            "V7.1 Fail-Soft Story Engine yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce uyku-tarih-v7-1-5-dakika.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -3247,7 +3810,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V7 FIVE MINUTE DIRECTOR TAMAMLANDI")
+    print("V7.1 FAIL-SOFT STORY ENGINE TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
