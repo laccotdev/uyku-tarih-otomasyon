@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat
 from google import genai
 from google.genai import types
 
@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/3.4"
+USER_AGENT = "UykuTarihTopicToVideo/3.5"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -40,11 +40,14 @@ CLOUDFLARE_IMAGE_MODELS = [
 STYLE_BIBLE = """
 Photorealistic cinematic historical reconstruction for a premium late-night
 documentary. Restrained realism, plausible period architecture, materials,
-clothing and tools. Quiet atmospheric lighting, earthy natural colors,
-subtle filmic contrast, realistic skin and anatomy, immersive 16:9
-composition, no fantasy spectacle. The visual must look like a frame from one
-cohesive historical film. No text, no letters, no numbers, no captions,
-no logos, no watermarks, no borders, no collage and no museum display.
+clothing and tools. One locked film palette across the whole video: deep
+blue-black moonlit shadows, muted amber torch highlights, desaturated stone,
+earth and bronze, gentle contrast and restrained saturation. Avoid bright
+cyan, vivid orange, green casts and radically different color temperatures.
+Realistic skin and anatomy, immersive 16:9 composition, no fantasy spectacle.
+The visual must look like a frame from one cohesive historical film. No text,
+no letters, no numbers, no captions, no logos, no watermarks, no borders,
+no collage and no museum display.
 """.strip()
 
 GLOBAL_NEGATIVE = """
@@ -748,6 +751,8 @@ def review_thumbnail_candidate(
     client: genai.Client,
     image_path: Path,
     title_text: str,
+    topic: str,
+    visual_identity: str,
 ) -> tuple[int, str]:
     data = image_path.read_bytes()
     prompt = f"""
@@ -757,18 +762,20 @@ Yalnızca JSON üret:
   "reason": "Kısa açıklama"
 }}
 
-Bu görsel bir YouTube tarih videosu kapağı için arka plan adayıdır.
-Başlık metni: {title_text}
+Bu görsel aşağıdaki YouTube tarih videosunun kapak arka planı adayıdır.
+KONU: {topic}
+BAŞLIK METNİ: {title_text}
+GÖRSEL KİMLİK: {visual_identity}
 
 Puanlama kriterleri:
-- Hattuşa ve geç hitit/antik anadolu atmosferine uygun mu?
-- Premium ve sinematik mi?
-- Sol tarafta başlık için temiz ve koyu alan var mı?
-- Güçlü tek ana odak var mı?
-- Yazı, logo, filigran, kolaj veya dikkat dağıtıcı unsur var mı?
-- Videonun gece / ay ışığı / meşale tonu ile uyumlu mu?
+- Konuyu ve doğru tarihsel dönemi belirgin biçimde çağrıştırıyor mu?
+- Başka medeniyetlere ait jenerik bir yapı gibi görünmekten kaçınıyor mu?
+- Premium, sinematik ve mobil ekranda güçlü mü?
+- Sağ tarafta tek güçlü ana odak, sol tarafta temiz ve koyu başlık alanı var mı?
+- Yazı, logo, filigran, kolaj, aşırı kalabalık veya dönem dışı unsur var mı?
+- Videonun mavi-siyah ay ışığı ve kısık amber meşale paletiyle uyumlu mu?
 
-0-100 arasında puan ver.
+0-100 arasında puan ver. 72 altı zayıf kabul edilir.
 """
     part = types.Part.from_bytes(data=data, mime_type="image/jpeg")
     try:
@@ -786,12 +793,15 @@ def generate_thumbnail_candidates(
     target_dir: Path,
 ) -> tuple[Path, dict[str, Any]]:
     target_dir.mkdir(parents=True, exist_ok=True)
-    base_prompt = str(payload['thumbnail_prompt']).strip()
+    base_prompt = str(payload["thumbnail_prompt"]).strip()
+    visual_identity = str(payload["visual_identity"]).strip()
     variants = [
-        "Monumental night entrance, imposing gate, cinematic scale, strong subject on right, moody negative space on left.",
-        "Wide courtyard and temple facade at blue hour, a few torch lights, soft mist, powerful architecture, title-safe dark space left.",
-        "Closer dramatic stone portal with moonlight and low torch glow, ancient Hattusa atmosphere, clear depth, title-safe left third.",
+        "A single iconic period-specific gateway or landmark, low camera angle, monumental but historically plausible, main subject on right.",
+        "A wide atmospheric night view of the exact historical place, restrained torchlight, deep perspective, strong subject on right.",
+        "A closer architectural detail unique to the topic, dramatic moonlight, clear silhouette, cinematic scale, dark left third.",
+        "A quiet human-scale moment at the historical location with one small silhouette for scale, architecture dominant, clean left third.",
     ]
+
     best_path: Path | None = None
     best_score = -1
     best_info: dict[str, Any] = {}
@@ -799,30 +809,38 @@ def generate_thumbnail_candidates(
     for idx, extra in enumerate(variants, start=1):
         target = target_dir / f"thumbnail_candidate_{idx}.jpg"
         prompt = (
-            f"{base_prompt}\n\n{extra}\n\n"
-            f"VIDEO VISUAL IDENTITY:\n{payload['visual_identity'].strip()}\n\n"
+            f"{base_prompt}\n\nTOPIC: {topic}\n\n{extra}\n\n"
+            f"VIDEO VISUAL IDENTITY:\n{visual_identity}\n\n"
             f"MASTER STYLE:\n{STYLE_BIBLE}\n"
-            "YouTube thumbnail background only. Main focal subject on the right third. "
-            "Left third must be darker, calmer and cleaner for bold title placement. "
-            "Single cohesive environment, no collage, no text."
+            "YouTube thumbnail background only. Topic-specific architecture, clothing and iconography. "
+            "Main focal subject on the right third. Left third darker, calmer and uncluttered for typography. "
+            "Single cohesive environment, no collage, no written symbols and no generic Egyptian, Greek or Roman substitution unless the topic requires it."
         )
         negative = (
             f"{GLOBAL_NEGATIVE}, "
             f"{str(payload.get('thumbnail_negative_prompt', '')).strip()}, "
-            "words, title, typography, collage, multiple panels, busy left side"
+            "words, title, typography, collage, multiple panels, busy left side, generic ancient temple, wrong civilization"
         )
-        info = generate_thumbnail_background_with_prompt(topic, prompt, negative, target, candidate_id=idx)
-        score, reason = review_thumbnail_candidate(client, target, str(payload.get('thumbnail_text', '')))
-        info['review_score'] = score
-        info['review_reason'] = reason
+        info = generate_thumbnail_background_with_prompt(
+            topic, prompt, negative, target, candidate_id=idx
+        )
+        score, reason = review_thumbnail_candidate(
+            client,
+            target,
+            str(payload.get("thumbnail_text", "")),
+            topic,
+            visual_identity,
+        )
+        info["review_score"] = score
+        info["review_reason"] = reason
         if score > best_score:
             best_score = score
             best_path = target
             best_info = info
 
     if best_path is None:
-        raise RuntimeError('Kapak adayı seçilemedi.')
-    best_info['selected_file'] = best_path.name
+        raise RuntimeError("Kapak adayı seçilemedi.")
+    best_info["selected_file"] = best_path.name
     return best_path, best_info
 
 
@@ -869,20 +887,47 @@ def video_font(size: int, bold: bool = False):
 def clean_video_frame(source: Path, target: Path) -> None:
     with Image.open(source) as raw:
         image = ImageOps.exif_transpose(raw).convert("RGB")
+
     frame = ImageOps.fit(
-        image, (WIDTH, HEIGHT),
+        image,
+        (WIDTH, HEIGHT),
         method=Image.Resampling.LANCZOS,
         centering=(0.5, 0.5),
     )
-    frame = ImageEnhance.Color(frame).enhance(0.90)
-    frame = ImageEnhance.Contrast(frame).enhance(1.06)
-    frame = ImageEnhance.Brightness(frame).enhance(0.95)
 
+    # Match every scene to a common night-documentary exposure.
+    gray = ImageOps.grayscale(frame)
+    mean_luma = sum(ImageStat.Stat(gray).mean) / 1.0
+    target_luma = 72.0
+    exposure_gain = max(0.78, min(1.22, target_luma / max(1.0, mean_luma)))
+    frame = ImageEnhance.Brightness(frame).enhance(exposure_gain)
+    frame = ImageEnhance.Color(frame).enhance(0.78)
+    frame = ImageEnhance.Contrast(frame).enhance(1.07)
+
+    # Fixed blue-shadow / amber-highlight grade. This is static, not animated.
+    luminance = ImageOps.grayscale(frame)
+    grade = ImageOps.colorize(
+        luminance,
+        black=(13, 22, 36),
+        mid=(91, 88, 91),
+        white=(216, 190, 151),
+    ).convert("RGB")
+    frame = Image.blend(frame, grade, 0.30)
+
+    # Fixed vignette and subtle matte. No per-frame grain or animated noise.
     overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    draw.rectangle((0, 0, WIDTH, HEIGHT), fill=(13, 10, 7, 16))
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill=(7, 9, 13, 20))
+    for inset, alpha in ((0, 38), (55, 25), (120, 14)):
+        draw.rounded_rectangle(
+            (inset, inset, WIDTH - inset, HEIGHT - inset),
+            radius=70,
+            outline=(0, 0, 0, alpha),
+            width=90,
+        )
+
     frame = Image.alpha_composite(frame.convert("RGBA"), overlay).convert("RGB")
-    frame.save(target, "JPEG", quality=94, optimize=True)
+    frame.save(target, "JPEG", quality=95, optimize=True)
 
 
 def make_storyboard(
@@ -1088,33 +1133,20 @@ def normalize_audio(source: Path, target: Path) -> None:
 
 
 def scene_filter(motion: str, frames: int, seconds: float) -> str:
-    fade_out = max(0.0, seconds - 0.6)
-    if motion == "slow_zoom_out":
-        zoom = "if(eq(on,1),1.075,max(1.0,zoom-0.00020))"
-        x = "iw/2-(iw/zoom/2)"
-        y = "ih/2-(ih/zoom/2)"
-    elif motion == "pan_left":
-        zoom = "1.045"
-        x = "(iw-iw/zoom)*(1-on/{frames})".format(frames=max(1, frames))
-        y = "ih/2-(ih/zoom/2)"
-    elif motion == "pan_right":
-        zoom = "1.045"
-        x = "(iw-iw/zoom)*(on/{frames})".format(frames=max(1, frames))
-        y = "ih/2-(ih/zoom/2)"
-    else:
-        zoom = "min(zoom+0.00018,1.075)"
-        x = "iw/2-(iw/zoom/2)"
-        y = "ih/2-(ih/zoom/2)"
-
+    # ZERO-JITTER MODE: no zoom, pan, grain, noise or animated sharpening.
+    # All perceived motion comes only from controlled scene transitions.
     return (
-        f"zoompan=z='{zoom}':x='{x}':y='{y}':"
-        f"d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS},"
-        f"fade=t=in:st=0:d=0.6,"
-        f"fade=t=out:st={fade_out:.3f}:d=0.6,"
-        "vignette=PI/5.5,"
-        "noise=alls=1.4:allf=t,"
-        "format=yuv420p"
+        f"scale={WIDTH}:{HEIGHT}:flags=lanczos,"
+        "setsar=1,format=yuv420p"
     )
+
+
+def transition_name(index: int, total: int) -> str:
+    # Restrained editorial rhythm. Dip-to-black marks major narrative beats.
+    if index in {max(1, total // 3) - 1, max(1, (2 * total) // 3) - 1}:
+        return "fadeblack"
+    tasteful = ["fade", "smoothleft", "fade", "smoothright", "hblur", "fade"]
+    return tasteful[index % len(tasteful)]
 
 
 def render_video(
@@ -1124,45 +1156,98 @@ def render_video(
     target: Path,
 ) -> float:
     duration = ffprobe_duration(audio)
-    scene_seconds = duration / len(frames)
+    transition_duration = 0.80 if len(frames) > 1 else 0.0
+    clip_seconds = (
+        duration + transition_duration * max(0, len(frames) - 1)
+    ) / len(frames)
+
     clips_dir = WORK / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
     clips: list[Path] = []
 
-    for index, (frame, scene) in enumerate(zip(frames, scenes), start=1):
-        frames_count = max(1, math.ceil(scene_seconds * FPS))
+    for index, frame in enumerate(frames, start=1):
         clip = clips_dir / f"clip_{index:03d}.mp4"
-        motion = str(scene.get("motion", "slow_zoom_in"))
         run(
             [
                 "ffmpeg", "-y",
-                "-loop", "1", "-i", str(frame),
-                "-vf", scene_filter(motion, frames_count, scene_seconds),
-                "-frames:v", str(frames_count),
-                "-an", "-c:v", "libx264", "-preset", "veryfast",
-                "-crf", "21", "-pix_fmt", "yuv420p",
+                "-loop", "1",
+                "-framerate", str(FPS),
+                "-i", str(frame),
+                "-t", f"{clip_seconds:.3f}",
+                "-vf", scene_filter("static", 0, clip_seconds),
+                "-an",
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "18",
+                "-tune", "stillimage",
+                "-pix_fmt", "yuv420p",
+                "-r", str(FPS),
                 str(clip),
             ]
         )
         clips.append(clip)
 
-    concat = WORK / "clips.txt"
-    concat.write_text(
-        "\n".join(f"file '{clip.resolve().as_posix()}'" for clip in clips),
-        encoding="utf-8",
+    if len(clips) == 1:
+        run(
+            [
+                "ffmpeg", "-y",
+                "-i", str(clips[0]),
+                "-i", str(audio),
+                "-filter_complex",
+                f"[0:v]fade=t=in:st=0:d=1.0,fade=t=out:st={max(0.0, duration - 1.2):.3f}:d=1.2[vout]",
+                "-map", "[vout]",
+                "-map", "1:a:0",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest", "-movflags", "+faststart",
+                str(target),
+            ]
+        )
+        return duration
+
+    filter_parts: list[str] = []
+    current_label = "[0:v]"
+    offset = clip_seconds - transition_duration
+
+    for index in range(1, len(clips)):
+        out_label = f"[vx{index}]"
+        transition = transition_name(index - 1, len(clips))
+        filter_parts.append(
+            f"{current_label}[{index}:v]"
+            f"xfade=transition={transition}:duration={transition_duration:.2f}:"
+            f"offset={offset:.3f}{out_label}"
+        )
+        current_label = out_label
+        offset += clip_seconds - transition_duration
+
+    final_label = "[vfinal]"
+    filter_parts.append(
+        f"{current_label}"
+        f"fade=t=in:st=0:d=1.0,"
+        f"fade=t=out:st={max(0.0, duration - 1.25):.3f}:d=1.25"
+        f"{final_label}"
     )
 
-    run(
-        [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(concat),
-            "-i", str(audio),
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest", "-movflags", "+faststart",
-            str(target),
-        ]
-    )
+    command = ["ffmpeg", "-y"]
+    for clip in clips:
+        command += ["-i", str(clip)]
+    command += ["-i", str(audio)]
+    command += [
+        "-filter_complex", ";".join(filter_parts),
+        "-map", final_label,
+        "-map", f"{len(clips)}:a:0",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-r", str(FPS),
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        "-movflags", "+faststart",
+        str(target),
+    ]
+    run(command)
     return duration
 
 
@@ -1222,7 +1307,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V3-4.txt").write_text(
+    (OUTPUT / "HATA-V3-5.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -1249,7 +1334,7 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V3.4 — KONUDAN VİDEOYA")
+    print("UYKU VE TARİH V3.5 — KONUDAN VİDEOYA")
     print("Konu:", topic)
     print("=" * 72)
 
@@ -1305,7 +1390,7 @@ def main() -> None:
     audio = OUTPUT / "seslendirme.wav"
     normalize_audio(raw_audio, audio)
 
-    video = OUTPUT / "pilot-video-v3-4.mp4"
+    video = OUTPUT / "pilot-video-v3-5.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], audio, video
     )
@@ -1347,6 +1432,10 @@ def main() -> None:
         "thumbnail": thumb_info,
         "final_video_contains_scene_numbers": False,
         "final_video_contains_scene_titles": False,
+        "zero_jitter_mode": True,
+        "camera_motion_inside_scenes": False,
+        "transition_duration_seconds": 0.8,
+        "transition_style": "restrained editorial xfade",
     }
     (OUTPUT / "uretim-raporu.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -1355,8 +1444,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V3.4 yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce pilot-video-v3-4.mp4 dosyasını izle.\n"
+            "V3.5 yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce pilot-video-v3-5.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -1365,7 +1454,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V3.4 ÜRETİM TAMAMLANDI")
+    print("V3.5 ÜRETİM TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
