@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/5.0"
+USER_AGENT = "UykuTarihTopicToVideo/5.1"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -71,6 +71,11 @@ TTS_MODELS = [
     "gemini-3.1-flash-tts-preview",
     "gemini-2.5-flash-preview-tts",
 ]
+
+# Cloudflare FLUX.1 accepts at most 2048 characters in `prompt`.
+# Keep a safety margin because fallback models receive exclusions in the same field.
+MAX_IMAGE_PROMPT_CHARS = 1320
+MAX_NEGATIVE_PROMPT_CHARS = 360
 
 TRANSITIONS = [
     "fade",
@@ -545,20 +550,42 @@ def validate_package(
         raise ValueError(" | ".join(issues))
     _normalize_package(payload, scene_count)
 
+def _compact_text(value: Any, limit: int) -> str:
+    clean = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(1, limit - 1)].rstrip(" ,.;:-") + "…"
+
+
+def _fit_prompt(parts: list[str], limit: int = MAX_IMAGE_PROMPT_CHARS) -> str:
+    clean_parts = [re.sub(r"\s+", " ", p).strip() for p in parts if str(p).strip()]
+    result = ". ".join(clean_parts)
+    if len(result) <= limit:
+        return result
+    budgets = [900, 410, 260, 230]
+    reduced = [
+        _compact_text(part, budgets[i] if i < len(budgets) else 160)
+        for i, part in enumerate(clean_parts)
+    ]
+    return _compact_text(". ".join(reduced), limit)
+
+
 def combined_prompt(payload: dict[str, Any], scene: dict[str, Any]) -> str:
-    return (
-        f"{scene['image_prompt'].strip()}\n\n"
-        f"WORLD BIBLE — STRICT CONTINUITY:\n{_world_bible_text(payload)}\n\n"
-        f"VIDEO VISUAL IDENTITY:\n{payload['visual_identity'].strip()}\n\n"
-        f"MASTER STYLE:\n{STYLE_BIBLE}\n\n"
-        "Continuity lock: architecture, materials, clothing, light direction and "
-        "color temperature must match every other scene in this video."
-    )
+    world = _world_bible_text(payload)
+    return _fit_prompt([
+        str(scene.get("image_prompt", "")),
+        f"Strict historical continuity: {world}",
+        f"Visual identity: {payload.get('visual_identity', '')}",
+        "Photorealistic premium late-night historical documentary, cohesive film still, plausible period architecture and materials, blue-black moonlit shadows, restrained amber firelight, 16:9, no text or collage.",
+    ])
 
 
 def combined_negative(scene: dict[str, Any]) -> str:
     extra = str(scene.get("negative_prompt", "")).strip()
-    return f"{GLOBAL_NEGATIVE}, {extra}" if extra else GLOBAL_NEGATIVE
+    return _compact_text(
+        f"{GLOBAL_NEGATIVE}, {extra}" if extra else GLOBAL_NEGATIVE,
+        MAX_NEGATIVE_PROMPT_CHARS,
+    )
 
 
 def deterministic_seed(topic: str, scene_id: int, attempt: int) -> int:
@@ -655,33 +682,43 @@ def _cloudflare_request_body(
     negative: str,
     seed: int,
 ) -> tuple[dict[str, str], dict[str, str] | None]:
-    """Return form data for multipart models or JSON for classic models."""
-    final_prompt = (
-        f"{prompt}\n\n"
-        f"STRICT EXCLUSIONS: {negative}\n"
-        "Landscape 16:9 frame, clean cinematic composition."
+    """Build a Cloudflare-safe request with a strict character guard."""
+    prompt = _compact_text(prompt, 1040)
+    negative = _compact_text(negative, MAX_NEGATIVE_PROMPT_CHARS)
+
+    # FLUX fallback models count exclusions in the same prompt field.
+    final_prompt = _compact_text(
+        f"{prompt}. Avoid: {negative}. Landscape 16:9, cinematic historical film still, no text.",
+        MAX_IMAGE_PROMPT_CHARS,
+    )
+    print(
+        f"V5.2 prompt guard: model={model}, "
+        f"prompt_chars={len(final_prompt)}, negative_chars={len(negative)}"
     )
 
+    if len(final_prompt) > MAX_IMAGE_PROMPT_CHARS:
+        raise RuntimeError(
+            f"Internal prompt guard failed: {len(final_prompt)} characters"
+        )
+
     if "flux-2-klein" in model or "flux-2-dev" in model:
-        form = {
+        return {
             "prompt": final_prompt,
             "width": "1344",
             "height": "768",
             "guidance": "4.5",
             "seed": str(seed),
-        }
-        return form, None
+        }, None
 
     if "flux-1-schnell" in model:
-        body = {
+        return {}, {
             "prompt": final_prompt,
             "seed": seed,
             "steps": 8,
         }
-        return {}, body
 
-    body = {
-        "prompt": prompt,
+    return {}, {
+        "prompt": _compact_text(prompt, 1100),
         "negative_prompt": negative,
         "width": 1024,
         "height": 576,
@@ -689,7 +726,6 @@ def _cloudflare_request_body(
         "guidance": 7.5,
         "seed": seed,
     }
-    return {}, body
 
 
 def cloudflare_image_request(
@@ -706,32 +742,73 @@ def cloudflare_image_request(
         "User-Agent": USER_AGENT,
         "Accept": "application/json, image/*",
     }
-    form_data, json_body = _cloudflare_request_body(model, prompt, negative, seed)
 
-    if form_data:
-        response = requests.post(
-            endpoint,
-            data=form_data,
-            headers=headers,
-            timeout=(20, 180),
-        )
-    else:
-        response = requests.post(
+    def send(form_data: dict[str, str], json_body: dict[str, Any] | None):
+        if form_data:
+            return requests.post(
+                endpoint,
+                data=form_data,
+                headers=headers,
+                timeout=(20, 180),
+            )
+        return requests.post(
             endpoint,
             json=json_body,
             headers={**headers, "Content-Type": "application/json"},
             timeout=(20, 180),
         )
 
+    form_data, json_body = _cloudflare_request_body(
+        model, prompt, negative, seed
+    )
+    response = send(form_data, json_body)
+
+    # Last-resort retry for Cloudflare prompt-length validation.
+    if response.status_code == 400 and "prompt" in response.text.lower() and "2048" in response.text:
+        emergency_prompt = _compact_text(prompt, 760)
+        print(
+            "Cloudflare rejected prompt length; emergency retry active: "
+            f"{len(emergency_prompt)} chars"
+        )
+        if "flux-2-klein" in model or "flux-2-dev" in model:
+            form_data = {
+                "prompt": emergency_prompt,
+                "width": "1344",
+                "height": "768",
+                "guidance": "4.0",
+                "seed": str(seed),
+            }
+            json_body = None
+        elif "flux-1-schnell" in model:
+            form_data = {}
+            json_body = {
+                "prompt": emergency_prompt,
+                "seed": seed,
+                "steps": 8,
+            }
+        else:
+            form_data = {}
+            json_body = {
+                "prompt": emergency_prompt,
+                "negative_prompt": "text, logo, modern objects, fantasy, distortion",
+                "width": 1024,
+                "height": 576,
+                "num_steps": 8 if "dreamshaper" in model else 20,
+                "guidance": 7.0,
+                "seed": seed,
+            }
+        response = send(form_data, json_body)
+
     if not response.ok:
         raise _cloudflare_error(response)
     _save_generated_image(_decode_cloudflare_image(response), target)
+
 
 def image_review(
     client: genai.Client,
     scene: dict[str, Any],
     image_path: Path,
-) -> tuple[bool, str]:
+) -> tuple[bool, int, str]:
     data = image_path.read_bytes()
     prompt = f"""
 Yalnızca JSON üret:
@@ -759,11 +836,11 @@ score 0-100 olsun. pass yalnızca score 64 veya üzerindeyse true olsun.
         payload, _ = generate_json_with_parts(client, prompt, part)
         score = int(payload.get("score", 0))
         passed = bool(payload.get("pass")) and score >= 64
-        return passed, str(payload.get("reason", ""))
+        return passed, score, str(payload.get("reason", ""))
     except Exception as exc:
         # Görsel değerlendirme servisi geçici olarak çalışmazsa üretimi durdurma.
         print("Görsel kalite değerlendirmesi atlandı:", exc)
-        return True, "Otomatik inceleme geçici olarak atlandı."
+        return True, 70, "Otomatik inceleme geçici olarak atlandı."
 
 
 def generate_json_with_parts(
@@ -810,6 +887,12 @@ def generate_scene_image(
     models = cloudflare_model_chain()
     last_error: Exception | None = None
     max_attempts = min(4, len(models))
+    best_score = -1
+    best_reason = ""
+    best_model = ""
+    best_seed = 0
+    best_file = WORK / f"best-scene-{int(scene['scene_id']):02d}.jpg"
+    best_file.unlink(missing_ok=True)
 
     for attempt, model in enumerate(models[:max_attempts], start=1):
         seed = deterministic_seed(topic, int(scene["scene_id"]), attempt)
@@ -819,19 +902,24 @@ def generate_scene_image(
                 f"deneme={attempt}/{max_attempts}"
             )
             cloudflare_image_request(
-                combined_prompt(payload, scene),
-                combined_negative(scene),
-                seed,
-                target,
-                model,
+                combined_prompt(payload, scene), combined_negative(scene), seed, target, model
             )
-            passed, reason = image_review(client, scene, target)
-            print(f"Görsel değerlendirmesi: pass={passed}; {reason}")
+            passed, score, reason = image_review(client, scene, target)
+            print(f"Görsel değerlendirmesi: pass={passed}; score={score}; {reason}")
+
+            if score > best_score:
+                shutil.copyfile(target, best_file)
+                best_score = score
+                best_reason = reason
+                best_model = model
+                best_seed = seed
+
             if passed:
                 return {
                     "scene_id": scene["scene_id"],
                     "model": model,
                     "seed": seed,
+                    "review_score": score,
                     "review": reason,
                     "file": target.name,
                 }
@@ -846,7 +934,19 @@ def generate_scene_image(
                     "Cloudflare günlük ücretsiz görsel kotası dolmuş. "
                     "Kota 00:00 UTC'de yenilenir."
                 ) from exc
-            time.sleep(min(12, 3 * attempt))
+            time.sleep(min(8, 2 * attempt))
+
+    if best_file.exists() and best_score >= 48:
+        shutil.copyfile(best_file, target)
+        return {
+            "scene_id": scene["scene_id"],
+            "model": best_model,
+            "seed": best_seed,
+            "review_score": best_score,
+            "review": f"En iyi aday kullanıldı: {best_reason}",
+            "quality_fallback": True,
+            "file": target.name,
+        }
 
     raise RuntimeError(
         f"Sahne {scene['scene_id']} için uygun görsel üretilemedi: {last_error}"
@@ -1845,7 +1945,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V5.txt").write_text(
+    (OUTPUT / "HATA-V5-2.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -1872,8 +1972,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V5 — EDITOR BRAIN")
+    print("UYKU VE TARİH V5.1 — EDITOR BRAIN")
     print("Konu:", topic)
+    print("PROMPT GUARD: ACTIVE — hard limit 1320 characters")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -1953,7 +2054,7 @@ def main() -> None:
         narration_audio, ambient_track, final_audio
     )
 
-    video = OUTPUT / "pilot-video-v5-editorial-cut.mp4"
+    video = OUTPUT / "pilot-video-v5-2-editorial-cut.mp4"
     actual_duration = render_video(
         frames,
         payload["scenes"],
@@ -2022,7 +2123,7 @@ def main() -> None:
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
             "V5 Editorial Cut Engine yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce pilot-video-v5-editorial-cut.mp4 dosyasını izle.\n"
+            "Önce pilot-video-v5-2-editorial-cut.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
