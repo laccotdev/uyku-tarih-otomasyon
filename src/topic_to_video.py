@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/3.5"
+USER_AGENT = "UykuTarihTopicToVideo/4.0"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -74,12 +74,22 @@ TTS_MODELS = [
 
 TRANSITIONS = [
     "fade",
+    "dissolve",
     "smoothleft",
     "smoothright",
+    "hblur",
     "fadeblack",
-    "smoothup",
-    "smoothdown",
 ]
+
+ALLOWED_TRANSITIONS = set(TRANSITIONS)
+ALLOWED_AMBIENT_PROFILES = {
+    "exterior_wind",
+    "interior_room",
+    "firelight",
+    "archive_room",
+    "night_silence",
+    "distant_storm",
+}
 
 
 def run(command: list[str]) -> None:
@@ -184,6 +194,81 @@ def _word_count(value: Any) -> int:
     return len(re.findall(r"\b\w+\b", str(value), flags=re.UNICODE))
 
 
+def _split_narration_into_scenes(narration: str, scene_count: int) -> list[str]:
+    sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?])\s+", narration.strip())
+        if item.strip()
+    ]
+    if not sentences:
+        return [narration.strip()] + [""] * max(0, scene_count - 1)
+
+    total_words = max(1, sum(_word_count(item) for item in sentences))
+    target = total_words / max(1, scene_count)
+    chunks: list[str] = []
+    current: list[str] = []
+    current_words = 0
+
+    for sentence in sentences:
+        sentence_words = _word_count(sentence)
+        remaining_slots = scene_count - len(chunks)
+        if current and current_words + sentence_words > target and remaining_slots > 1:
+            chunks.append(" ".join(current).strip())
+            current = []
+            current_words = 0
+        current.append(sentence)
+        current_words += sentence_words
+
+    if current:
+        chunks.append(" ".join(current).strip())
+
+    while len(chunks) < scene_count:
+        longest_index = max(range(len(chunks)), key=lambda idx: _word_count(chunks[idx]))
+        words = chunks[longest_index].split()
+        if len(words) < 8:
+            chunks.append("")
+            continue
+        midpoint = len(words) // 2
+        left = " ".join(words[:midpoint]).strip()
+        right = " ".join(words[midpoint:]).strip()
+        chunks[longest_index] = left
+        chunks.insert(longest_index + 1, right)
+
+    if len(chunks) > scene_count:
+        head = chunks[: scene_count - 1]
+        tail = " ".join(chunks[scene_count - 1 :]).strip()
+        chunks = head + [tail]
+    return chunks[:scene_count]
+
+
+def _ensure_scene_narration(payload: dict[str, Any]) -> None:
+    scenes = list(payload.get("scenes", []))
+    narration = re.sub(r"\s+", " ", str(payload.get("narration", ""))).strip()
+    scene_texts = [
+        re.sub(r"\s+", " ", str(scene.get("narration_text", ""))).strip()
+        for scene in scenes
+    ]
+    covered_words = sum(_word_count(item) for item in scene_texts)
+    narration_words = max(1, _word_count(narration))
+
+    if len(scene_texts) != len(scenes) or covered_words < narration_words * 0.72:
+        scene_texts = _split_narration_into_scenes(narration, len(scenes))
+
+    for scene, scene_text in zip(scenes, scene_texts):
+        scene["narration_text"] = scene_text
+
+    joined = " ".join(item for item in scene_texts if item).strip()
+    if joined:
+        payload["narration"] = joined
+
+
+def _world_bible_text(payload: dict[str, Any]) -> str:
+    world = payload.get("world_bible", {})
+    if isinstance(world, dict):
+        return json.dumps(world, ensure_ascii=False, indent=2)
+    return str(world).strip()
+
+
 def _package_issues(
     payload: dict[str, Any],
     scene_count: int,
@@ -192,7 +277,7 @@ def _package_issues(
     issues: list[str] = []
     required = (
         "video_title", "thumbnail_text", "description", "narration",
-        "visual_identity", "thumbnail_prompt", "scenes",
+        "visual_identity", "world_bible", "thumbnail_prompt", "scenes",
     )
     missing = [key for key in required if not payload.get(key)]
     if missing:
@@ -218,8 +303,11 @@ def _package_issues(
         if not isinstance(scene, dict):
             issues.append(f"Sahne {index} geçersiz.")
             continue
-        for key in ("narration_idea", "visual_goal", "image_prompt"):
-            if not str(scene.get(key, "")).strip():
+        for key in (
+            "narration_idea", "narration_text", "visual_goal", "image_prompt",
+            "transition", "transition_duration", "ambient_profile",
+        ):
+            if scene.get(key) in (None, ""):
                 issues.append(f"Sahne {index} için {key} eksik.")
     return issues
 
@@ -232,13 +320,32 @@ def _normalize_package(payload: dict[str, Any], scene_count: int) -> None:
 
     for index, scene in enumerate(payload["scenes"], start=1):
         scene["scene_id"] = index
-        motion = str(scene.get("motion", "slow_zoom_in"))
-        if motion not in {
-            "slow_zoom_in", "slow_zoom_out", "pan_left", "pan_right"
-        }:
-            scene["motion"] = "slow_zoom_in"
+        transition = str(scene.get("transition", "fade")).strip().lower()
+        if transition not in ALLOWED_TRANSITIONS:
+            transition = "fade"
+        scene["transition"] = transition
+
+        try:
+            transition_duration = float(scene.get("transition_duration", 0.72))
+        except (TypeError, ValueError):
+            transition_duration = 0.72
+        scene["transition_duration"] = max(0.45, min(1.25, transition_duration))
+
+        ambient = str(scene.get("ambient_profile", "night_silence")).strip().lower()
+        if ambient not in ALLOWED_AMBIENT_PROFILES:
+            ambient = "night_silence"
+        scene["ambient_profile"] = ambient
+
+        try:
+            weight = float(scene.get("duration_weight", 1.0))
+        except (TypeError, ValueError):
+            weight = 1.0
+        scene["duration_weight"] = max(0.55, min(1.8, weight))
+
         if str(scene.get("importance", "normal")) not in {"high", "normal"}:
             scene["importance"] = "normal"
+
+    _ensure_scene_narration(payload)
 
 
 def _repair_video_package(
@@ -269,10 +376,16 @@ ZORUNLU HEDEFLER:
 - İlk cümle dinleyiciyi zamana ve mekâna taşısın.
 - Son cümle yumuşak bir kapanış yapsın.
 - Tam {scene_count} sahne olsun.
+- world_bible alanı dönem, coğrafya, mimari, kıyafet, malzeme, ışık, palet ve yasaklanan medeniyetleri tanımlasın.
+- Her sahnede narration_text alanı bulunsun ve tüm narration_text alanları birleştiğinde narration metnini oluştursun.
 - Her sahne narration sırasındaki somut fikri doğrudan görselleştirsin.
+- transition yalnızca fade, dissolve, smoothleft, smoothright, hblur veya fadeblack olsun.
+- transition_duration 0.45 ile 1.25 saniye arasında olsun.
+- ambient_profile yalnızca exterior_wind, interior_room, firelight, archive_room, night_silence veya distant_storm olsun.
+- duration_weight 0.55 ile 1.8 arasında olsun.
 - Her image_prompt İngilizce, ayrıntılı, 16:9 sinematik tarih karesi tarif etsin.
 - Müze objesi, beyaz fon, kolaj, yazı, sayı, logo, modern veya fantastik unsur olmasın.
-- video_title, thumbnail_text, description, visual_identity,
+- video_title, thumbnail_text, description, visual_identity, world_bible,
   thumbnail_prompt, thumbnail_negative_prompt, chapters ve tags alanlarını koru veya iyileştir.
 - thumbnail_text en fazla dört kelime olsun.
 
@@ -318,16 +431,30 @@ JSON ŞEMASI:
   "description": "İki kısa paragraf Türkçe açıklama",
   "narration": "Tek parça final Türkçe seslendirme metni",
   "visual_identity": "Bu videoya özgü tek cümlelik sanat yönetimi",
+  "world_bible": {{
+    "period": "Dönem",
+    "location": "Coğrafya",
+    "architecture": "Tutarlı mimari tanımı",
+    "clothing": "Tutarlı kıyafet tanımı",
+    "materials": "Taş, kerpiç, ahşap, bronz gibi malzemeler",
+    "lighting": "Ay ışığı, yağ kandili, meşale gibi ışık kuralları",
+    "palette": "Bütün videoda korunacak renk paleti",
+    "forbidden": ["Yanlış medeniyet ve dönem unsurları"]
+  }},
   "thumbnail_prompt": "Yazısız 16:9 kapak arka planı için ayrıntılı İngilizce prompt. Ana özne sağ tarafta, sol taraf koyu ve boş.",
   "thumbnail_negative_prompt": "Kapakta kesinlikle olmaması gereken unsurlar",
   "scenes": [
     {{
       "scene_id": 1,
       "narration_idea": "Bu sahne sırasında anlatılan ana fikir",
+      "narration_text": "Bu sahnede okunacak final Türkçe cümleler",
       "visual_goal": "Görüntünün açıkça göstermesi gereken olay, mekân veya durum",
       "image_prompt": "Tek bir sinematik kare üretmek için ayrıntılı İngilizce prompt",
       "negative_prompt": "Bu sahneye özgü kaçınılacak unsurlar",
-      "motion": "slow_zoom_in | slow_zoom_out | pan_left | pan_right",
+      "duration_weight": 1.0,
+      "transition": "fade | dissolve | smoothleft | smoothright | hblur | fadeblack",
+      "transition_duration": 0.72,
+      "ambient_profile": "exterior_wind | interior_room | firelight | archive_room | night_silence | distant_storm",
       "importance": "high | normal"
     }}
   ],
@@ -358,6 +485,17 @@ ZORUNLU GÖRSEL KURALLARI:
 - Yakın yüz planlarını sınırlı tut; atmosferik geniş ve orta planlar kullan.
 - Her sahne promptu; konu, dönem, yer, ışık, kompozisyon ve kamera açısını içersin.
 - Tam olarak {scene_count} sahne üret.
+
+ZORUNLU EDITOR BRAIN KURALLARI:
+- narration metnini sahnelere anlamlı biçimde böl; her sahnenin narration_text alanı gerçek konuşma sırasını izlesin.
+- Sahne süreleri eşit olmasın; duration_weight ile anlatım yoğunluğuna göre ritim kur.
+- Aynı mekân veya fikir devam ediyorsa fade ya da dissolve kullan.
+- Yeni mekâna geçiliyorsa smoothleft veya smoothright kullan.
+- Zaman sıçraması, bölüm değişimi veya önemli kırılmada fadeblack kullan.
+- Hblur yalnızca sis, hatıra, belirsizlik veya zihinsel geçişlerde kullanılmalı.
+- Geçiş efekti gösteriş için değil anlatının anlamı için seçilmeli.
+- Her sahne için ortam sesini ambient_profile ile belirle.
+- world_bible bütün sahne promptlarında korunacak tek tarihî dünya referansıdır.
 """
 
     payload, model = generate_json(client, prompt, max_tokens=12000)
@@ -410,8 +548,11 @@ def validate_package(
 def combined_prompt(payload: dict[str, Any], scene: dict[str, Any]) -> str:
     return (
         f"{scene['image_prompt'].strip()}\n\n"
+        f"WORLD BIBLE — STRICT CONTINUITY:\n{_world_bible_text(payload)}\n\n"
         f"VIDEO VISUAL IDENTITY:\n{payload['visual_identity'].strip()}\n\n"
-        f"MASTER STYLE:\n{STYLE_BIBLE}"
+        f"MASTER STYLE:\n{STYLE_BIBLE}\n\n"
+        "Continuity lock: architecture, materials, clothing, light direction and "
+        "color temperature must match every other scene in this video."
     )
 
 
@@ -1132,6 +1273,192 @@ def normalize_audio(source: Path, target: Path) -> None:
     )
 
 
+def allocate_scene_durations(
+    scenes: list[dict[str, Any]],
+    total_duration: float,
+) -> list[float]:
+    if not scenes:
+        return []
+
+    weights: list[float] = []
+    for scene in scenes:
+        words = max(4, _word_count(scene.get("narration_text", "")))
+        punctuation = len(re.findall(r"[,:;.!?]", str(scene.get("narration_text", ""))))
+        importance = 1.12 if scene.get("importance") == "high" else 1.0
+        explicit = float(scene.get("duration_weight", 1.0))
+        weights.append((words + punctuation * 0.55) * importance * explicit)
+
+    minimum = 4.2
+    maximum = 15.0
+    durations = [total_duration * weight / sum(weights) for weight in weights]
+
+    for _ in range(5):
+        durations = [max(minimum, min(maximum, item)) for item in durations]
+        difference = total_duration - sum(durations)
+        if abs(difference) < 0.02:
+            break
+        adjustable = [
+            idx for idx, item in enumerate(durations)
+            if (difference > 0 and item < maximum - 0.01)
+            or (difference < 0 and item > minimum + 0.01)
+        ]
+        if not adjustable:
+            break
+        share = difference / len(adjustable)
+        for idx in adjustable:
+            durations[idx] += share
+
+    scale = total_duration / max(0.001, sum(durations))
+    return [max(0.5, item * scale) for item in durations]
+
+
+def scene_transition_plan(scenes: list[dict[str, Any]]) -> tuple[list[str], list[float]]:
+    names: list[str] = []
+    durations: list[float] = []
+    for scene in scenes[:-1]:
+        name = str(scene.get("transition", "fade")).strip().lower()
+        if name not in ALLOWED_TRANSITIONS:
+            name = "fade"
+        try:
+            duration = float(scene.get("transition_duration", 0.72))
+        except (TypeError, ValueError):
+            duration = 0.72
+        names.append(name)
+        durations.append(max(0.45, min(1.25, duration)))
+    return names, durations
+
+
+def ambient_filter(profile: str, duration: float) -> str:
+    fade_out = max(0.0, duration - 1.0)
+    filters = {
+        "exterior_wind": "highpass=f=75,lowpass=f=950,volume=0.065",
+        "interior_room": "highpass=f=35,lowpass=f=310,volume=0.035",
+        "firelight": "highpass=f=140,lowpass=f=2600,tremolo=f=0.55:d=0.22,volume=0.038",
+        "archive_room": "highpass=f=45,lowpass=f=520,volume=0.032",
+        "distant_storm": "highpass=f=35,lowpass=f=780,volume=0.060",
+        "night_silence": "highpass=f=35,lowpass=f=240,volume=0.022",
+    }
+    selected = filters.get(profile, filters["night_silence"])
+    return (
+        f"{selected},"
+        f"afade=t=in:st=0:d=0.9,"
+        f"afade=t=out:st={fade_out:.3f}:d=1.0,"
+        "aformat=sample_rates=48000:channel_layouts=stereo"
+    )
+
+
+def generate_ambient_segment(profile: str, duration: float, target: Path) -> None:
+    color = "brown" if profile in {"interior_room", "archive_room", "distant_storm"} else "pink"
+    run(
+        [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", f"anoisesrc=color={color}:amplitude=0.18:sample_rate=48000:d={duration:.3f}",
+            "-af", ambient_filter(profile, duration),
+            "-c:a", "pcm_s16le",
+            str(target),
+        ]
+    )
+
+
+def build_ambient_track(
+    scenes: list[dict[str, Any]],
+    visible_durations: list[float],
+    transition_durations: list[float],
+    target: Path,
+) -> None:
+    ambient_dir = WORK / "ambient-scenes"
+    ambient_dir.mkdir(parents=True, exist_ok=True)
+    segments: list[Path] = []
+
+    for index, (scene, visible) in enumerate(zip(scenes, visible_durations)):
+        extra = transition_durations[index] if index < len(transition_durations) else 0.0
+        segment_duration = visible + extra
+        segment = ambient_dir / f"ambient_{index + 1:03d}.wav"
+        generate_ambient_segment(
+            str(scene.get("ambient_profile", "night_silence")),
+            segment_duration,
+            segment,
+        )
+        segments.append(segment)
+
+    if len(segments) == 1:
+        shutil.copy2(segments[0], target)
+        return
+
+    command = ["ffmpeg", "-y"]
+    for segment in segments:
+        command += ["-i", str(segment)]
+
+    filters: list[str] = []
+    current = "[0:a]"
+    for index in range(1, len(segments)):
+        out = f"[a{index}]"
+        crossfade = transition_durations[index - 1]
+        filters.append(
+            f"{current}[{index}:a]acrossfade=d={crossfade:.3f}:c1=tri:c2=tri{out}"
+        )
+        current = out
+    final = "[ambient]"
+    filters.append(f"{current}volume=0.72{final}")
+
+    command += [
+        "-filter_complex", ";".join(filters),
+        "-map", final,
+        "-c:a", "pcm_s16le",
+        str(target),
+    ]
+    run(command)
+
+
+def mix_narration_and_ambient(
+    narration: Path,
+    ambient: Path,
+    target: Path,
+) -> None:
+    run(
+        [
+            "ffmpeg", "-y",
+            "-i", str(narration),
+            "-i", str(ambient),
+            "-filter_complex",
+            "[1:a]volume=0.34[amb];"
+            "[amb][0:a]sidechaincompress=threshold=0.020:ratio=8:attack=25:release=360[ducked];"
+            "[0:a][ducked]amix=inputs=2:weights='1 1':normalize=0,"
+            "alimiter=limit=0.95,loudnorm=I=-17:TP=-2:LRA=7[aout]",
+            "-map", "[aout]",
+            "-ar", "48000",
+            "-c:a", "pcm_s16le",
+            str(target),
+        ]
+    )
+
+
+def write_edit_timeline(
+    scenes: list[dict[str, Any]],
+    visible_durations: list[float],
+    transitions: list[str],
+    transition_durations: list[float],
+    target: Path,
+) -> None:
+    cursor = 0.0
+    timeline: list[dict[str, Any]] = []
+    for index, (scene, duration) in enumerate(zip(scenes, visible_durations)):
+        item = {
+            "scene_id": scene.get("scene_id", index + 1),
+            "start": round(cursor, 3),
+            "end": round(cursor + duration, 3),
+            "duration": round(duration, 3),
+            "narration_text": scene.get("narration_text", ""),
+            "ambient_profile": scene.get("ambient_profile", "night_silence"),
+            "transition_to_next": transitions[index] if index < len(transitions) else None,
+            "transition_duration": transition_durations[index] if index < len(transition_durations) else 0.0,
+        }
+        timeline.append(item)
+        cursor += duration
+    target.write_text(json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def scene_filter(motion: str, frames: int, seconds: float) -> str:
     # ZERO-JITTER MODE: no zoom, pan, grain, noise or animated sharpening.
     # All perceived motion comes only from controlled scene transitions.
@@ -1141,31 +1468,23 @@ def scene_filter(motion: str, frames: int, seconds: float) -> str:
     )
 
 
-def transition_name(index: int, total: int) -> str:
-    # Restrained editorial rhythm. Dip-to-black marks major narrative beats.
-    if index in {max(1, total // 3) - 1, max(1, (2 * total) // 3) - 1}:
-        return "fadeblack"
-    tasteful = ["fade", "smoothleft", "fade", "smoothright", "hblur", "fade"]
-    return tasteful[index % len(tasteful)]
-
-
 def render_video(
     frames: list[Path],
     scenes: list[dict[str, Any]],
     audio: Path,
     target: Path,
+    visible_durations: list[float],
+    transitions: list[str],
+    transition_durations: list[float],
 ) -> float:
     duration = ffprobe_duration(audio)
-    transition_duration = 0.80 if len(frames) > 1 else 0.0
-    clip_seconds = (
-        duration + transition_duration * max(0, len(frames) - 1)
-    ) / len(frames)
-
     clips_dir = WORK / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
     clips: list[Path] = []
 
-    for index, frame in enumerate(frames, start=1):
+    for index, (frame, visible) in enumerate(zip(frames, visible_durations), start=1):
+        extra = transition_durations[index - 1] if index - 1 < len(transition_durations) else 0.0
+        clip_duration = visible + extra
         clip = clips_dir / f"clip_{index:03d}.mp4"
         run(
             [
@@ -1173,8 +1492,8 @@ def render_video(
                 "-loop", "1",
                 "-framerate", str(FPS),
                 "-i", str(frame),
-                "-t", f"{clip_seconds:.3f}",
-                "-vf", scene_filter("static", 0, clip_seconds),
+                "-t", f"{clip_duration:.3f}",
+                "-vf", scene_filter("static", 0, clip_duration),
                 "-an",
                 "-c:v", "libx264",
                 "-preset", "medium",
@@ -1207,18 +1526,19 @@ def render_video(
 
     filter_parts: list[str] = []
     current_label = "[0:v]"
-    offset = clip_seconds - transition_duration
+    offset = visible_durations[0]
 
     for index in range(1, len(clips)):
         out_label = f"[vx{index}]"
-        transition = transition_name(index - 1, len(clips))
+        transition = transitions[index - 1]
+        transition_duration = transition_durations[index - 1]
         filter_parts.append(
             f"{current_label}[{index}:v]"
-            f"xfade=transition={transition}:duration={transition_duration:.2f}:"
+            f"xfade=transition={transition}:duration={transition_duration:.3f}:"
             f"offset={offset:.3f}{out_label}"
         )
         current_label = out_label
-        offset += clip_seconds - transition_duration
+        offset += visible_durations[index]
 
     final_label = "[vfinal]"
     filter_parts.append(
@@ -1307,7 +1627,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V3-5.txt").write_text(
+    (OUTPUT / "HATA-V4.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -1334,7 +1654,7 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V3.5 — KONUDAN VİDEOYA")
+    print("UYKU VE TARİH V4 — EDITOR BRAIN")
     print("Konu:", topic)
     print("=" * 72)
 
@@ -1387,12 +1707,43 @@ def main() -> None:
     tts_model = synthesize_narration(
         client, payload["narration"], raw_audio
     )
-    audio = OUTPUT / "seslendirme.wav"
-    normalize_audio(raw_audio, audio)
+    narration_audio = OUTPUT / "seslendirme.wav"
+    normalize_audio(raw_audio, narration_audio)
 
-    video = OUTPUT / "pilot-video-v3-5.mp4"
+    narration_duration = ffprobe_duration(narration_audio)
+    visible_durations = allocate_scene_durations(
+        payload["scenes"], narration_duration
+    )
+    transitions, transition_durations = scene_transition_plan(payload["scenes"])
+    write_edit_timeline(
+        payload["scenes"],
+        visible_durations,
+        transitions,
+        transition_durations,
+        OUTPUT / "edit-timeline.json",
+    )
+
+    ambient_track = WORK / "ambient-track.wav"
+    build_ambient_track(
+        payload["scenes"],
+        visible_durations,
+        transition_durations,
+        ambient_track,
+    )
+    final_audio = OUTPUT / "ses-tasarim.wav"
+    mix_narration_and_ambient(
+        narration_audio, ambient_track, final_audio
+    )
+
+    video = OUTPUT / "pilot-video-v4-editor-brain.mp4"
     actual_duration = render_video(
-        frames, payload["scenes"], audio, video
+        frames,
+        payload["scenes"],
+        final_audio,
+        video,
+        visible_durations,
+        transitions,
+        transition_durations,
     )
     create_srt(
         payload["narration"], actual_duration, OUTPUT / "altyazi.srt"
@@ -1428,6 +1779,14 @@ def main() -> None:
         ),
         "actual_duration_seconds": round(actual_duration, 2),
         "scene_count": len(frames),
+        "editor_brain": {
+            "zero_jitter": True,
+            "semantic_scene_timing": True,
+            "semantic_transitions": True,
+            "procedural_ambience": True,
+            "automatic_audio_ducking": True,
+            "world_bible_continuity": True,
+        },
         "images": image_manifest,
         "thumbnail": thumb_info,
         "final_video_contains_scene_numbers": False,
@@ -1444,8 +1803,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V3.5 yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce pilot-video-v3-5.mp4 dosyasını izle.\n"
+            "V4 Editor Brain yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce pilot-video-v4-editor-brain.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -1454,7 +1813,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V3.5 ÜRETİM TAMAMLANDI")
+    print("V4 EDITOR BRAIN TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
