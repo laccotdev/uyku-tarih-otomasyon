@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/7.1"
+USER_AGENT = "UykuTarihTopicToVideo/7.2"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -68,8 +68,8 @@ TEXT_MODELS = [
 ]
 
 TTS_MODELS = [
-    "gemini-3.1-flash-tts-preview",
     "gemini-2.5-flash-preview-tts",
+    "gemini-3.1-flash-tts-preview",
 ]
 
 # Cloudflare FLUX.1 accepts at most 2048 characters in `prompt`.
@@ -1244,6 +1244,109 @@ Do not add, remove or paraphrase words. No music or effects.
 """.strip()
 
 
+def _is_quota_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "429",
+            "resource_exhausted",
+            "quota exceeded",
+            "rate limit",
+        )
+    )
+
+
+def _ensure_edge_tts() -> Any:
+    try:
+        import edge_tts
+        return edge_tts
+    except ImportError:
+        print("Ücretsiz yedek ses motoru kuruluyor: edge-tts")
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--quiet",
+                "edge-tts>=7.0,<8.0",
+            ],
+            check=True,
+            timeout=180,
+        )
+        import edge_tts
+        return edge_tts
+
+
+def synthesize_edge_tts(
+    narration: str,
+    target: Path,
+) -> str:
+    edge_tts = _ensure_edge_tts()
+    mp3_target = target.with_suffix(".edge.mp3")
+    mp3_target.unlink(missing_ok=True)
+
+    async def _save() -> str:
+        voice_name = "tr-TR-AhmetNeural"
+        try:
+            communicator = edge_tts.Communicate(
+                narration,
+                voice_name,
+                rate="-8%",
+                pitch="-3Hz",
+                volume="-2%",
+            )
+            await communicator.save(str(mp3_target))
+            return voice_name
+        except Exception:
+            voices = await edge_tts.list_voices()
+            turkish = [
+                item
+                for item in voices
+                if str(item.get("Locale", "")).lower() == "tr-tr"
+            ]
+            male = [
+                item
+                for item in turkish
+                if str(item.get("Gender", "")).lower() == "male"
+            ]
+            candidates = male or turkish
+            if not candidates:
+                raise RuntimeError("Edge TTS içinde Türkçe ses bulunamadı.")
+            selected = str(candidates[0]["ShortName"])
+            communicator = edge_tts.Communicate(
+                narration,
+                selected,
+                rate="-8%",
+                pitch="-3Hz",
+                volume="-2%",
+            )
+            await communicator.save(str(mp3_target))
+            return selected
+
+    import asyncio
+    voice = asyncio.run(_save())
+
+    if not mp3_target.exists() or mp3_target.stat().st_size < 8000:
+        raise RuntimeError("Edge TTS ses dosyası üretmedi.")
+
+    run([
+        "ffmpeg", "-y",
+        "-i", str(mp3_target),
+        "-ar", "48000",
+        "-ac", "1",
+        "-c:a", "pcm_s16le",
+        str(target),
+    ])
+    mp3_target.unlink(missing_ok=True)
+
+    if not target.exists() or ffprobe_duration(target) < 8.0:
+        raise RuntimeError("Edge TTS sesi beklenenden kısa.")
+    return f"edge-tts/{voice}"
+
+
 def synthesize_short_segment(
     client: genai.Client,
     text: str,
@@ -1255,51 +1358,52 @@ def synthesize_short_segment(
     chain = model_chain(client, [configured, *TTS_MODELS])
     last_error: Exception | None = None
 
+    # One request per Gemini model. A quota error must never trigger repeated
+    # waiting and consume the remaining free-tier quota.
     for model in chain:
-        for attempt, delay in enumerate((5, 12), start=1):
-            try:
-                print(
-                    f"Chapter TTS {scene_index}/{scene_count}: "
-                    f"model={model}, attempt={attempt}/2"
-                )
-                response = client.models.generate_content(
-                    model=model,
-                    contents=scene_tts_directive(
-                        text, scene_index, scene_count
-                    ),
-                    config=types.GenerateContentConfig(
-                        response_modalities=["AUDIO"],
-                        speech_config=types.SpeechConfig(
-                            voice_config=types.VoiceConfig(
-                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                    voice_name=VOICE_NAME
-                                )
+        try:
+            print(
+                f"Chapter TTS {scene_index}/{scene_count}: "
+                f"model={model}, attempt=1/1"
+            )
+            response = client.models.generate_content(
+                model=model,
+                contents=scene_tts_directive(
+                    text, scene_index, scene_count
+                ),
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=VOICE_NAME
                             )
-                        ),
+                        )
                     ),
-                )
-                candidates = response.candidates or []
-                if not candidates or not candidates[0].content.parts:
-                    raise ValueError("TTS bölüm sesi döndürmedi.")
-                inline = candidates[0].content.parts[0].inline_data
-                data = inline.data if inline else None
-                if not data or len(data) < 12000:
-                    raise ValueError("TTS bölüm sesi boş veya çok kısa.")
-                write_wav(target, data)
-                if ffprobe_duration(target) < 8.0:
-                    raise ValueError("TTS bölüm sesi beklenenden kısa.")
-                return model
-            except Exception as exc:
-                last_error = exc
-                target.unlink(missing_ok=True)
-                if retryable(exc) and attempt < 2:
-                    time.sleep(delay)
-                    continue
-                break
+                ),
+            )
+            candidates = response.candidates or []
+            if not candidates or not candidates[0].content.parts:
+                raise ValueError("TTS bölüm sesi döndürmedi.")
+            inline = candidates[0].content.parts[0].inline_data
+            data = inline.data if inline else None
+            if not data or len(data) < 12000:
+                raise ValueError("TTS bölüm sesi boş veya çok kısa.")
+            write_wav(target, data)
+            if ffprobe_duration(target) < 8.0:
+                raise ValueError("TTS bölüm sesi beklenenden kısa.")
+            return model
+        except Exception as exc:
+            last_error = exc
+            target.unlink(missing_ok=True)
+            print(f"Gemini bölüm TTS atlandı: {model}: {exc}")
+            continue
 
-    raise RuntimeError(
-        f"Bölüm {scene_index} seslendirilemedi: {last_error}"
+    print(
+        f"Gemini bölüm TTS kullanılamadı; ücretsiz yedek ses motoruna "
+        f"geçiliyor. Son hata: {last_error}"
     )
+    return synthesize_edge_tts(text, target)
 
 
 def append_scene_pause(
@@ -1323,30 +1427,86 @@ def append_scene_pause(
     ])
 
 
+def _verify_media_file(path: Path, label: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"{label} bulunamadı: {path}")
+    if path.stat().st_size < 128:
+        raise RuntimeError(f"{label} boş veya bozuk: {path}")
+
+
 def concat_audio_files(files: list[Path], target: Path) -> None:
     if not files:
         raise ValueError("Birleştirilecek ses bulunamadı.")
+
+    for index, path in enumerate(files, start=1):
+        _verify_media_file(path, f"Ses parçası {index}")
+
+    target.unlink(missing_ok=True)
     if len(files) == 1:
         shutil.copy2(files[0], target)
+        _verify_media_file(target, "Birleştirilmiş ses")
         return
 
-    concat_file = WORK / f"audio-concat-{target.stem}.txt"
-    concat_file.write_text(
-        "".join(
-            f"file '{path.resolve().as_posix()}'\\n"
-            for path in files
-        ),
-        encoding="utf-8",
+    command = ["ffmpeg", "-y"]
+    filters: list[str] = []
+    labels: list[str] = []
+
+    for index, path in enumerate(files):
+        command.extend(["-i", str(path)])
+        label = f"a{index}"
+        filters.append(
+            f"[{index}:a]"
+            "aresample=48000,"
+            "aformat=sample_fmts=s16:channel_layouts=mono,"
+            f"asetpts=N/SR/TB[{label}]"
+        )
+        labels.append(f"[{label}]")
+
+    filters.append(
+        "".join(labels)
+        + f"concat=n={len(files)}:v=0:a=1[outa]"
     )
-    run([
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", str(concat_file),
+
+    command.extend([
+        "-filter_complex", ";".join(filters),
+        "-map", "[outa]",
         "-ar", "48000",
         "-ac", "1",
         "-c:a", "pcm_s16le",
         str(target),
     ])
+    run(command)
+    _verify_media_file(target, "Birleştirilmiş ses")
+
+    expected = sum(ffprobe_duration(path) for path in files)
+    actual = ffprobe_duration(target)
+    if abs(actual - expected) > 0.75:
+        raise RuntimeError(
+            "Ses birleştirme süre kontrolünü geçemedi: "
+            f"{actual:.2f}s / {expected:.2f}s"
+        )
+
+
+def write_concat_manifest(
+    files: list[Path],
+    target: Path,
+) -> None:
+    if not files:
+        raise ValueError("Manifest için dosya bulunamadı.")
+
+    lines: list[str] = []
+    for index, path in enumerate(files, start=1):
+        _verify_media_file(path, f"Video parçası {index}")
+        safe_path = path.resolve().as_posix().replace("'", r"'\''")
+        lines.append(f"file '{safe_path}'")
+
+    # Real newline characters. Never write a literal backslash+n sequence.
+    content = "\n".join(lines) + "\n"
+    target.write_text(content, encoding="utf-8")
+
+    readback = target.read_text(encoding="utf-8")
+    if "\\nfile" in readback or readback.count("\n") != len(files):
+        raise RuntimeError("FFmpeg concat manifest satır sonu kontrolü başarısız.")
 
 
 def _atempo_chain(factor: float) -> str:
@@ -2517,47 +2677,43 @@ def synthesize_narration(
     last_error: Exception | None = None
 
     for model in chain:
-        for attempt, delay in enumerate((8, 25, 55), start=1):
-            try:
-                print(f"TTS: model={model}, deneme={attempt}/3")
-                response = client.models.generate_content(
-                    model=model,
-                    contents=tts_directive(narration),
-                    config=types.GenerateContentConfig(
-                        response_modalities=["AUDIO"],
-                        speech_config=types.SpeechConfig(
-                            voice_config=types.VoiceConfig(
-                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                    voice_name=VOICE_NAME
-                                )
+        try:
+            print(f"TTS: model={model}, deneme=1/1")
+            response = client.models.generate_content(
+                model=model,
+                contents=tts_directive(narration),
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=VOICE_NAME
                             )
-                        ),
+                        )
                     ),
-                )
-                candidates = response.candidates or []
-                if not candidates or not candidates[0].content.parts:
-                    raise ValueError("TTS ses parçası döndürmedi.")
-                inline = candidates[0].content.parts[0].inline_data
-                data = inline.data if inline else None
-                if not data or len(data) < 48000:
-                    raise ValueError("TTS verisi boş veya çok kısa.")
-                write_wav(target, data)
-                if ffprobe_duration(target) < 35:
-                    raise ValueError("TTS sesi beklenenden kısa.")
-                return model
-            except Exception as exc:
-                last_error = exc
-                target.unlink(missing_ok=True)
-                print(f"TTS hatası: {model}: {exc}")
-                message = str(exc).lower()
-                if "404" in message or "not found" in message or "no longer available" in message:
-                    break
-                if retryable(exc) and attempt < 3:
-                    time.sleep(delay)
-                    continue
-                break
+                ),
+            )
+            candidates = response.candidates or []
+            if not candidates or not candidates[0].content.parts:
+                raise ValueError("TTS ses parçası döndürmedi.")
+            inline = candidates[0].content.parts[0].inline_data
+            data = inline.data if inline else None
+            if not data or len(data) < 48000:
+                raise ValueError("TTS verisi boş veya çok kısa.")
+            write_wav(target, data)
+            if ffprobe_duration(target) < 35:
+                raise ValueError("TTS sesi beklenenden kısa.")
+            return model
+        except Exception as exc:
+            last_error = exc
+            target.unlink(missing_ok=True)
+            print(f"Gemini TTS atlandı: {model}: {exc}")
 
-    raise RuntimeError(f"Ses üretilemedi. Son hata: {last_error}")
+    print(
+        "Gemini tek parça TTS kullanılamadı; ücretsiz yedek ses "
+        f"motoruna geçiliyor. Son hata: {last_error}"
+    )
+    return synthesize_edge_tts(narration, target)
 
 
 def normalize_audio(source: Path, target: Path) -> None:
@@ -2565,9 +2721,9 @@ def normalize_audio(source: Path, target: Path) -> None:
         [
             "ffmpeg", "-y", "-i", str(source),
             "-af",
-            "aresample=48000,highpass=f=55,lowpass=f=11000,"
-            "acompressor=threshold=-21dB:ratio=2.0:attack=24:release=190,"
-            "loudnorm=I=-17:TP=-2:LRA=7",
+            "aresample=48000,volume=-6dB,highpass=f=55,lowpass=f=11000,"
+            "acompressor=threshold=-23dB:ratio=1.8:attack=28:release=210,"
+            "alimiter=limit=0.90,loudnorm=I=-17:TP=-2:LRA=7",
             "-ar", "48000", "-c:a", "pcm_s16le",
             str(target),
         ]
@@ -3449,13 +3605,7 @@ def render_video(
 
     concat_file = WORK / "v7-video-concat.txt"
     all_clips = [intro_clip, *scene_clips]
-    concat_file.write_text(
-        "".join(
-            f"file '{clip.resolve().as_posix()}'\\n"
-            for clip in all_clips
-        ),
-        encoding="utf-8",
-    )
+    write_concat_manifest(all_clips, concat_file)
 
     video_only = WORK / "v7-video-only.mp4"
     run([
@@ -3560,7 +3710,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V7-1.txt").write_text(
+    (OUTPUT / "HATA-V7-2.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -3603,17 +3753,19 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V7.1 — FAIL-SOFT STORY ENGINE ACTIVE")
+    print("UYKU VE TARİH V7.2 — VERIFIED AUDIO PIPELINE ACTIVE")
     print("Konu:", topic)
-    print("FAIL-SOFT STORY ENGINE: chapter-by-chapter long-form generation")
+    print("VERIFIED PIPELINE: story → TTS → images → render")
     print("=" * 72)
 
     payload, text_model = build_video_package(
         client, topic, int(story_seconds), scene_count
     )
-    payload, story_model = story_director_pass(
-        client, topic, payload, scene_count
-    )
+    story_model = "disabled-for-reliability"
+    if os.getenv("ENABLE_STORY_REFINEMENT", "0") == "1":
+        payload, story_model = story_director_pass(
+            client, topic, payload, scene_count
+        )
 
     (OUTPUT / "video-paketi.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -3634,34 +3786,7 @@ def main() -> None:
     (OUTPUT / "senaryo.txt").write_text(payload["narration"], encoding="utf-8")
     (OUTPUT / "baslik.txt").write_text(str(payload["video_title"]), encoding="utf-8")
 
-    raw_dir = WORK / "raw-images"
-    frame_dir = WORK / "video-frames"
-    raw_dir.mkdir()
-    frame_dir.mkdir()
-
-    frames: list[Path] = []
-    image_manifest: list[dict[str, Any]] = []
-    for scene in payload["scenes"]:
-        scene_id = int(scene["scene_id"])
-        raw = raw_dir / f"scene_{scene_id:02d}.jpg"
-        info = generate_scene_image(client, topic, payload, scene, raw)
-        frame = frame_dir / f"frame_{scene_id:02d}.jpg"
-        clean_video_frame(raw, frame)
-        frames.append(frame)
-        image_manifest.append(info)
-
-    make_storyboard(frames, payload["scenes"], OUTPUT / "storyboard-kontrol.jpg")
-
-    thumb_dir = WORK / "thumbnail-candidates"
-    selected_thumb_background, thumb_info = generate_thumbnail_candidates(
-        client, topic, payload, thumb_dir
-    )
-    make_thumbnail(
-        selected_thumb_background,
-        str(payload["thumbnail_text"]),
-        OUTPUT / "kapak.jpg",
-    )
-
+    print("AŞAMA 1/4: Seslendirme görsellerden önce hazırlanıyor.")
     narration_audio = OUTPUT / "seslendirme.wav"
     try:
         visible_durations, tts_model = synthesize_scene_narration(
@@ -3693,6 +3818,43 @@ def main() -> None:
             minimum=14.0,
         )
 
+    print("AŞAMA 2/4: Ses hazır. Görseller üretiliyor.")
+    raw_dir = WORK / "raw-images"
+    frame_dir = WORK / "video-frames"
+    raw_dir.mkdir()
+    frame_dir.mkdir()
+
+    frames: list[Path] = []
+    image_manifest: list[dict[str, Any]] = []
+    for scene in payload["scenes"]:
+        scene_id = int(scene["scene_id"])
+        raw = raw_dir / f"scene_{scene_id:02d}.jpg"
+        info = generate_scene_image(client, topic, payload, scene, raw)
+        frame = frame_dir / f"frame_{scene_id:02d}.jpg"
+        clean_video_frame(raw, frame)
+        frames.append(frame)
+        image_manifest.append(info)
+
+    make_storyboard(
+        frames,
+        payload["scenes"],
+        OUTPUT / "storyboard-kontrol.jpg",
+    )
+
+    thumb_dir = WORK / "thumbnail-candidates"
+    selected_thumb_background, thumb_info = generate_thumbnail_candidates(
+        client,
+        topic,
+        payload,
+        thumb_dir,
+    )
+    make_thumbnail(
+        selected_thumb_background,
+        str(payload["thumbnail_text"]),
+        OUTPUT / "kapak.jpg",
+    )
+
+    print("AŞAMA 3/4: Ses tasarımı ve zaman çizelgesi hazırlanıyor.")
     transitions, transition_durations = scene_transition_plan(payload["scenes"])
 
     ambient_track = WORK / "ambient-track.wav"
@@ -3714,7 +3876,8 @@ def main() -> None:
         target_seconds,
     )
 
-    video = OUTPUT / "uyku-tarih-v7-1-5-dakika.mp4"
+    print("AŞAMA 4/4: Final video render ediliyor.")
+    video = OUTPUT / "uyku-tarih-v7-2-5-dakika.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -3769,6 +3932,11 @@ def main() -> None:
             "chapter_by_chapter_generation": True,
             "deterministic_local_length_guard": True,
             "short_script_never_aborts": True,
+            "verified_audio_concat_filter": True,
+            "tts_before_images": True,
+            "quota_safe_tts_requests": True,
+            "edge_tts_fallback": True,
+            "concat_manifest_newline_validation": True,
             "chapter_tts_calls": CHAPTER_COUNT,
             "editorial_shots_per_scene": 3,
             "professional_intro_seconds": INTRO_VISIBLE_SECONDS,
@@ -3800,8 +3968,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V7.1 Fail-Soft Story Engine yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce uyku-tarih-v7-1-5-dakika.mp4 dosyasını izle.\n"
+            "V7.2 Verified Audio Pipeline yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce uyku-tarih-v7-2-5-dakika.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -3810,7 +3978,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V7.1 FAIL-SOFT STORY ENGINE TAMAMLANDI")
+    print("V7.2 VERIFIED AUDIO PIPELINE TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
