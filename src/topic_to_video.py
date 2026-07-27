@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/6.1"
+USER_AGENT = "UykuTarihTopicToVideo/6.2"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -102,7 +102,16 @@ ALLOWED_AMBIENT_PROFILES = {
 
 def run(command: list[str]) -> None:
     print("$", " ".join(str(x) for x in command))
-    subprocess.run(command, check=True)
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            timeout=900,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "Harici işlem 15 dakikalık güvenlik sınırını aştı ve durduruldu."
+        ) from exc
 
 
 def reset_dirs() -> None:
@@ -190,7 +199,7 @@ def generate_json(
                 message = str(exc).lower()
                 if "404" in message or "not found" in message or "no longer available" in message:
                     break
-                if retryable(exc) and attempt < 3:
+                if retryable(exc) and attempt < 2:
                     time.sleep(delay)
                     continue
                 break
@@ -625,9 +634,9 @@ def synthesize_short_segment(
     chain = model_chain(client, [configured, *TTS_MODELS])
     last_error: Exception | None = None
     for model in chain:
-        for attempt, delay in enumerate((6, 18, 40), start=1):
+        for attempt, delay in enumerate((4, 10), start=1):
             try:
-                print(f"Scene TTS {scene_index}/{scene_count}: model={model}, attempt={attempt}/3")
+                print(f"Scene TTS {scene_index}/{scene_count}: model={model}, attempt={attempt}/2")
                 response = client.models.generate_content(
                     model=model,
                     contents=scene_tts_directive(text, scene_index, scene_count),
@@ -663,18 +672,45 @@ def synthesize_short_segment(
     raise RuntimeError(f"Sahne {scene_index} seslendirilemedi: {last_error}")
 
 
-def append_scene_pause(source: Path, target: Path, pause_seconds: float) -> None:
+def append_scene_pause(
+    source: Path,
+    target: Path,
+    pause_seconds: float,
+) -> None:
+    pause_seconds = max(0.0, float(pause_seconds))
+
+    # Critical safety rule:
+    # FFmpeg anullsrc with -t 0 creates an unbounded source. For the last
+    # scene there is no pause, so copy the normalized file directly.
+    if pause_seconds <= 0.001:
+        target.unlink(missing_ok=True)
+        shutil.copy2(source, target)
+        print("Audio pause: 0 seconds — finite direct copy used")
+        return
+
+    source_duration = ffprobe_duration(source)
+    target.unlink(missing_ok=True)
+
+    # apad with pad_dur is explicitly finite; it cannot generate hours of
+    # silence when a short scene pause was requested.
     run([
         "ffmpeg", "-y",
         "-i", str(source),
-        "-f", "lavfi", "-t", f"{pause_seconds:.3f}",
-        "-i", "anullsrc=r=48000:cl=mono",
-        "-filter_complex",
-        "[0:a]aformat=sample_rates=48000:channel_layouts=mono[a0];"
-        "[1:a]aformat=sample_rates=48000:channel_layouts=mono[a1];"
-        "[a0][a1]concat=n=2:v=0:a=1[a]",
-        "-map", "[a]", "-c:a", "pcm_s16le", str(target),
+        "-af", f"apad=pad_dur={pause_seconds:.3f}",
+        "-ar", "48000",
+        "-c:a", "pcm_s16le",
+        str(target),
     ])
+
+    output_duration = ffprobe_duration(target)
+    maximum_expected = source_duration + pause_seconds + 0.75
+    if output_duration > maximum_expected:
+        target.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Ses bekleme çıktısı güvenli süreyi aştı: "
+            f"{output_duration:.2f}s > {maximum_expected:.2f}s"
+        )
+
 
 
 def concat_audio_files(files: list[Path], target: Path) -> None:
@@ -1210,7 +1246,7 @@ def generate_scene_image(
 ) -> dict[str, Any]:
     models = cloudflare_model_chain()
     last_error: Exception | None = None
-    max_attempts = min(4, len(models))
+    max_attempts = min(2, len(models))
     best_score = -1
     best_reason = ""
     best_model = ""
@@ -1273,7 +1309,7 @@ def generate_scene_image(
     preferred_models = list(dict.fromkeys([
         "@cf/black-forest-labs/flux-2-klein-4b",
         *models,
-    ]))[:2]
+    ]))[:1]
 
     for repair_attempt, model in enumerate(preferred_models, start=1):
         seed = deterministic_seed(
@@ -1330,7 +1366,7 @@ def generate_scene_image(
     # Do not throw away the entire video for a usable but imperfect image.
     if (
         best_file.exists()
-        and best_score >= 38
+        and best_score >= 40
         and not _fatal_candidate_reason(best_reason, best_score)
     ):
         shutil.copyfile(best_file, target)
@@ -1446,8 +1482,6 @@ def generate_thumbnail_candidates(
     variants = [
         "A single iconic period-specific gateway or landmark, low camera angle, monumental but historically plausible, main subject on right.",
         "A wide atmospheric night view of the exact historical place, restrained torchlight, deep perspective, strong subject on right.",
-        "A closer architectural detail unique to the topic, dramatic moonlight, clear silhouette, cinematic scale, dark left third.",
-        "A quiet human-scale moment at the historical location with one small silhouette for scale, architecture dominant, clean left third.",
     ]
 
     best_path: Path | None = None
@@ -1501,7 +1535,7 @@ def generate_thumbnail_background_with_prompt(
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     models = cloudflare_model_chain()
-    max_attempts = min(4, len(models))
+    max_attempts = min(2, len(models))
     for attempt, model in enumerate(models[:max_attempts], start=1):
         seed = deterministic_seed(topic, 900 + candidate_id, attempt)
         try:
@@ -1771,7 +1805,7 @@ def normalize_audio(source: Path, target: Path) -> None:
         [
             "ffmpeg", "-y", "-i", str(source),
             "-af",
-            "highpass=f=55,lowpass=f=14500,"
+            "aresample=48000,highpass=f=55,lowpass=f=11000,"
             "acompressor=threshold=-21dB:ratio=2.0:attack=24:release=190,"
             "loudnorm=I=-17:TP=-2:LRA=7",
             "-ar", "48000", "-c:a", "pcm_s16le",
@@ -2442,7 +2476,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V6-1.txt").write_text(
+    (OUTPUT / "HATA-V6-2.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -2469,9 +2503,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V6.1 — QUALITY RECOVERY ACTIVE")
+    print("UYKU VE TARİH V6.2 — FAST SAFE RENDER ACTIVE")
     print("Konu:", topic)
-    print("QUALITY RECOVERY: critic-guided scene regeneration enabled")
+    print("FAST SAFE RENDER: finite audio padding + reduced retry chain")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -2557,7 +2591,7 @@ def main() -> None:
     final_audio = OUTPUT / "ses-tasarim.wav"
     concat_audio_files([intro_audio, story_audio], final_audio)
 
-    video = OUTPUT / "pilot-video-v6-1-quality-recovery.mp4"
+    video = OUTPUT / "pilot-video-v6-2-fast-safe.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -2603,6 +2637,10 @@ def main() -> None:
             "three_act_story": True,
             "scene_level_tts_sync": True,
             "critic_guided_image_recovery": True,
+            "finite_audio_padding": True,
+            "zero_pause_direct_copy": True,
+            "ffmpeg_timeout_seconds": 900,
+            "fast_retry_chain": True,
             "usable_best_candidate_fallback": True,
             "wide_detail_editorial_cuts": True,
         },
@@ -2630,8 +2668,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V6.1 Quality Recovery yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce pilot-video-v6-1-quality-recovery.mp4 dosyasını izle.\n"
+            "V6.2 Fast Safe Render yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce pilot-video-v6-2-fast-safe.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -2640,7 +2678,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V6.1 QUALITY RECOVERY TAMAMLANDI")
+    print("V6.2 FAST SAFE RENDER TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
