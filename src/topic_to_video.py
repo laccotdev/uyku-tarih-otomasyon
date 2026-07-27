@@ -26,10 +26,16 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/3.0"
-POLLINATIONS_IMAGES_ENDPOINT = "https://gen.pollinations.ai/v1/images/generations"
-POLLINATIONS_MODELS_ENDPOINT = "https://gen.pollinations.ai/image/models"
+USER_AGENT = "UykuTarihTopicToVideo/3.3"
+CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
+
+CLOUDFLARE_IMAGE_MODELS = [
+    "@cf/black-forest-labs/flux-2-klein-4b",
+    "@cf/black-forest-labs/flux-1-schnell",
+    "@cf/lykon/dreamshaper-8-lcm",
+    "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+]
 
 STYLE_BIBLE = """
 Photorealistic cinematic historical reconstruction for a premium late-night
@@ -407,108 +413,75 @@ def deterministic_seed(topic: str, scene_id: int, attempt: int) -> int:
     return int(digest[:8], 16) % 2_000_000_000
 
 
-def pollinations_image_models() -> list[str]:
-    """Return image models available to this API key, in a quality/speed order."""
-    key = os.getenv("POLLINATIONS_API_KEY", "").strip()
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Authorization": f"Bearer {key}",
-        "Accept": "application/json",
-    }
-    preferred = ["zimage", "klein", "flux", "sana"]
-    configured = os.getenv("IMAGE_MODEL", "auto").strip()
-    if configured and configured.lower() != "auto":
-        preferred.insert(0, configured)
-    preferred = list(dict.fromkeys(preferred))
+def cloudflare_credentials() -> tuple[str, str]:
+    account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    api_token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+    if not account_id:
+        raise RuntimeError("CLOUDFLARE_ACCOUNT_ID bulunamadı.")
+    if not api_token:
+        raise RuntimeError("CLOUDFLARE_API_TOKEN bulunamadı.")
+    return account_id, api_token
+
+
+def cloudflare_model_chain() -> list[str]:
+    configured = os.getenv("CLOUDFLARE_IMAGE_MODEL", "").strip()
+    models = [configured, *CLOUDFLARE_IMAGE_MODELS] if configured else list(CLOUDFLARE_IMAGE_MODELS)
+    return list(dict.fromkeys(model for model in models if model))
+
+
+def _cloudflare_error(response: requests.Response) -> RuntimeError:
+    try:
+        payload = response.json()
+        errors = payload.get("errors") or []
+        detail = "; ".join(
+            str(item.get("message") or item.get("code") or item)
+            for item in errors
+            if isinstance(item, dict)
+        )
+        if not detail:
+            detail = str(payload)[:800]
+    except Exception:
+        detail = response.text[:800] if response.text else "Yanıt gövdesi boş."
+    return RuntimeError(
+        f"Cloudflare Workers AI HTTP {response.status_code}: {detail}"
+    )
+
+
+def _decode_cloudflare_image(response: requests.Response) -> bytes:
+    content_type = response.headers.get("content-type", "").lower()
+    if content_type.startswith("image/"):
+        return response.content
 
     try:
-        response = requests.get(
-            POLLINATIONS_MODELS_ENDPOINT,
-            headers=headers,
-            timeout=(15, 30),
-        )
-        response.raise_for_status()
         payload = response.json()
-        available = {
-            str(item.get("name", "")).strip()
-            for item in payload
-            if isinstance(item, dict)
-            and item.get("category") == "image"
-            and "image" in (item.get("output_modalities") or [])
-        }
-        filtered = [name for name in preferred if name in available]
-        if filtered:
-            print("Kullanılabilir görsel modeli zinciri:", ", ".join(filtered))
-            return filtered
     except Exception as exc:
-        print("Pollinations model kataloğu alınamadı; sabit zincir kullanılacak:", exc)
+        raise RuntimeError(
+            f"Cloudflare görsel yerine çözülemeyen yanıt döndürdü: {content_type}"
+        ) from exc
 
-    return preferred
+    if payload.get("success") is False:
+        errors = payload.get("errors") or []
+        raise RuntimeError(f"Cloudflare API hatası: {errors}")
+
+    result = payload.get("result", payload)
+    encoded = None
+    if isinstance(result, dict):
+        encoded = result.get("image") or result.get("b64_json") or result.get("base64")
+    elif isinstance(result, str):
+        encoded = result
+
+    if not encoded:
+        raise RuntimeError(f"Cloudflare geçerli görsel döndürmedi: {str(payload)[:800]}")
+
+    if isinstance(encoded, str) and encoded.startswith("data:image"):
+        encoded = encoded.split(",", 1)[-1]
+    try:
+        return base64.b64decode(encoded)
+    except Exception as exc:
+        raise RuntimeError("Cloudflare görsel base64 verisi çözülemedi.") from exc
 
 
-def pollinations_request(
-    prompt: str,
-    negative: str,
-    seed: int,
-    target: Path,
-    model: str,
-) -> None:
-    """Generate through Pollinations' current OpenAI-compatible POST endpoint."""
-    key = os.getenv("POLLINATIONS_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("POLLINATIONS_API_KEY bulunamadı.")
-
-    final_prompt = (
-        f"{prompt}\n\n"
-        f"STRICT EXCLUSIONS:\n{negative}\n\n"
-        f"Composition variation reference: {seed}."
-    )
-    request_body = {
-        "prompt": final_prompt,
-        "model": model,
-        "n": 1,
-        "size": "1024x576",
-        "quality": "medium",
-        "response_format": "b64_json",
-        "safe": True,
-        "user": f"uyku-tarih-{seed}",
-    }
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    response = requests.post(
-        POLLINATIONS_IMAGES_ENDPOINT,
-        json=request_body,
-        headers=headers,
-        timeout=(25, 150),
-    )
-    response.raise_for_status()
-    payload = response.json()
-    items = payload.get("data") or []
-    if not items or not isinstance(items[0], dict):
-        raise RuntimeError(f"Pollinations geçerli görsel verisi döndürmedi: {str(payload)[:500]}")
-
-    item = items[0]
-    raw_bytes: bytes | None = None
-    encoded = item.get("b64_json")
-    if encoded:
-        raw_bytes = base64.b64decode(encoded)
-    elif item.get("url"):
-        image_response = requests.get(
-            str(item["url"]),
-            headers={"User-Agent": USER_AGENT},
-            timeout=(20, 90),
-        )
-        image_response.raise_for_status()
-        raw_bytes = image_response.content
-
-    if not raw_bytes:
-        raise RuntimeError("Pollinations görsel gövdesi boş döndü.")
-
+def _save_generated_image(raw_bytes: bytes, target: Path) -> None:
     temp = target.with_suffix(".download")
     temp.write_bytes(raw_bytes)
     try:
@@ -522,6 +495,84 @@ def pollinations_request(
     finally:
         temp.unlink(missing_ok=True)
 
+
+def _cloudflare_request_body(
+    model: str,
+    prompt: str,
+    negative: str,
+    seed: int,
+) -> tuple[dict[str, str], dict[str, str] | None]:
+    """Return form data for multipart models or JSON for classic models."""
+    final_prompt = (
+        f"{prompt}\n\n"
+        f"STRICT EXCLUSIONS: {negative}\n"
+        "Landscape 16:9 frame, clean cinematic composition."
+    )
+
+    if "flux-2-klein" in model or "flux-2-dev" in model:
+        form = {
+            "prompt": final_prompt,
+            "width": "1344",
+            "height": "768",
+            "guidance": "4.5",
+            "seed": str(seed),
+        }
+        return form, None
+
+    if "flux-1-schnell" in model:
+        body = {
+            "prompt": final_prompt,
+            "seed": seed,
+            "steps": 8,
+        }
+        return {}, body
+
+    body = {
+        "prompt": prompt,
+        "negative_prompt": negative,
+        "width": 1024,
+        "height": 576,
+        "num_steps": 8 if "dreamshaper" in model else 20,
+        "guidance": 7.5,
+        "seed": seed,
+    }
+    return {}, body
+
+
+def cloudflare_image_request(
+    prompt: str,
+    negative: str,
+    seed: int,
+    target: Path,
+    model: str,
+) -> None:
+    account_id, api_token = cloudflare_credentials()
+    endpoint = f"{CLOUDFLARE_API_BASE}/{account_id}/ai/run/{model}"
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, image/*",
+    }
+    form_data, json_body = _cloudflare_request_body(model, prompt, negative, seed)
+
+    if form_data:
+        response = requests.post(
+            endpoint,
+            data=form_data,
+            headers=headers,
+            timeout=(20, 180),
+        )
+    else:
+        response = requests.post(
+            endpoint,
+            json=json_body,
+            headers={**headers, "Content-Type": "application/json"},
+            timeout=(20, 180),
+        )
+
+    if not response.ok:
+        raise _cloudflare_error(response)
+    _save_generated_image(_decode_cloudflare_image(response), target)
 
 def image_review(
     client: genai.Client,
@@ -603,18 +654,18 @@ def generate_scene_image(
     scene: dict[str, Any],
     target: Path,
 ) -> dict[str, Any]:
-    models = pollinations_image_models()
+    models = cloudflare_model_chain()
     last_error: Exception | None = None
+    max_attempts = min(4, len(models))
 
-    # Move to another model quickly instead of waiting four minutes three times.
-    for attempt, model in enumerate(models[:4], start=1):
+    for attempt, model in enumerate(models[:max_attempts], start=1):
         seed = deterministic_seed(topic, int(scene["scene_id"]), attempt)
         try:
             print(
                 f"Sahne görseli: {scene['scene_id']}, model={model}, "
-                f"deneme={attempt}/{min(4, len(models))}"
+                f"deneme={attempt}/{max_attempts}"
             )
-            pollinations_request(
+            cloudflare_image_request(
                 combined_prompt(payload, scene),
                 combined_negative(scene),
                 seed,
@@ -636,7 +687,13 @@ def generate_scene_image(
             last_error = exc
             target.unlink(missing_ok=True)
             print(f"Sahne görseli başarısız ({model}): {exc}")
-            time.sleep(min(20, 4 * attempt))
+            message = str(exc).lower()
+            if "10,000 neurons" in message or "account limited" in message:
+                raise RuntimeError(
+                    "Cloudflare günlük ücretsiz görsel kotası dolmuş. "
+                    "Kota 00:00 UTC'de yenilenir."
+                ) from exc
+            time.sleep(min(12, 3 * attempt))
 
     raise RuntimeError(
         f"Sahne {scene['scene_id']} için uygun görsel üretilemedi: {last_error}"
@@ -662,21 +719,21 @@ def generate_thumbnail_background(
     )
 
     last_error: Exception | None = None
-    models = pollinations_image_models()
-    for attempt, model in enumerate(models[:4], start=1):
+    models = cloudflare_model_chain()
+    max_attempts = min(4, len(models))
+    for attempt, model in enumerate(models[:max_attempts], start=1):
         seed = deterministic_seed(topic, 999, attempt)
         try:
-            print(f"Kapak arka planı: model={model}, deneme={attempt}/{min(4, len(models))}")
-            pollinations_request(prompt, negative, seed, target, model)
+            print(f"Kapak arka planı: model={model}, deneme={attempt}/{max_attempts}")
+            cloudflare_image_request(prompt, negative, seed, target, model)
             return {"model": model, "seed": seed, "file": target.name}
         except Exception as exc:
             last_error = exc
             target.unlink(missing_ok=True)
             print(f"Kapak arka planı başarısız ({model}): {exc}")
-            time.sleep(min(20, 4 * attempt))
+            time.sleep(min(12, 3 * attempt))
 
     raise RuntimeError(f"Kapak arka planı üretilemedi: {last_error}")
-
 
 def video_font(size: int, bold: bool = False):
     candidates = [
@@ -1049,7 +1106,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V3.txt").write_text(
+    (OUTPUT / "HATA-V3-3.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -1062,18 +1119,21 @@ def main() -> None:
     if not topic:
         raise RuntimeError("Video konusu boş.")
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-    pollinations_key = os.getenv("POLLINATIONS_API_KEY", "").strip()
+    cloudflare_account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    cloudflare_api_token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
     if not gemini_key:
         raise RuntimeError("GEMINI_API_KEY bulunamadı.")
-    if not pollinations_key:
-        raise RuntimeError("POLLINATIONS_API_KEY bulunamadı.")
+    if not cloudflare_account_id:
+        raise RuntimeError("CLOUDFLARE_ACCOUNT_ID bulunamadı.")
+    if not cloudflare_api_token:
+        raise RuntimeError("CLOUDFLARE_API_TOKEN bulunamadı.")
 
     target_seconds = int(os.getenv("TARGET_SECONDS", "90"))
     scene_count = int(os.getenv("SCENE_COUNT", "12"))
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V3 — KONUDAN VİDEOYA")
+    print("UYKU VE TARİH V3.3 — KONUDAN VİDEOYA")
     print("Konu:", topic)
     print("=" * 72)
 
@@ -1127,7 +1187,7 @@ def main() -> None:
     audio = OUTPUT / "seslendirme.wav"
     normalize_audio(raw_audio, audio)
 
-    video = OUTPUT / "pilot-video-v3.mp4"
+    video = OUTPUT / "pilot-video-v3-3.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], audio, video
     )
@@ -1158,8 +1218,11 @@ def main() -> None:
         "topic": topic,
         "text_model": text_model,
         "tts_model": tts_model,
-        "image_engine": "Pollinations",
-        "image_model_default": os.getenv("IMAGE_MODEL", "auto"),
+        "image_engine": "Cloudflare Workers AI",
+        "image_model_default": os.getenv(
+            "CLOUDFLARE_IMAGE_MODEL",
+            "@cf/black-forest-labs/flux-2-klein-4b",
+        ),
         "actual_duration_seconds": round(actual_duration, 2),
         "scene_count": len(frames),
         "images": image_manifest,
@@ -1175,7 +1238,7 @@ def main() -> None:
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
             "V3 yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce pilot-video-v3.mp4 dosyasını izle.\n"
+            "Önce pilot-video-v3-3.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
