@@ -108,6 +108,55 @@ def json_from_response(raw: str) -> dict[str, Any]:
     return json.loads(text[start:end + 1])
 
 
+def _unique(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        clean = value.strip().removeprefix("models/")
+        if clean and clean not in seen:
+            seen.add(clean)
+            result.append(clean)
+    return result
+
+
+def available_generate_models(client: genai.Client) -> set[str]:
+    """Return models exposed to this API key that support generateContent."""
+    available: set[str] = set()
+    try:
+        for model in client.models.list():
+            actions = set(getattr(model, "supported_actions", None) or [])
+            name = str(getattr(model, "name", "")).removeprefix("models/")
+            if name and (not actions or "generateContent" in actions):
+                available.add(name)
+    except Exception as exc:
+        # Model discovery is helpful but must never block the render.
+        print("Model listesi alınamadı; sabit yedek zinciri kullanılacak:", exc)
+    return available
+
+
+def is_retryable_service_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    markers = (
+        "429", "500", "502", "503", "504",
+        "resource_exhausted", "unavailable", "high demand",
+        "temporarily", "timeout", "timed out", "deadline exceeded",
+        "connection reset", "connection aborted", "service unavailable",
+    )
+    return any(marker in message for marker in markers)
+
+
+def ordered_candidates(
+    available: set[str],
+    preferred: list[str],
+) -> list[str]:
+    candidates = _unique(preferred)
+    if not available:
+        return candidates
+    filtered = [model for model in candidates if model in available]
+    # Keep fixed candidates as a last resort because list() can lag aliases.
+    return filtered or candidates
+
+
 def build_editorial_package(
     client: genai.Client,
     topic: str,
@@ -159,36 +208,68 @@ Yazım kuralları:
 - Görsel üretme; yalnızca arşivde bulunabilecek gerçek mekân, eser, harita,
   gravür, kazı veya müze objeleri planla.
 """
-    model = os.getenv("TEXT_MODEL", "gemini-2.5-flash")
-    last_error: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            print(f"Editoryal paket üretiliyor: {attempt}/3")
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.55,
-                    max_output_tokens=8192,
-                ),
-            )
-            payload = json_from_response(response.text or "")
-            scenes = payload.get("scenes")
-            if not isinstance(scenes, list) or len(scenes) < visual_count:
-                raise ValueError("Yeterli sahne üretilmedi.")
-            payload["scenes"] = scenes[:visual_count]
-            narration = slug_text(str(payload.get("sample_narration", "")))
-            if len(narration.split()) < 100:
-                raise ValueError("Ses metni çok kısa.")
-            payload["sample_narration"] = narration
-            return payload
-        except Exception as exc:
-            last_error = exc
-            print("Editoryal üretim yeniden denenecek:", exc)
-            time.sleep(attempt * 2)
-    raise RuntimeError(f"Editoryal paket üretilemedi: {last_error}")
 
+    available = available_generate_models(client)
+    configured = os.getenv("TEXT_MODEL", "").strip()
+    models = ordered_candidates(
+        available,
+        [
+            # This task is structured JSON; Lite models are faster and usually
+            # less congested than the flagship model.
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            configured,
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-flash-latest",
+        ],
+    )
+    print("Metin modeli yedek zinciri:", " -> ".join(models))
+
+    last_error: Exception | None = None
+    delays = (3, 12, 30)
+    for model in models:
+        for attempt, delay in enumerate(delays, start=1):
+            try:
+                print(f"Editoryal paket: model={model}, deneme={attempt}/{len(delays)}")
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.55,
+                        max_output_tokens=8192,
+                    ),
+                )
+                payload = json_from_response(response.text or "")
+                scenes = payload.get("scenes")
+                if not isinstance(scenes, list) or len(scenes) < visual_count:
+                    raise ValueError("Yeterli sahne üretilmedi.")
+                payload["scenes"] = scenes[:visual_count]
+                narration = slug_text(str(payload.get("sample_narration", "")))
+                if len(narration.split()) < 100:
+                    raise ValueError("Ses metni çok kısa.")
+                payload["sample_narration"] = narration
+                payload["text_model_used"] = model
+                print("Editoryal paket başarılı. Kullanılan model:", model)
+                return payload
+            except Exception as exc:
+                last_error = exc
+                message = str(exc)
+                print(f"Model başarısız: {model}: {message}")
+                # Missing/unsupported models should immediately move to fallback.
+                if "404" in message or "not found" in message.lower() or "no longer available" in message.lower():
+                    break
+                if not is_retryable_service_error(exc):
+                    # A malformed JSON response can still succeed on another attempt.
+                    if attempt == len(delays):
+                        break
+                if attempt < len(delays):
+                    print(f"Geçici hata; {delay} saniye sonra yeniden denenecek.")
+                    time.sleep(delay)
+        print("Sıradaki metin modeline geçiliyor.")
+
+    raise RuntimeError(f"Editoryal paket üretilemedi. Son hata: {last_error}")
 
 def license_allowed(name: str) -> bool:
     lower = name.lower()
@@ -551,40 +632,67 @@ def synthesize_voice(
     narration: str,
     voice_name: str,
     target: Path,
-) -> None:
-    model = os.getenv("TTS_MODEL", "gemini-2.5-flash-preview-tts")
-    last_error: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            print(f"Ses üretiliyor: {voice_name}, deneme {attempt}/3")
-            response = client.models.generate_content(
-                model=model,
-                contents=tts_prompt(narration),
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=voice_name
-                            )
-                        )
-                    ),
-                ),
-            )
-            data = response.candidates[0].content.parts[0].inline_data.data
-            if not data or len(data) < 48000:
-                raise ValueError("Ses verisi boş veya çok kısa.")
-            write_wav(target, data)
-            if ffprobe_duration(target) < 20:
-                raise ValueError("Üretilen ses beklenenden kısa.")
-            return
-        except Exception as exc:
-            last_error = exc
-            target.unlink(missing_ok=True)
-            print("Ses yeniden denenecek:", exc)
-            time.sleep(attempt * 4)
-    raise RuntimeError(f"{voice_name} sesi üretilemedi: {last_error}")
+) -> str:
+    available = available_generate_models(client)
+    configured = os.getenv("TTS_MODEL", "").strip()
+    models = ordered_candidates(
+        available,
+        [
+            configured,
+            "gemini-3.1-flash-tts-preview",
+            "gemini-2.5-flash-preview-tts",
+        ],
+    )
+    print(f"{voice_name} TTS yedek zinciri:", " -> ".join(models))
 
+    last_error: Exception | None = None
+    delays = (8, 25, 55)
+    for model in models:
+        for attempt, delay in enumerate(delays, start=1):
+            try:
+                print(
+                    f"Ses üretiliyor: voice={voice_name}, model={model}, "
+                    f"deneme={attempt}/{len(delays)}"
+                )
+                response = client.models.generate_content(
+                    model=model,
+                    contents=tts_prompt(narration),
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=voice_name
+                                )
+                            )
+                        ),
+                    ),
+                )
+                candidates = response.candidates or []
+                if not candidates or not candidates[0].content.parts:
+                    raise ValueError("TTS yanıtında ses parçası bulunamadı.")
+                inline = candidates[0].content.parts[0].inline_data
+                data = inline.data if inline else None
+                if not data or len(data) < 48000:
+                    raise ValueError("Ses verisi boş veya çok kısa.")
+                write_wav(target, data)
+                if ffprobe_duration(target) < 20:
+                    raise ValueError("Üretilen ses beklenenden kısa.")
+                print(f"Ses başarılı: {voice_name}, model={model}")
+                return model
+            except Exception as exc:
+                last_error = exc
+                target.unlink(missing_ok=True)
+                message = str(exc)
+                print(f"TTS başarısız: {voice_name}, model={model}: {message}")
+                if "404" in message or "not found" in message.lower() or "no longer available" in message.lower():
+                    break
+                if attempt < len(delays):
+                    print(f"Geçici TTS hatası; {delay} saniye beklenecek.")
+                    time.sleep(delay)
+        print(f"{voice_name} için sıradaki TTS modeline geçiliyor.")
+
+    raise RuntimeError(f"{voice_name} sesi üretilemedi. Son hata: {last_error}")
 
 def normalize_audio(source: Path, target: Path) -> None:
     run(
@@ -811,23 +919,41 @@ def main() -> None:
     for voice_name, description in VOICE_OPTIONS:
         raw = voice_dir / f"{voice_name.lower()}-raw.wav"
         final = OUTPUT / f"ses-{voice_name.lower()}.wav"
-        synthesize_voice(client, narration, voice_name, raw)
-        normalize_audio(raw, final)
-        normalized_voices[voice_name] = final
-        voice_manifest.append(
-            {
-                "voice": voice_name,
-                "description": description,
-                "duration_seconds": round(ffprobe_duration(final), 2),
-            }
-        )
+        try:
+            model_used = synthesize_voice(client, narration, voice_name, raw)
+            normalize_audio(raw, final)
+            normalized_voices[voice_name] = final
+            voice_manifest.append(
+                {
+                    "voice": voice_name,
+                    "description": description,
+                    "status": "success",
+                    "tts_model_used": model_used,
+                    "duration_seconds": round(ffprobe_duration(final), 2),
+                }
+            )
+        except Exception as exc:
+            print(f"{voice_name} sesi atlandı: {exc}")
+            voice_manifest.append(
+                {
+                    "voice": voice_name,
+                    "description": description,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+
+    if not normalized_voices:
+        raise RuntimeError("Hiçbir TTS sesi üretilemedi.")
 
     (OUTPUT / "ses-secenekleri.json").write_text(
         json.dumps(voice_manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    preview_audio = normalized_voices["Schedar"]
+    preview_voice = "Schedar" if "Schedar" in normalized_voices else next(iter(normalized_voices))
+    preview_audio = normalized_voices[preview_voice]
+    print("Önizleme sesi:", preview_voice)
     create_preview(
         frames,
         preview_audio,
