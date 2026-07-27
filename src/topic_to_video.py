@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/6.2"
+USER_AGENT = "UykuTarihTopicToVideo/7.0"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -76,9 +76,14 @@ TTS_MODELS = [
 # Keep a safety margin because fallback models receive exclusions in the same field.
 MAX_IMAGE_PROMPT_CHARS = 1320
 MAX_NEGATIVE_PROMPT_CHARS = 360
-INTRO_VISIBLE_SECONDS = 5.2
-INTRO_TRANSITION_SECONDS = 0.65
-SCENE_PAUSE_SECONDS = 0.16
+INTRO_VISIBLE_SECONDS = 12.0
+INTRO_TRANSITION_SECONDS = 0.70
+SCENE_PAUSE_SECONDS = 0.18
+DEFAULT_TARGET_SECONDS = 300
+DEFAULT_SCENE_COUNT = 12
+CHAPTER_COUNT = 4
+MIN_FINAL_VIDEO_SECONDS = 285
+MAX_FINAL_VIDEO_SECONDS = 315
 
 TRANSITIONS = [
     "fade",
@@ -323,6 +328,7 @@ def _package_issues(
         for key in (
             "narration_idea", "narration_text", "visual_goal", "image_prompt",
             "transition", "transition_duration", "ambient_profile",
+            "chapter_index", "chapter_title", "beat_type",
         ):
             if scene.get(key) in (None, ""):
                 issues.append(f"Sahne {index} için {key} eksik.")
@@ -361,6 +367,45 @@ def _normalize_package(payload: dict[str, Any], scene_count: int) -> None:
 
         if str(scene.get("importance", "normal")) not in {"high", "normal"}:
             scene["importance"] = "normal"
+
+        default_chapter = min(
+            CHAPTER_COUNT,
+            1 + ((index - 1) * CHAPTER_COUNT // max(1, scene_count)),
+        )
+        try:
+            chapter_index = int(scene.get("chapter_index", default_chapter))
+        except (TypeError, ValueError):
+            chapter_index = default_chapter
+        scene["chapter_index"] = max(1, min(CHAPTER_COUNT, chapter_index))
+
+        chapter_title = re.sub(
+            r"\s+", " ", str(scene.get("chapter_title", "")).strip()
+        )
+        if not chapter_title:
+            chapter_title = [
+                "Geceye Giriş",
+                "Yaşayan Dünya",
+                "Kırılma Anı",
+                "Sessiz Miras",
+            ][scene["chapter_index"] - 1]
+        scene["chapter_title"] = chapter_title
+
+        allowed_beats = {
+            "hook", "orientation", "setting",
+            "routine", "craft", "community",
+            "evidence", "tension", "turning_point",
+            "aftermath", "legacy", "reflection",
+        }
+        beat_type = str(scene.get("beat_type", "")).strip().lower()
+        if beat_type not in allowed_beats:
+            beat_order = [
+                "hook", "orientation", "setting",
+                "routine", "craft", "community",
+                "evidence", "tension", "turning_point",
+                "aftermath", "legacy", "reflection",
+            ]
+            beat_type = beat_order[min(index - 1, len(beat_order) - 1)]
+        scene["beat_type"] = beat_type
 
     _ensure_scene_narration(payload)
 
@@ -403,8 +448,11 @@ ZORUNLU HEDEFLER:
 - Her image_prompt İngilizce, ayrıntılı, 16:9 sinematik tarih karesi tarif etsin.
 - Müze objesi, beyaz fon, kolaj, yazı, sayı, logo, modern veya fantastik unsur olmasın.
 - video_title, thumbnail_text, description, visual_identity, world_bible,
-  thumbnail_prompt, thumbnail_negative_prompt, chapters ve tags alanlarını koru veya iyileştir.
+  intro_hook, thumbnail_prompt, thumbnail_negative_prompt, chapters ve tags alanlarını koru veya iyileştir.
 - thumbnail_text en fazla dört kelime olsun.
+- intro_hook en fazla sekiz kelime olsun.
+- Sahnelere chapter_index, chapter_title ve beat_type alanlarını ekle.
+- Dört bölüm ve bölüm başına üç sahne kullan.
 
 MEVCUT JSON:
 {existing}
@@ -418,8 +466,8 @@ def build_video_package(
     target_seconds: int,
     scene_count: int,
 ) -> tuple[dict[str, Any], str]:
-    target_words = max(170, min(260, round(target_seconds * 2.35)))
-    minimum_words = max(110, round(target_words * 0.62))
+    target_words = max(620, min(760, round(target_seconds * 2.25)))
+    minimum_words = max(540, round(target_words * 0.84))
     prompt = f"""
 Yalnızca geçerli JSON üret. Markdown yazma.
 
@@ -445,6 +493,7 @@ JSON ŞEMASI:
   "historical_scope": "Dönem, yer ve bağlam",
   "video_title": "Merak uyandıran fakat abartısız Türkçe YouTube başlığı",
   "thumbnail_text": "En fazla dört kelime",
+  "intro_hook": "En fazla sekiz kelimelik sakin ve merak uyandıran giriş cümlesi",
   "description": "İki kısa paragraf Türkçe açıklama",
   "narration": "Tek parça final Türkçe seslendirme metni",
   "visual_identity": "Bu videoya özgü tek cümlelik sanat yönetimi",
@@ -463,6 +512,9 @@ JSON ŞEMASI:
   "scenes": [
     {{
       "scene_id": 1,
+      "chapter_index": 1,
+      "chapter_title": "Kısa bölüm başlığı",
+      "beat_type": "hook | orientation | setting | routine | craft | community | evidence | tension | turning_point | aftermath | legacy | reflection",
       "narration_idea": "Bu sahne sırasında anlatılan ana fikir",
       "narration_text": "Bu sahnede okunacak final Türkçe cümleler",
       "visual_goal": "Görüntünün açıkça göstermesi gereken olay, mekân veya durum",
@@ -502,6 +554,9 @@ ZORUNLU GÖRSEL KURALLARI:
 - Yakın yüz planlarını sınırlı tut; atmosferik geniş ve orta planlar kullan.
 - Her sahne promptu; konu, dönem, yer, ışık, kompozisyon ve kamera açısını içersin.
 - Tam olarak {scene_count} sahne üret.
+- Sahne yapısı dört bölümden oluşsun ve her bölümde üç sahne bulunsun.
+- Bölüm 1: kanca, zaman-mekân, çevre. Bölüm 2: gündelik hayat, emek, topluluk.
+- Bölüm 3: kanıtlar, gerilim, kırılma. Bölüm 4: sonrası, miras, düşünceli kapanış.
 
 ZORUNLU EDITOR BRAIN KURALLARI:
 - narration metnini sahnelere anlamlı biçimde böl; her sahnenin narration_text alanı gerçek konuşma sırasını izlesin.
@@ -559,63 +614,70 @@ def story_director_pass(
     scene_count: int,
 ) -> tuple[dict[str, Any], str]:
     current = json.dumps(payload, ensure_ascii=False)
+    original_words = _word_count(str(payload.get("narration", "")))
+    minimum_words = max(540, round(original_words * 0.86))
+
     prompt = f"""
 Yalnızca geçerli ve eksiksiz JSON üret. Markdown yazma.
 
-Sen kıdemli bir tarih belgeseli hikâye editörüsün.
-Aşağıdaki paketi kopuk bilgi ve görsel listesi olmaktan çıkarıp akıcı,
-üç perdeli bir gece belgeseli hikâyesine dönüştür.
+Sen uzun format tarih belgeseli hikâye yönetmenisin.
+Aşağıdaki paketi yaklaşık beş dakikalık, tek nefeste dinlenen,
+neden-sonuç ilişkisi güçlü bir gece belgeseline dönüştür.
 
 KONU:
 {topic}
 
-ZORUNLU YAPI:
-- İlk yirmi saniyede merkezî bir soru ve sakin bir kanca kur.
-- Her sahne bir öncekinin doğal sonucu veya devamı olsun.
-- Bilgi listesi yazma; tek seferde anlatılmış bir hikâye kur.
-- Aynı bilgiyi tekrarlama, konuyu her sahnede yeniden tanıtma.
-- Sıra: kanca, mekân, gündelik hayat, işaretler, gerilim,
-  dönüm noktası, geride kalanlar, düşünceli kapanış.
-- Tam {scene_count} sahne koru.
-- Her sahnede act: 1, 2 veya 3 olsun.
-- beat_type şu değerlerden biri olsun:
-  hook, orientation, daily_life, evidence, tension,
-  turning_point, aftermath, reflection.
-- continuity_bridge önceki sahneden geçiş mantığını kısa açıklasın.
-- narration_text yalnızca o sahnede okunacak final metin olsun.
-- narration, narration_text alanlarının sırayla birleşmiş hâli olsun.
-- Görsel promptu o sahnedeki cümleyle doğrudan eşleşsin.
-- Tarihsel belirsizliği dramatik kesinlik gibi sunma.
-- world_bible ve dönem tutarlılığını koru.
+UZUN FORMAT YAPI:
+- Tam {scene_count} sahne ve tam dört bölüm kullan.
+- Her bölümde üç sahne bulunsun.
+- Bölüm 1: hook, orientation, setting.
+- Bölüm 2: routine, craft, community.
+- Bölüm 3: evidence, tension, turning_point.
+- Bölüm 4: aftermath, legacy, reflection.
+- İlk otuz saniyede merkezî soruyu kur.
+- Her sahne önceki sahnenin düşüncesini sürdürsün.
+- Bilgi listesi, maddeleme, tekrar ve her sahnede yeniden giriş yapma.
+- İnsan deneyimi, mekân, gündelik ayrıntı ve tarihsel bağlam dengeli olsun.
+- Bilinmeyen ayrıntıları kesin gerçek gibi sunma.
+- Son bölüm, konuyu günümüze kalan izlerle sakin biçimde bağlasın.
+- narration en az {minimum_words} Türkçe kelime olsun.
+- narration_text alanları birleştiğinde narration ile aynı metni oluştursun.
+- intro_hook en fazla sekiz kelime ve video başlığından farklı olsun.
+- Her sahnede chapter_index, chapter_title, beat_type ve continuity_bridge bulunsun.
+- Görsel promptu yalnızca o sahnenin somut anlatımına odaklansın.
+- Aynı film paleti, dönem, coğrafya ve mimari bütün sahnelerde korunsun.
+- chapters alanı dört kısa Türkçe bölüm başlığı içersin.
 
 MEVCUT JSON:
 {current}
 """
     try:
-        refined, model = generate_json(client, prompt, max_tokens=14000)
-        issues = _package_issues(refined, scene_count, 105)
+        refined, model = generate_json(client, prompt, max_tokens=16000)
+        issues = _package_issues(refined, scene_count, minimum_words)
         if issues:
-            print("Story Director doğrulama başarısız; önceki paket kullanılacak:", issues)
+            print("Long-form Story Director doğrulama başarısız:", issues)
             return payload, "fallback-original"
         _normalize_package(refined, scene_count)
         _ensure_scene_narration(refined)
         return refined, model
     except Exception as exc:
-        print("Story Director geçici olarak atlandı:", exc)
+        print("Long-form Story Director geçici olarak atlandı:", exc)
         return payload, "fallback-original"
 
 
-def scene_tts_directive(text: str, scene_index: int, scene_count: int) -> str:
+def scene_tts_directive(text: str, chapter_index: int, chapter_count: int) -> str:
     return f"""
 Read only the Turkish transcript after the separator.
 
-Use the exact same mature Turkish male documentary narrator in every scene.
-This is scene {scene_index} of {scene_count}; it must sound like the uninterrupted
-continuation of one story, never like a fresh introduction.
+Use the exact same mature Turkish male documentary narrator in every chapter.
+This is chapter {chapter_index} of {chapter_count}; it must sound like one
+continuous five-minute story, not a fresh introduction.
 
-Calm, grounded, warm, intimate, standard Turkey Turkish.
-Slow but conversational. Natural pauses and gentle endings.
-No trailer voice, no newsreader tone, no added words.
+Calm, grounded, warm and intimate. Standard Turkey Turkish.
+Late-night historical documentary. Slow but conversational.
+Natural pauses, clear articulation and gentle sentence endings.
+No trailer voice, no advertisement, no newsreader tone.
+Do not add, remove or paraphrase words. No music or effects.
 
 --- TRANSCRIPT ---
 {text}
@@ -633,13 +695,19 @@ def synthesize_short_segment(
     configured = os.getenv("TTS_MODEL", "").strip()
     chain = model_chain(client, [configured, *TTS_MODELS])
     last_error: Exception | None = None
+
     for model in chain:
-        for attempt, delay in enumerate((4, 10), start=1):
+        for attempt, delay in enumerate((5, 12), start=1):
             try:
-                print(f"Scene TTS {scene_index}/{scene_count}: model={model}, attempt={attempt}/2")
+                print(
+                    f"Chapter TTS {scene_index}/{scene_count}: "
+                    f"model={model}, attempt={attempt}/2"
+                )
                 response = client.models.generate_content(
                     model=model,
-                    contents=scene_tts_directive(text, scene_index, scene_count),
+                    contents=scene_tts_directive(
+                        text, scene_index, scene_count
+                    ),
                     config=types.GenerateContentConfig(
                         response_modalities=["AUDIO"],
                         speech_config=types.SpeechConfig(
@@ -653,23 +721,26 @@ def synthesize_short_segment(
                 )
                 candidates = response.candidates or []
                 if not candidates or not candidates[0].content.parts:
-                    raise ValueError("TTS sahne sesi döndürmedi.")
+                    raise ValueError("TTS bölüm sesi döndürmedi.")
                 inline = candidates[0].content.parts[0].inline_data
                 data = inline.data if inline else None
-                if not data or len(data) < 8000:
-                    raise ValueError("TTS sahne sesi boş veya çok kısa.")
+                if not data or len(data) < 12000:
+                    raise ValueError("TTS bölüm sesi boş veya çok kısa.")
                 write_wav(target, data)
-                if ffprobe_duration(target) < 1.2:
-                    raise ValueError("TTS sahne sesi beklenenden kısa.")
+                if ffprobe_duration(target) < 8.0:
+                    raise ValueError("TTS bölüm sesi beklenenden kısa.")
                 return model
             except Exception as exc:
                 last_error = exc
                 target.unlink(missing_ok=True)
-                if retryable(exc) and attempt < 3:
+                if retryable(exc) and attempt < 2:
                     time.sleep(delay)
                     continue
                 break
-    raise RuntimeError(f"Sahne {scene_index} seslendirilemedi: {last_error}")
+
+    raise RuntimeError(
+        f"Bölüm {scene_index} seslendirilemedi: {last_error}"
+    )
 
 
 def append_scene_pause(
@@ -678,21 +749,11 @@ def append_scene_pause(
     pause_seconds: float,
 ) -> None:
     pause_seconds = max(0.0, float(pause_seconds))
-
-    # Critical safety rule:
-    # FFmpeg anullsrc with -t 0 creates an unbounded source. For the last
-    # scene there is no pause, so copy the normalized file directly.
     if pause_seconds <= 0.001:
         target.unlink(missing_ok=True)
         shutil.copy2(source, target)
-        print("Audio pause: 0 seconds — finite direct copy used")
         return
 
-    source_duration = ffprobe_duration(source)
-    target.unlink(missing_ok=True)
-
-    # apad with pad_dur is explicitly finite; it cannot generate hours of
-    # silence when a short scene pause was requested.
     run([
         "ffmpeg", "-y",
         "-i", str(source),
@@ -702,63 +763,203 @@ def append_scene_pause(
         str(target),
     ])
 
-    output_duration = ffprobe_duration(target)
-    maximum_expected = source_duration + pause_seconds + 0.75
-    if output_duration > maximum_expected:
-        target.unlink(missing_ok=True)
-        raise RuntimeError(
-            "Ses bekleme çıktısı güvenli süreyi aştı: "
-            f"{output_duration:.2f}s > {maximum_expected:.2f}s"
-        )
-
-
 
 def concat_audio_files(files: list[Path], target: Path) -> None:
+    if not files:
+        raise ValueError("Birleştirilecek ses bulunamadı.")
     if len(files) == 1:
         shutil.copy2(files[0], target)
         return
-    command = ["ffmpeg", "-y"]
-    for file in files:
-        command += ["-i", str(file)]
-    inputs = "".join(f"[{idx}:a]" for idx in range(len(files)))
-    command += [
-        "-filter_complex", f"{inputs}concat=n={len(files)}:v=0:a=1[a]",
-        "-map", "[a]", "-ar", "48000", "-c:a", "pcm_s16le", str(target),
+
+    concat_file = WORK / f"audio-concat-{target.stem}.txt"
+    concat_file.write_text(
+        "".join(
+            f"file '{path.resolve().as_posix()}'\\n"
+            for path in files
+        ),
+        encoding="utf-8",
+    )
+    run([
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", str(concat_file),
+        "-ar", "48000",
+        "-ac", "1",
+        "-c:a", "pcm_s16le",
+        str(target),
+    ])
+
+
+def _atempo_chain(factor: float) -> str:
+    factor = max(0.25, min(4.0, factor))
+    values: list[float] = []
+    while factor < 0.5:
+        values.append(0.5)
+        factor /= 0.5
+    while factor > 2.0:
+        values.append(2.0)
+        factor /= 2.0
+    values.append(factor)
+    return ",".join(f"atempo={value:.6f}" for value in values)
+
+
+def fit_audio_duration(
+    source: Path,
+    target: Path,
+    target_seconds: float,
+) -> None:
+    target_seconds = max(1.0, float(target_seconds))
+    current = ffprobe_duration(source)
+    factor = current / target_seconds
+    filter_chain = (
+        f"{_atempo_chain(factor)},"
+        "aresample=48000,"
+        "apad=pad_dur=3,"
+        f"atrim=duration={target_seconds:.3f},"
+        "asetpts=N/SR/TB"
+    )
+    run([
+        "ffmpeg", "-y",
+        "-i", str(source),
+        "-af", filter_chain,
+        "-ar", "48000",
+        "-ac", "1",
+        "-c:a", "pcm_s16le",
+        str(target),
+    ])
+    final_duration = ffprobe_duration(target)
+    if abs(final_duration - target_seconds) > 0.8:
+        raise RuntimeError(
+            "Ses hedef süreye getirilemedi: "
+            f"{final_duration:.2f}s / {target_seconds:.2f}s"
+        )
+
+
+def _allocate_exact_duration(
+    total_seconds: float,
+    weights: list[float],
+    minimum: float,
+) -> list[float]:
+    if not weights:
+        return []
+    count = len(weights)
+    minimum = min(minimum, total_seconds / count)
+    base_total = minimum * count
+    remaining = max(0.0, total_seconds - base_total)
+    safe_weights = [max(1.0, float(value)) for value in weights]
+    weight_sum = sum(safe_weights)
+    result = [
+        minimum + remaining * value / weight_sum
+        for value in safe_weights
     ]
-    run(command)
+    result[-1] += total_seconds - sum(result)
+    return result
+
+
+def _chapter_groups(
+    scenes: list[dict[str, Any]],
+) -> list[list[tuple[int, dict[str, Any]]]]:
+    groups: list[list[tuple[int, dict[str, Any]]]] = [
+        [] for _ in range(CHAPTER_COUNT)
+    ]
+    for index, scene in enumerate(scenes):
+        try:
+            chapter = int(scene.get("chapter_index", 1))
+        except (TypeError, ValueError):
+            chapter = 1 + index * CHAPTER_COUNT // max(1, len(scenes))
+        chapter = max(1, min(CHAPTER_COUNT, chapter))
+        groups[chapter - 1].append((index, scene))
+
+    if any(not group for group in groups):
+        groups = [[] for _ in range(CHAPTER_COUNT)]
+        for index, scene in enumerate(scenes):
+            chapter = min(
+                CHAPTER_COUNT - 1,
+                index * CHAPTER_COUNT // max(1, len(scenes)),
+            )
+            groups[chapter].append((index, scene))
+    return groups
 
 
 def synthesize_scene_narration(
     client: genai.Client,
     scenes: list[dict[str, Any]],
     output_audio: Path,
+    target_seconds: float,
 ) -> tuple[list[float], str]:
-    scene_dir = WORK / "scene-audio"
-    if scene_dir.exists():
-        shutil.rmtree(scene_dir)
-    scene_dir.mkdir(parents=True)
+    chapter_dir = WORK / "chapter-audio"
+    if chapter_dir.exists():
+        shutil.rmtree(chapter_dir)
+    chapter_dir.mkdir(parents=True)
 
-    files: list[Path] = []
-    durations: list[float] = []
+    groups = _chapter_groups(scenes)
+    chapter_word_counts = [
+        sum(
+            _word_count(str(scene.get("narration_text", "")))
+            for _, scene in group
+        )
+        for group in groups
+    ]
+    chapter_targets = _allocate_exact_duration(
+        target_seconds,
+        chapter_word_counts,
+        minimum=48.0,
+    )
+
+    fitted_chapters: list[Path] = []
+    scene_durations = [0.0] * len(scenes)
     models: list[str] = []
 
-    for index, scene in enumerate(scenes, start=1):
-        scene_text = re.sub(r"\s+", " ", str(scene.get("narration_text", ""))).strip()
-        raw = scene_dir / f"{index:02d}_raw.wav"
-        normalized = scene_dir / f"{index:02d}_norm.wav"
-        final = scene_dir / f"{index:02d}_final.wav"
+    for chapter_index, (group, chapter_target) in enumerate(
+        zip(groups, chapter_targets),
+        start=1,
+    ):
+        chapter_text = " ".join(
+            re.sub(
+                r"\\s+", " ",
+                str(scene.get("narration_text", ""))
+            ).strip()
+            for _, scene in group
+        ).strip()
+        if not chapter_text:
+            raise RuntimeError(f"Bölüm {chapter_index} metni boş.")
 
-        model = synthesize_short_segment(client, scene_text, index, len(scenes), raw)
+        raw = chapter_dir / f"chapter_{chapter_index:02d}_raw.wav"
+        normalized = chapter_dir / f"chapter_{chapter_index:02d}_norm.wav"
+        fitted = chapter_dir / f"chapter_{chapter_index:02d}_fitted.wav"
+
+        model = synthesize_short_segment(
+            client,
+            chapter_text,
+            chapter_index,
+            len(groups),
+            raw,
+        )
         normalize_audio(raw, normalized)
-        pause = 0.0 if index == len(scenes) else SCENE_PAUSE_SECONDS
-        append_scene_pause(normalized, final, pause)
-
-        files.append(final)
-        durations.append(ffprobe_duration(final))
+        fit_audio_duration(normalized, fitted, chapter_target)
+        fitted_chapters.append(fitted)
         models.append(model)
 
-    concat_audio_files(files, output_audio)
-    return durations, " -> ".join(dict.fromkeys(models))
+        scene_weights = [
+            max(1, _word_count(str(scene.get("narration_text", ""))))
+            for _, scene in group
+        ]
+        allocated = _allocate_exact_duration(
+            chapter_target,
+            scene_weights,
+            minimum=14.0,
+        )
+        for (scene_position, _), duration in zip(group, allocated):
+            scene_durations[scene_position] = duration
+
+    concat_audio_files(fitted_chapters, output_audio)
+    final_duration = ffprobe_duration(output_audio)
+    if abs(final_duration - target_seconds) > 1.0:
+        corrected = chapter_dir / "story-corrected.wav"
+        fit_audio_duration(output_audio, corrected, target_seconds)
+        shutil.copy2(corrected, output_audio)
+
+    return scene_durations, " -> ".join(dict.fromkeys(models))
 
 
 def create_scene_srt(
@@ -1496,12 +1697,12 @@ def generate_thumbnail_candidates(
             f"MASTER STYLE:\n{STYLE_BIBLE}\n"
             "YouTube thumbnail background only. Topic-specific architecture, clothing and iconography. "
             "Main focal subject on the right third. Left third darker, calmer and uncluttered for typography. "
-            "Single cohesive environment, no collage, no written symbols and no generic Egyptian, Greek or Roman substitution unless the topic requires it."
+            "Single cohesive environment, no collage, no split screen, no diptych, no visible seam, no written symbols and no generic Egyptian, Greek or Roman substitution unless the topic requires it."
         )
         negative = (
             f"{GLOBAL_NEGATIVE}, "
             f"{str(payload.get('thumbnail_negative_prompt', '')).strip()}, "
-            "words, title, typography, collage, multiple panels, busy left side, generic ancient temple, wrong civilization"
+            "words, title, typography, collage, multiple panels, split screen, diptych, divided image, vertical seam, busy left side, generic ancient temple, wrong civilization"
         )
         info = generate_thumbnail_background_with_prompt(
             topic, prompt, negative, target, candidate_id=idx
@@ -2082,104 +2283,232 @@ def make_editorial_shots(
     return shots, shot_meta
 
 
+def _intro_background(source: Path) -> Image.Image:
+    with Image.open(source) as raw:
+        image = ImageOps.fit(
+            ImageOps.exif_transpose(raw).convert("RGB"),
+            (WIDTH, HEIGHT),
+            Image.Resampling.LANCZOS,
+        )
+    image = ImageEnhance.Brightness(image).enhance(0.62)
+    image = ImageEnhance.Contrast(image).enhance(1.12)
+    image = ImageEnhance.Color(image).enhance(0.82)
+    return image
+
+
+def _left_cinematic_gradient(image: Image.Image, strength: int = 220) -> Image.Image:
+    base = image.convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    for x in range(1180):
+        alpha = int(strength * (1 - x / 1180) ** 1.55)
+        draw.line((x, 0, x, HEIGHT), fill=(5, 8, 14, alpha))
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill=(4, 7, 12, 22))
+    return Image.alpha_composite(base, overlay)
+
+
 def make_intro_frames(
     hero_frame: Path,
+    second_frame: Path,
     clean_target: Path,
+    brand_target: Path,
     title_target: Path,
-    topic_title: str,
+    exit_target: Path,
+    video_title: str,
+    intro_hook: str,
 ) -> None:
-    with Image.open(hero_frame) as raw:
-        image = ImageOps.fit(raw.convert("RGB"), (WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+    hero = _intro_background(hero_frame)
+    second = _intro_background(second_frame)
 
-    image = ImageEnhance.Brightness(image).enhance(0.66)
-    image = ImageEnhance.Contrast(image).enhance(1.10)
-    image = ImageEnhance.Color(image).enhance(0.86)
-
-    clean = Image.alpha_composite(
-        image.convert("RGBA"),
-        Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 46)),
-    ).convert("RGB")
+    clean = ImageEnhance.Brightness(hero).enhance(0.86)
     clean.save(clean_target, "JPEG", quality=95, optimize=True)
 
-    title_image = clean.convert("RGBA")
-    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay)
-    for x in range(1200):
-        alpha = int(190 * (1 - x / 1200) ** 1.45)
-        overlay_draw.line((x, 0, x, HEIGHT), fill=(7, 9, 13, alpha))
-    title_image = Image.alpha_composite(title_image, overlay)
+    brand = hero.convert("RGBA")
+    brand = Image.alpha_composite(
+        brand,
+        Image.new("RGBA", brand.size, (0, 0, 0, 70)),
+    )
+    brand_draw = ImageDraw.Draw(brand)
+    brand_font = video_font(54, bold=True)
+    sub_font = video_font(21, bold=True)
+    brand_text = "UYKU VE TARİH"
+    brand_box = brand_draw.textbbox((0, 0), brand_text, font=brand_font)
+    brand_width = brand_box[2] - brand_box[0]
+    brand_draw.rectangle(
+        (WIDTH // 2 - 85, 428, WIDTH // 2 + 85, 436),
+        fill=(207, 174, 122, 255),
+    )
+    brand_draw.text(
+        ((WIDTH - brand_width) // 2, 466),
+        brand_text,
+        font=brand_font,
+        fill=(244, 238, 225),
+        stroke_width=1,
+        stroke_fill=(5, 7, 10),
+    )
+    sub_text = "GECE BELGESELİ"
+    sub_box = brand_draw.textbbox((0, 0), sub_text, font=sub_font)
+    brand_draw.text(
+        ((WIDTH - (sub_box[2] - sub_box[0])) // 2, 548),
+        sub_text,
+        font=sub_font,
+        fill=(202, 184, 154),
+    )
+    brand.convert("RGB").save(brand_target, "JPEG", quality=95, optimize=True)
 
-    draw = ImageDraw.Draw(title_image)
-    small_font = video_font(27, bold=True)
-    title_font = video_font(64, bold=True)
-    title = textwrap.shorten(
-        re.sub(r"\s+", " ", topic_title).strip().upper(),
-        width=52,
-        placeholder="…",
-    ).upper()
+    title_image = _left_cinematic_gradient(second)
+    title_draw = ImageDraw.Draw(title_image)
+    small_font = video_font(23, bold=True)
+    title_font = video_font(58, bold=True)
+    hook_font = video_font(27, bold=False)
 
-    draw.rectangle((116, 382, 266, 392), fill=(213, 183, 134, 255))
-    draw.text((116, 422), "UYKU VE TARİH", font=small_font,
-              fill=(220, 199, 164), stroke_width=1, stroke_fill=(8, 7, 6))
-
-    lines: list[str] = []
+    title = re.sub(r"\\s+", " ", video_title).strip().upper()
+    title = textwrap.shorten(title, width=70, placeholder="…").upper()
+    title_lines: list[str] = []
     current = ""
     for word in title.split():
         candidate = f"{current} {word}".strip()
-        if draw.textbbox((0, 0), candidate, font=title_font)[2] <= 1120:
+        width = title_draw.textbbox((0, 0), candidate, font=title_font)[2]
+        if width <= 1000:
             current = candidate
         else:
             if current:
-                lines.append(current)
+                title_lines.append(current)
             current = word
     if current:
-        lines.append(current)
+        title_lines.append(current)
 
-    for idx, line in enumerate(lines[:2]):
-        draw.text((116, 478 + idx * 76), line, font=title_font,
-                  fill=(248, 241, 226), stroke_width=2, stroke_fill=(9, 8, 7))
+    title_draw.text(
+        (120, 320),
+        "UYKU VE TARİH  /  YENİ BÖLÜM",
+        font=small_font,
+        fill=(210, 184, 142),
+    )
+    title_draw.rectangle(
+        (120, 372, 320, 380),
+        fill=(210, 178, 126, 255),
+    )
+    for line_index, line in enumerate(title_lines[:3]):
+        title_draw.text(
+            (120, 420 + line_index * 73),
+            line,
+            font=title_font,
+            fill=(246, 240, 228),
+            stroke_width=2,
+            stroke_fill=(5, 7, 10),
+        )
 
-    title_image.convert("RGB").save(title_target, "JPEG", quality=95, optimize=True)
+    hook = re.sub(r"\\s+", " ", intro_hook).strip()
+    if hook:
+        title_draw.text(
+            (123, 666),
+            hook,
+            font=hook_font,
+            fill=(207, 199, 184),
+        )
+    title_image.convert("RGB").save(
+        title_target, "JPEG", quality=95, optimize=True
+    )
+
+    exit_image = hero.filter(ImageFilter.GaussianBlur(radius=1.1))
+    exit_image = ImageEnhance.Brightness(exit_image).enhance(0.82)
+    exit_image.save(exit_target, "JPEG", quality=95, optimize=True)
 
 
-def render_intro_sequence(clean_frame: Path, title_frame: Path, target: Path) -> None:
-    first_seconds = 2.85
-    second_seconds = 3.0
-    transition = 0.65
-    total = first_seconds + second_seconds - transition
+def render_intro_sequence(
+    clean_frame: Path,
+    brand_frame: Path,
+    title_frame: Path,
+    exit_frame: Path,
+    target: Path,
+) -> None:
+    durations = [3.0, 3.2, 4.2, 3.7]
+    transition = INTRO_TRANSITION_SECONDS
 
-    run([
-        "ffmpeg", "-y",
-        "-loop", "1", "-framerate", str(FPS), "-t", f"{first_seconds:.3f}", "-i", str(clean_frame),
-        "-loop", "1", "-framerate", str(FPS), "-t", f"{second_seconds:.3f}", "-i", str(title_frame),
-        "-filter_complex",
-        "[0:v]scale=1920:1080,setsar=1,fade=t=in:st=0:d=0.9[v0];"
-        "[1:v]scale=1920:1080,setsar=1[v1];"
-        f"[v0][v1]xfade=transition=fade:duration={transition:.3f}:"
-        f"offset={first_seconds-transition:.3f},"
-        f"fade=t=out:st={total-0.75:.3f}:d=0.75,format=yuv420p[v]",
-        "-map", "[v]", "-t", f"{total:.3f}", "-an",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-pix_fmt", "yuv420p", str(target),
-    ])
+    command = ["ffmpeg", "-y"]
+    for duration, frame in zip(
+        durations,
+        [clean_frame, brand_frame, title_frame, exit_frame],
+    ):
+        command += [
+            "-loop", "1",
+            "-framerate", str(FPS),
+            "-t", f"{duration:.3f}",
+            "-i", str(frame),
+        ]
+
+    filters = (
+        "[0:v]scale=1920:1080,setsar=1,"
+        "fade=t=in:st=0:d=0.9,format=yuv420p[v0];"
+        "[1:v]scale=1920:1080,setsar=1,format=yuv420p[v1];"
+        "[2:v]scale=1920:1080,setsar=1,"
+        "drawbox=x='-420+260*t':y=0:w=220:h=1080:"
+        "color=white@0.035:t=fill,format=yuv420p[v2];"
+        "[3:v]scale=1920:1080,setsar=1,format=yuv420p[v3];"
+        f"[v0][v1]xfade=transition=fadeblack:duration={transition:.3f}:"
+        "offset=2.300[x1];"
+        f"[x1][v2]xfade=transition=fade:duration={transition:.3f}:"
+        "offset=4.800[x2];"
+        f"[x2][v3]xfade=transition=fade:duration={transition:.3f}:"
+        "offset=8.300,"
+        "fade=t=out:st=11.2:d=0.8,format=yuv420p[v]"
+    )
+
+    command += [
+        "-filter_complex", filters,
+        "-map", "[v]",
+        "-t", f"{INTRO_VISIBLE_SECONDS:.3f}",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-r", str(FPS),
+        str(target),
+    ]
+    run(command)
 
 
-def create_intro_audio(target: Path, duration: float = INTRO_VISIBLE_SECONDS) -> None:
+def create_intro_audio(
+    target: Path,
+    duration: float = INTRO_VISIBLE_SECONDS,
+) -> None:
     run([
         "ffmpeg", "-y",
         "-f", "lavfi", "-i",
-        f"anoisesrc=color=pink:amplitude=0.020:sample_rate=48000:d={duration:.3f}",
-        "-f", "lavfi", "-i", "sine=frequency=196:sample_rate=48000:duration=2.2",
+        f"anoisesrc=color=pink:amplitude=0.018:sample_rate=48000:d={duration:.3f}",
+        "-f", "lavfi", "-i",
+        f"sine=frequency=48:sample_rate=48000:duration={duration:.3f}",
+        "-f", "lavfi", "-i",
+        "anoisesrc=color=white:amplitude=0.08:sample_rate=48000:d=1.5",
+        "-f", "lavfi", "-i",
+        "sine=frequency=196:sample_rate=48000:duration=2.8",
+        "-f", "lavfi", "-i",
+        "anoisesrc=color=pink:amplitude=0.07:sample_rate=48000:d=1.2",
         "-filter_complex",
-        "[0:a]highpass=f=70,lowpass=f=850,volume=0.030,"
-        "afade=t=in:st=0:d=1.2,afade=t=out:st=4.0:d=1.1[wind];"
-        "[1:a]adelay=2100|2100,afade=t=in:st=0:d=0.12,"
-        "afade=t=out:st=0.65:d=1.45,aecho=0.5:0.25:190|380:0.20|0.10,"
-        "volume=0.025[chime];"
-        "[wind][chime]amix=inputs=2:duration=longest:normalize=0,"
-        "alimiter=limit=0.85[a]",
-        "-map", "[a]", "-t", f"{duration:.3f}", "-ar", "48000",
-        "-c:a", "pcm_s16le", str(target),
+        "[0:a]highpass=f=70,lowpass=f=820,volume=0.035,"
+        "afade=t=in:st=0:d=1.4,afade=t=out:st=10.0:d=2.0[air];"
+        "[1:a]lowpass=f=90,volume=0.022,"
+        "afade=t=in:st=0:d=2.0,afade=t=out:st=10.0:d=2.0[rumble];"
+        "[2:a]highpass=f=700,lowpass=f=6500,"
+        "afade=t=in:st=0:d=0.15,afade=t=out:st=0.45:d=0.95,"
+        "adelay=2650|2650,volume=0.035[whoosh1];"
+        "[3:a]afade=t=in:st=0:d=0.08,"
+        "afade=t=out:st=0.8:d=2.0,"
+        "aecho=0.5:0.25:230|460:0.18|0.09,"
+        "adelay=5200|5200,volume=0.030[chime];"
+        "[4:a]highpass=f=900,lowpass=f=7500,"
+        "afade=t=in:st=0:d=0.12,afade=t=out:st=0.35:d=0.75,"
+        "adelay=8650|8650,volume=0.030[whoosh2];"
+        "[air][rumble][whoosh1][chime][whoosh2]"
+        "amix=inputs=5:duration=longest:normalize=0,"
+        "alimiter=limit=0.88[a]",
+        "-map", "[a]",
+        "-t", f"{duration:.3f}",
+        "-ar", "48000",
+        "-ac", "1",
+        "-c:a", "pcm_s16le",
+        str(target),
     ])
 
 
@@ -2276,6 +2605,187 @@ def editorial_transition(prev_type: str, next_type: str, index: int) -> tuple[st
         return "fadeblack", 0.45
     return "fade", 0.38
 
+def _chapter_label_frame(
+    image: Image.Image,
+    chapter_index: int,
+    chapter_title: str,
+) -> Image.Image:
+    canvas = image.convert("RGBA")
+    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    draw.rounded_rectangle(
+        (92, 86, 690, 190),
+        radius=18,
+        fill=(6, 9, 14, 172),
+    )
+    draw.rectangle(
+        (118, 112, 170, 119),
+        fill=(208, 176, 126, 255),
+    )
+    draw.text(
+        (118, 132),
+        f"BÖLÜM {chapter_index}",
+        font=video_font(19, bold=True),
+        fill=(205, 184, 150),
+    )
+    title = textwrap.shorten(
+        re.sub(r"\\s+", " ", chapter_title).strip().upper(),
+        width=34,
+        placeholder="…",
+    )
+    draw.text(
+        (244, 126),
+        title,
+        font=video_font(27, bold=True),
+        fill=(243, 237, 225),
+    )
+    return Image.alpha_composite(canvas, overlay).convert("RGB")
+
+
+def _scene_shot_frames(
+    frame: Path,
+    scene: dict[str, Any],
+    index: int,
+    target_dir: Path,
+    chapter_start: bool,
+) -> list[Path]:
+    with Image.open(frame) as raw:
+        base = ImageOps.exif_transpose(raw).convert("RGB")
+
+    wide = ImageOps.fit(
+        base,
+        (WIDTH, HEIGHT),
+        Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+    medium = ImageOps.fit(
+        base,
+        (WIDTH, HEIGHT),
+        Image.Resampling.LANCZOS,
+        centering=(0.40, 0.50) if index % 2 else (0.60, 0.50),
+    )
+    medium = ImageEnhance.Contrast(medium).enhance(1.03)
+
+    crop_w = int(base.width * 0.72)
+    crop_h = int(base.height * 0.72)
+    center_x = int(base.width * (0.38 if index % 2 else 0.62))
+    center_y = int(base.height * 0.52)
+    left = max(0, min(base.width - crop_w, center_x - crop_w // 2))
+    top = max(0, min(base.height - crop_h, center_y - crop_h // 2))
+    detail = base.crop((left, top, left + crop_w, top + crop_h))
+    detail = ImageOps.fit(
+        detail,
+        (WIDTH, HEIGHT),
+        Image.Resampling.LANCZOS,
+    )
+    detail = ImageEnhance.Brightness(detail).enhance(0.97)
+    detail = ImageEnhance.Contrast(detail).enhance(1.05)
+
+    if chapter_start:
+        wide = _chapter_label_frame(
+            wide,
+            int(scene.get("chapter_index", 1)),
+            str(scene.get("chapter_title", "")),
+        )
+
+    paths = [
+        target_dir / f"scene_{index:02d}_wide.jpg",
+        target_dir / f"scene_{index:02d}_medium.jpg",
+        target_dir / f"scene_{index:02d}_detail.jpg",
+    ]
+    for image, path in zip([wide, medium, detail], paths):
+        image.save(path, "JPEG", quality=94, optimize=True)
+    return paths
+
+
+def _render_scene_editorial_clip(
+    shot_frames: list[Path],
+    seconds: float,
+    chapter_start: bool,
+    chapter_end: bool,
+    target: Path,
+) -> None:
+    seconds = max(9.0, float(seconds))
+    transition = 0.46
+    visible_parts = [
+        seconds * 0.44,
+        seconds * 0.33,
+    ]
+    visible_parts.append(seconds - sum(visible_parts))
+    input_durations = [
+        visible_parts[0] + transition,
+        visible_parts[1] + transition,
+        visible_parts[2],
+    ]
+
+    command = ["ffmpeg", "-y"]
+    for frame, duration in zip(shot_frames, input_durations):
+        command += [
+            "-loop", "1",
+            "-framerate", str(FPS),
+            "-t", f"{duration:.3f}",
+            "-i", str(frame),
+        ]
+
+    fade_in = "fade=t=in:st=0:d=0.45," if chapter_start else ""
+    fade_out = (
+        f"fade=t=out:st={max(0.0, seconds - 0.55):.3f}:d=0.55,"
+        if chapter_end else ""
+    )
+    filters = (
+        "[0:v]scale=1920:1080,setsar=1,"
+        "eq=saturation=0.94:contrast=1.015:brightness=-0.008,"
+        "vignette=PI/9.2,format=yuv420p[v0];"
+        "[1:v]scale=1920:1080,setsar=1,"
+        "eq=saturation=0.94:contrast=1.015:brightness=-0.008,"
+        "vignette=PI/9.2,format=yuv420p[v1];"
+        "[2:v]scale=1920:1080,setsar=1,"
+        "eq=saturation=0.94:contrast=1.02:brightness=-0.010,"
+        "vignette=PI/9.2,format=yuv420p[v2];"
+        f"[v0][v1]xfade=transition=fade:duration={transition:.3f}:"
+        f"offset={visible_parts[0]:.3f}[x1];"
+        f"[x1][v2]xfade=transition=hblur:duration={transition:.3f}:"
+        f"offset={visible_parts[0] + visible_parts[1]:.3f},"
+        f"{fade_in}{fade_out}format=yuv420p[v]"
+    )
+
+    command += [
+        "-filter_complex", filters,
+        "-map", "[v]",
+        "-t", f"{seconds:.3f}",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-r", str(FPS),
+        str(target),
+    ]
+    run(command)
+
+
+def _verify_final_media(
+    target: Path,
+    expected_seconds: float,
+) -> float:
+    actual = ffprobe_duration(target)
+    if actual < MIN_FINAL_VIDEO_SECONDS:
+        raise RuntimeError(
+            f"Final video çok kısa üretildi: {actual:.2f} saniye. "
+            f"Hedef yaklaşık {expected_seconds:.2f} saniyeydi."
+        )
+    if actual > MAX_FINAL_VIDEO_SECONDS + 15:
+        raise RuntimeError(
+            f"Final video beklenenden uzun: {actual:.2f} saniye."
+        )
+    if abs(actual - expected_seconds) > 3.0:
+        raise RuntimeError(
+            "Final süre güvenlik kontrolünü geçemedi: "
+            f"{actual:.2f}s / {expected_seconds:.2f}s"
+        )
+    return actual
+
+
 def render_video(
     frames: list[Path],
     scenes: list[dict[str, Any]],
@@ -2285,139 +2795,154 @@ def render_video(
     transitions: list[str],
     transition_durations: list[float],
 ) -> float:
-    clips_dir = WORK / "v6-clips"
-    if clips_dir.exists():
-        shutil.rmtree(clips_dir)
-    clips_dir.mkdir(parents=True)
+    clips_dir = WORK / "v7-clips"
+    shots_dir = WORK / "v7-shots"
+    for folder in (clips_dir, shots_dir):
+        if folder.exists():
+            shutil.rmtree(folder)
+        folder.mkdir(parents=True)
 
     intro_clean = WORK / "intro-clean.jpg"
+    intro_brand = WORK / "intro-brand.jpg"
     intro_title = WORK / "intro-title.jpg"
-    make_intro_frames(
-        frames[0], intro_clean, intro_title,
-        (OUTPUT / "baslik.txt").read_text(encoding="utf-8"),
+    intro_exit = WORK / "intro-exit.jpg"
+
+    second_frame = frames[1] if len(frames) > 1 else frames[0]
+    package = json.loads(
+        (OUTPUT / "video-paketi.json").read_text(encoding="utf-8")
     )
-    intro_clip = clips_dir / "clip_000_intro.mp4"
-    render_intro_sequence(intro_clean, intro_title, intro_clip)
+    make_intro_frames(
+        frames[0],
+        second_frame,
+        intro_clean,
+        intro_brand,
+        intro_title,
+        intro_exit,
+        (OUTPUT / "baslik.txt").read_text(encoding="utf-8"),
+        str(package.get("intro_hook", "")),
+    )
+
+    intro_clip = clips_dir / "000_intro.mp4"
+    render_intro_sequence(
+        intro_clean,
+        intro_brand,
+        intro_title,
+        intro_exit,
+        intro_clip,
+    )
 
     scene_clips: list[Path] = []
     timeline: list[dict[str, Any]] = [{
-        "type": "intro", "start": 0.0, "duration": INTRO_VISIBLE_SECONDS
+        "type": "intro",
+        "start": 0.0,
+        "duration": INTRO_VISIBLE_SECONDS,
+        "style": "cold-open / ident / title reveal / story handoff",
     }]
     cursor = INTRO_VISIBLE_SECONDS
 
-    for index, (frame, scene, visible) in enumerate(
-        zip(frames, scenes, visible_durations), start=1
+    for index, (frame, scene, duration) in enumerate(
+        zip(frames, scenes, visible_durations),
+        start=1,
     ):
-        extra = transition_durations[index - 1] if index - 1 < len(transition_durations) else 0.0
-        total = visible + extra
-
-        with Image.open(frame) as raw:
-            base = ImageOps.exif_transpose(raw).convert("RGB")
-
-        shot_dir = WORK / "v6-shots"
-        shot_dir.mkdir(parents=True, exist_ok=True)
-        wide_path = shot_dir / f"{index:02d}_wide.jpg"
-        detail_path = shot_dir / f"{index:02d}_detail.jpg"
-
-        wide = ImageOps.fit(base, (WIDTH, HEIGHT), Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-        detail = ImageOps.fit(
-            base, (WIDTH, HEIGHT), Image.Resampling.LANCZOS,
-            centering=(0.35, 0.50) if index % 2 else (0.65, 0.50),
+        previous_chapter = (
+            int(scenes[index - 2].get("chapter_index", 1))
+            if index > 1 else None
         )
-        detail = ImageEnhance.Contrast(detail).enhance(1.035)
-        wide.save(wide_path, "JPEG", quality=94, optimize=True)
-        detail.save(detail_path, "JPEG", quality=94, optimize=True)
+        current_chapter = int(scene.get("chapter_index", 1))
+        next_chapter = (
+            int(scenes[index].get("chapter_index", current_chapter))
+            if index < len(scenes) else None
+        )
+        chapter_start = previous_chapter != current_chapter
+        chapter_end = next_chapter != current_chapter
 
-        scene_clip = clips_dir / f"scene_{index:02d}.mp4"
-        if total >= 5.0:
-            first = clips_dir / f"scene_{index:02d}_a.mp4"
-            second = clips_dir / f"scene_{index:02d}_b.mp4"
-            first_duration = total * 0.62
-            second_duration = total - first_duration
-            render_static_clip(wide_path, first, first_duration)
-            render_static_clip(detail_path, second, second_duration)
-            concat_file = clips_dir / f"scene_{index:02d}.txt"
-            concat_file.write_text(
-                f"file '{first.resolve().as_posix()}'\n"
-                f"file '{second.resolve().as_posix()}'\n",
-                encoding="utf-8",
-            )
-            run([
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", str(concat_file), "-c:v", "libx264",
-                "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
-                str(scene_clip),
-            ])
-            shots = ["wide", "detail"]
-        else:
-            render_static_clip(wide_path, scene_clip, total)
-            shots = ["wide"]
-
+        shot_frames = _scene_shot_frames(
+            frame,
+            scene,
+            index,
+            shots_dir,
+            chapter_start,
+        )
+        scene_clip = clips_dir / f"{index:03d}_scene.mp4"
+        _render_scene_editorial_clip(
+            shot_frames,
+            duration,
+            chapter_start,
+            chapter_end,
+            scene_clip,
+        )
         scene_clips.append(scene_clip)
+
         timeline.append({
             "type": "story_scene",
             "scene_id": scene.get("scene_id", index),
-            "act": scene.get("act"),
-            "beat_type": scene.get("beat_type"),
-            "continuity_bridge": scene.get("continuity_bridge"),
+            "chapter_index": current_chapter,
+            "chapter_title": scene.get("chapter_title", ""),
+            "beat_type": scene.get("beat_type", ""),
+            "continuity_bridge": scene.get("continuity_bridge", ""),
             "start": round(cursor, 3),
-            "duration": round(visible, 3),
-            "shots": shots,
+            "duration": round(duration, 3),
+            "shots": ["wide", "medium", "detail"],
+            "internal_transitions": ["fade", "hblur"],
             "narration_text": scene.get("narration_text", ""),
         })
-        cursor += visible
+        cursor += duration
 
+    concat_file = WORK / "v7-video-concat.txt"
     all_clips = [intro_clip, *scene_clips]
-    command = ["ffmpeg", "-y"]
-    for clip in all_clips:
-        command += ["-i", str(clip)]
-
-    filters: list[str] = []
-    current = "[0:v]"
-    offset = INTRO_VISIBLE_SECONDS
-    filters.append(
-        f"{current}[1:v]xfade=transition=fade:"
-        f"duration={INTRO_TRANSITION_SECONDS:.3f}:"
-        f"offset={INTRO_VISIBLE_SECONDS:.3f}[vx1]"
+    concat_file.write_text(
+        "".join(
+            f"file '{clip.resolve().as_posix()}'\\n"
+            for clip in all_clips
+        ),
+        encoding="utf-8",
     )
-    current = "[vx1]"
 
-    for idx in range(2, len(all_clips)):
-        previous_scene = scenes[idx - 2]
-        next_scene = scenes[idx - 1]
-        act_change = previous_scene.get("act") != next_scene.get("act")
-        transition = "fadeblack" if act_change else "fade"
-        duration = 0.52 if act_change else 0.34
-        offset += visible_durations[idx - 2]
-        out = f"[vx{idx}]"
-        filters.append(
-            f"{current}[{idx}:v]xfade=transition={transition}:"
-            f"duration={duration:.3f}:offset={offset:.3f}{out}"
+    video_only = WORK / "v7-video-only.mp4"
+    run([
+        "ffmpeg", "-y",
+        "-fflags", "+genpts",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_file),
+        "-c:v", "copy",
+        "-an",
+        str(video_only),
+    ])
+
+    expected_duration = INTRO_VISIBLE_SECONDS + sum(visible_durations)
+    audio_duration = ffprobe_duration(audio)
+    video_duration = ffprobe_duration(video_only)
+    if abs(audio_duration - expected_duration) > 1.2:
+        raise RuntimeError(
+            "Final ses süresi hedefle uyuşmuyor: "
+            f"{audio_duration:.2f}s / {expected_duration:.2f}s"
         )
-        current = out
+    if abs(video_duration - expected_duration) > 2.0:
+        raise RuntimeError(
+            "Final görüntü süresi hedefle uyuşmuyor: "
+            f"{video_duration:.2f}s / {expected_duration:.2f}s"
+        )
 
-    total_video = INTRO_VISIBLE_SECONDS + sum(visible_durations)
-    filters.append(
-        f"{current}fade=t=out:st={max(0.0, total_video-1.4):.3f}:"
-        f"d=1.4,format=yuv420p[vfinal]"
-    )
-
-    command += ["-i", str(audio)]
-    command += [
-        "-filter_complex", ";".join(filters),
-        "-map", "[vfinal]", "-map", f"{len(all_clips)}:a:0",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-r", str(FPS),
-        "-c:a", "aac", "-b:a", "192k",
-        "-shortest", "-movflags", "+faststart", str(target),
-    ]
-    run(command)
+    run([
+        "ffmpeg", "-y",
+        "-i", str(video_only),
+        "-i", str(audio),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-t", f"{expected_duration:.3f}",
+        "-movflags", "+faststart",
+        str(target),
+    ])
 
     (OUTPUT / "edit-timeline.json").write_text(
         json.dumps(timeline, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    return total_video
+    return _verify_final_media(target, expected_duration)
 
 
 def timestamp(seconds: float) -> str:
@@ -2476,7 +3001,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V6-2.txt").write_text(
+    (OUTPUT / "HATA-V7.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -2498,18 +3023,34 @@ def main() -> None:
     if not cloudflare_api_token:
         raise RuntimeError("CLOUDFLARE_API_TOKEN bulunamadı.")
 
-    target_seconds = int(os.getenv("TARGET_SECONDS", "90"))
-    scene_count = int(os.getenv("SCENE_COUNT", "12"))
+    requested_target = int(
+        os.getenv("TARGET_SECONDS", str(DEFAULT_TARGET_SECONDS))
+    )
+    target_seconds = (
+        DEFAULT_TARGET_SECONDS
+        if requested_target < 240
+        else max(240, min(360, requested_target))
+    )
+
+    requested_scene_count = int(
+        os.getenv("SCENE_COUNT", str(DEFAULT_SCENE_COUNT))
+    )
+    scene_count = (
+        DEFAULT_SCENE_COUNT
+        if requested_scene_count < 10
+        else max(10, min(16, requested_scene_count))
+    )
+    story_seconds = target_seconds - INTRO_VISIBLE_SECONDS
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V6.2 — FAST SAFE RENDER ACTIVE")
+    print("UYKU VE TARİH V7 — FIVE MINUTE DIRECTOR ACTIVE")
     print("Konu:", topic)
-    print("FAST SAFE RENDER: finite audio padding + reduced retry chain")
+    print("FIVE MINUTE DIRECTOR: 4 chapters, 12 scenes, 36 editorial shots")
     print("=" * 72)
 
     payload, text_model = build_video_package(
-        client, topic, target_seconds, scene_count
+        client, topic, int(story_seconds), scene_count
     )
     payload, story_model = story_director_pass(
         client, topic, payload, scene_count
@@ -2565,15 +3106,32 @@ def main() -> None:
     narration_audio = OUTPUT / "seslendirme.wav"
     try:
         visible_durations, tts_model = synthesize_scene_narration(
-            client, payload["scenes"], narration_audio
+            client,
+            payload["scenes"],
+            narration_audio,
+            story_seconds,
         )
     except Exception as exc:
         print("Sahne bazlı TTS başarısız; tek parça yedek:", exc)
         raw_audio = WORK / "narration-raw.wav"
         tts_model = synthesize_narration(client, payload["narration"], raw_audio)
-        normalize_audio(raw_audio, narration_audio)
-        visible_durations = allocate_scene_durations(
-            payload["scenes"], ffprobe_duration(narration_audio)
+        normalized_fallback = WORK / "narration-fallback-normalized.wav"
+        normalize_audio(raw_audio, normalized_fallback)
+        fit_audio_duration(
+            normalized_fallback,
+            narration_audio,
+            story_seconds,
+        )
+        visible_durations = _allocate_exact_duration(
+            story_seconds,
+            [
+                max(
+                    1,
+                    _word_count(str(scene.get("narration_text", ""))),
+                )
+                for scene in payload["scenes"]
+            ],
+            minimum=14.0,
         )
 
     transitions, transition_durations = scene_transition_plan(payload["scenes"])
@@ -2588,10 +3146,16 @@ def main() -> None:
     intro_audio = WORK / "intro-audio.wav"
     create_intro_audio(intro_audio, INTRO_VISIBLE_SECONDS)
 
+    final_audio_raw = WORK / "final-audio-raw.wav"
     final_audio = OUTPUT / "ses-tasarim.wav"
-    concat_audio_files([intro_audio, story_audio], final_audio)
+    concat_audio_files([intro_audio, story_audio], final_audio_raw)
+    fit_audio_duration(
+        final_audio_raw,
+        final_audio,
+        target_seconds,
+    )
 
-    video = OUTPUT / "pilot-video-v6-2-fast-safe.mp4"
+    video = OUTPUT / "uyku-tarih-v7-5-dakika.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -2641,6 +3205,11 @@ def main() -> None:
             "zero_pause_direct_copy": True,
             "ffmpeg_timeout_seconds": 900,
             "fast_retry_chain": True,
+            "five_minute_target": True,
+            "chapter_tts_calls": CHAPTER_COUNT,
+            "editorial_shots_per_scene": 3,
+            "professional_intro_seconds": INTRO_VISIBLE_SECONDS,
+            "hard_final_duration_guard": True,
             "usable_best_candidate_fallback": True,
             "wide_detail_editorial_cuts": True,
         },
@@ -2668,8 +3237,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V6.2 Fast Safe Render yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce pilot-video-v6-2-fast-safe.mp4 dosyasını izle.\n"
+            "V7 Five Minute Director yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce uyku-tarih-v7-5-dakika.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -2678,7 +3247,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V6.2 FAST SAFE RENDER TAMAMLANDI")
+    print("V7 FIVE MINUTE DIRECTOR TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
