@@ -162,6 +162,108 @@ def generate_json(
     raise RuntimeError(f"Hiçbir metin modeli çalışmadı. Son hata: {last_error}")
 
 
+def _word_count(value: Any) -> int:
+    return len(re.findall(r"\b\w+\b", str(value), flags=re.UNICODE))
+
+
+def _package_issues(
+    payload: dict[str, Any],
+    scene_count: int,
+    minimum_words: int,
+) -> list[str]:
+    issues: list[str] = []
+    required = (
+        "video_title", "thumbnail_text", "description", "narration",
+        "visual_identity", "thumbnail_prompt", "scenes",
+    )
+    missing = [key for key in required if not payload.get(key)]
+    if missing:
+        issues.append("Eksik alanlar: " + ", ".join(missing))
+
+    narration = re.sub(r"\s+", " ", str(payload.get("narration", ""))).strip()
+    count = _word_count(narration)
+    if count < minimum_words:
+        issues.append(
+            f"Senaryo kısa: {count} kelime. En az {minimum_words} kelime olmalı."
+        )
+
+    scenes = payload.get("scenes")
+    if not isinstance(scenes, list):
+        issues.append("scenes alanı liste değil.")
+        return issues
+    if len(scenes) < scene_count:
+        issues.append(
+            f"Sahne sayısı yetersiz: {len(scenes)}. Tam {scene_count} sahne gerekli."
+        )
+
+    for index, scene in enumerate(scenes[:scene_count], start=1):
+        if not isinstance(scene, dict):
+            issues.append(f"Sahne {index} geçersiz.")
+            continue
+        for key in ("narration_idea", "visual_goal", "image_prompt"):
+            if not str(scene.get(key, "")).strip():
+                issues.append(f"Sahne {index} için {key} eksik.")
+    return issues
+
+
+def _normalize_package(payload: dict[str, Any], scene_count: int) -> None:
+    payload["narration"] = re.sub(
+        r"\s+", " ", str(payload.get("narration", ""))
+    ).strip()
+    payload["scenes"] = list(payload.get("scenes", []))[:scene_count]
+
+    for index, scene in enumerate(payload["scenes"], start=1):
+        scene["scene_id"] = index
+        motion = str(scene.get("motion", "slow_zoom_in"))
+        if motion not in {
+            "slow_zoom_in", "slow_zoom_out", "pan_left", "pan_right"
+        }:
+            scene["motion"] = "slow_zoom_in"
+        if str(scene.get("importance", "normal")) not in {"high", "normal"}:
+            scene["importance"] = "normal"
+
+
+def _repair_video_package(
+    client: genai.Client,
+    topic: str,
+    payload: dict[str, Any],
+    issues: list[str],
+    target_words: int,
+    scene_count: int,
+) -> tuple[dict[str, Any], str]:
+    existing = json.dumps(payload, ensure_ascii=False)
+    issue_text = "\n".join(f"- {item}" for item in issues)
+    prompt = f"""
+Yalnızca geçerli JSON üret. Markdown yazma.
+
+Aşağıdaki tarih videosu paketini düzelt ve EKSİKSİZ TAM JSON olarak geri ver.
+Kullanıcı yalnızca konuyu verdi; ondan ek bilgi istenemez.
+
+KONU:
+{topic}
+
+TESPİT EDİLEN SORUNLAR:
+{issue_text}
+
+ZORUNLU HEDEFLER:
+- narration alanı {max(120, target_words - 20)} ile {target_words + 35} Türkçe kelime arasında olsun.
+- Metin sakin, doğal, tarihsel açıdan temkinli ve seslendirmeye uygun olsun.
+- İlk cümle dinleyiciyi zamana ve mekâna taşısın.
+- Son cümle yumuşak bir kapanış yapsın.
+- Tam {scene_count} sahne olsun.
+- Her sahne narration sırasındaki somut fikri doğrudan görselleştirsin.
+- Her image_prompt İngilizce, ayrıntılı, 16:9 sinematik tarih karesi tarif etsin.
+- Müze objesi, beyaz fon, kolaj, yazı, sayı, logo, modern veya fantastik unsur olmasın.
+- video_title, thumbnail_text, description, visual_identity,
+  thumbnail_prompt, thumbnail_negative_prompt, chapters ve tags alanlarını koru veya iyileştir.
+- thumbnail_text en fazla dört kelime olsun.
+
+MEVCUT JSON:
+{existing}
+"""
+    return generate_json(client, prompt, max_tokens=12000)
+
+
 def build_video_package(
     client: genai.Client,
     topic: str,
@@ -169,6 +271,7 @@ def build_video_package(
     scene_count: int,
 ) -> tuple[dict[str, Any], str]:
     target_words = max(170, min(260, round(target_seconds * 2.35)))
+    minimum_words = max(110, round(target_words * 0.62))
     prompt = f"""
 Yalnızca geçerli JSON üret. Markdown yazma.
 
@@ -185,7 +288,7 @@ başlık veya montaj tercihi istemeyecek.
 HEDEF:
 Yaklaşık {target_seconds} saniyelik, uyku öncesi dinlemeye uygun, yayın
 kalitesinde Türkçe tarih videosu.
-Yaklaşık {target_words} kelimelik seslendirme.
+Narration alanı {max(120, target_words - 20)} ile {target_words + 35} kelime arasında olsun.
 Tam {scene_count} temiz ve birbirini takip eden görsel sahne.
 
 JSON ŞEMASI:
@@ -238,41 +341,53 @@ ZORUNLU GÖRSEL KURALLARI:
 - Her sahne promptu; konu, dönem, yer, ışık, kompozisyon ve kamera açısını içersin.
 - Tam olarak {scene_count} sahne üret.
 """
-    payload, model = generate_json(client, prompt, max_tokens=10000)
-    validate_package(payload, scene_count)
-    return payload, model
+
+    payload, model = generate_json(client, prompt, max_tokens=12000)
+    model_history = [model]
+
+    # Kısa veya eksik model yanıtını hata sayıp tamamen bırakmak yerine,
+    # aynı paketi otomatik olarak genişletip onar.
+    for repair_round in range(1, 4):
+        issues = _package_issues(payload, scene_count, minimum_words)
+        if not issues:
+            _normalize_package(payload, scene_count)
+            return payload, " -> ".join(model_history)
+
+        print(
+            f"Video paketi doğrulama turu {repair_round}/3: "
+            + " | ".join(issues)
+        )
+        payload, repair_model = _repair_video_package(
+            client,
+            topic,
+            payload,
+            issues,
+            target_words,
+            scene_count,
+        )
+        model_history.append(repair_model)
+
+    final_issues = _package_issues(payload, scene_count, minimum_words)
+    if final_issues:
+        raise ValueError(
+            "Video paketi üç otomatik onarımdan sonra hâlâ geçersiz: "
+            + " | ".join(final_issues)
+        )
+
+    _normalize_package(payload, scene_count)
+    return payload, " -> ".join(model_history)
 
 
-def validate_package(payload: dict[str, Any], scene_count: int) -> None:
-    required = (
-        "video_title", "thumbnail_text", "description", "narration",
-        "visual_identity", "thumbnail_prompt", "scenes",
-    )
-    missing = [key for key in required if not payload.get(key)]
-    if missing:
-        raise ValueError("Eksik paket alanları: " + ", ".join(missing))
-
-    narration = re.sub(r"\s+", " ", str(payload["narration"])).strip()
-    if len(narration.split()) < 140:
-        raise ValueError("Senaryo yeterince uzun değil.")
-    payload["narration"] = narration
-
-    scenes = payload.get("scenes")
-    if not isinstance(scenes, list) or len(scenes) < scene_count:
-        raise ValueError(f"{scene_count} sahne üretilemedi.")
-    payload["scenes"] = scenes[:scene_count]
-
-    for index, scene in enumerate(payload["scenes"], start=1):
-        if not isinstance(scene, dict):
-            raise ValueError(f"Sahne {index} geçersiz.")
-        scene["scene_id"] = index
-        for key in ("narration_idea", "visual_goal", "image_prompt"):
-            if not str(scene.get(key, "")).strip():
-                raise ValueError(f"Sahne {index} için {key} eksik.")
-        motion = str(scene.get("motion", "slow_zoom_in"))
-        if motion not in {"slow_zoom_in", "slow_zoom_out", "pan_left", "pan_right"}:
-            scene["motion"] = "slow_zoom_in"
-
+def validate_package(
+    payload: dict[str, Any],
+    scene_count: int,
+    minimum_words: int = 110,
+) -> None:
+    """Backward-compatible validator used by older calls/tests."""
+    issues = _package_issues(payload, scene_count, minimum_words)
+    if issues:
+        raise ValueError(" | ".join(issues))
+    _normalize_package(payload, scene_count)
 
 def combined_prompt(payload: dict[str, Any], scene: dict[str, Any]) -> str:
     return (
