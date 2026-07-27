@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/7.2"
+USER_AGENT = "UykuTarihTopicToVideo/8.0"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -76,12 +76,12 @@ TTS_MODELS = [
 # Keep a safety margin because fallback models receive exclusions in the same field.
 MAX_IMAGE_PROMPT_CHARS = 1320
 MAX_NEGATIVE_PROMPT_CHARS = 360
-INTRO_VISIBLE_SECONDS = 12.0
+INTRO_VISIBLE_SECONDS = 8.0
 INTRO_TRANSITION_SECONDS = 0.70
 SCENE_PAUSE_SECONDS = 0.18
 DEFAULT_TARGET_SECONDS = 300
 DEFAULT_SCENE_COUNT = 12
-CHAPTER_COUNT = 4
+CHAPTER_COUNT = 3
 MIN_FINAL_VIDEO_SECONDS = 285
 MAX_FINAL_VIDEO_SECONDS = 315
 
@@ -461,10 +461,18 @@ MEVCUT JSON:
 
 
 CHAPTER_BEATS = [
-    ("Geceye Giriş", ["hook", "orientation", "setting"]),
-    ("Yaşayan Dünya", ["routine", "craft", "community"]),
-    ("Kırılma Anı", ["evidence", "tension", "turning_point"]),
-    ("Sessiz Miras", ["aftermath", "legacy", "reflection"]),
+    (
+        "Gerilim Birikiyor",
+        ["hook", "context", "goal", "obstacle"],
+    ),
+    (
+        "Kararlar ve Çatışma",
+        ["first_move", "counter_move", "escalation", "breakthrough"],
+    ),
+    (
+        "Sonuç ve Dönüşüm",
+        ["climax", "immediate_result", "human_cost", "legacy"],
+    ),
 ]
 
 
@@ -724,13 +732,19 @@ def _chapter_generation_prompt(
         }
         for scene in scenes
     ]
+    scene_count = len(scenes)
+    previous_tail = str(
+        payload.get("_previous_chapter_tail", "")
+    ).strip()
 
-    previous_context = ""
-    if chapter_index > 1:
-        previous_context = (
-            "Bu bölüm önceki bölümün düşüncesini doğal biçimde sürdürmeli; "
-            "yeni bir video başlıyormuş gibi giriş yapmamalı."
+    continuation_rule = (
+        "Bu ilk bölüm. İlk 25 kelime içinde ana çatışmayı veya soruyu kur."
+        if chapter_index == 1
+        else (
+            "Yeni bir giriş yapma. Aşağıdaki önceki bölümün son düşüncesinden "
+            "doğrudan devam et:\n" + previous_tail
         )
+    )
 
     return f"""
 Yalnızca geçerli JSON üret:
@@ -738,9 +752,7 @@ Yalnızca geçerli JSON üret:
   "chapter_title": "Kısa Türkçe bölüm adı",
   "chapter_text": "Tek parça akıcı Türkçe anlatım",
   "scene_texts": [
-    "Birinci sahnede okunacak metin",
-    "İkinci sahnede okunacak metin",
-    "Üçüncü sahnede okunacak metin"
+    "Sahne metni 1"
   ]
 }}
 
@@ -748,27 +760,38 @@ KONU:
 {topic}
 
 BÖLÜM:
-{chapter_index}/4 — {chapter_title}
+{chapter_index}/{CHAPTER_COUNT} — {chapter_title}
 
-HEDEF:
-- chapter_text yaklaşık {target_words} Türkçe kelime olsun.
-- Kesin alt sınır {max(120, target_words - 25)} kelime.
-- Tam üç scene_texts üret.
-- Üç scene_texts birleştiğinde chapter_text ile aynı anlatıyı oluştursun.
-- Metin sakin, doğal, belgesel tonunda ve seslendirmeye uygun olsun.
-- Bilgi listesi, tekrar, yapay dramatizasyon ve reklam tonu kullanma.
-- Tarihsel belirsizlikleri kesin bilgi gibi sunma.
-- İnsan deneyimi, mekân ve tarihsel bağlam arasında doğal bağ kur.
-- {previous_context}
+ANLATIM MİMARİSİ:
+- Bu bir görsel betimleme metni değil, olay anlatısıdır.
+- Metnin en az yüzde 65'i olay, karar, neden ve sonuç içermeli.
+- Tarihsel bağlam yaklaşık yüzde 20 olabilir.
+- Duyusal veya atmosferik betimleme en fazla yüzde 15 olabilir.
+- Her paragraf hikâyeyi ileri götürmeli.
+- Kim ne istedi, ne engelledi, hangi karar alındı ve bunun sonucu ne oldu
+  sorularından en az ikisini her sahnede cevapla.
+- "Gece çökerken", "taş duvarlar", "sessizlik", "ay ışığı",
+  "karanlığın içinde" gibi kalıpları bölüm boyunca toplam bir defadan
+  fazla kullanma.
+- Kamera, görüntü, sahne, kadraj veya izleyici kelimelerini kullanma.
+- Bilgi listesi yazma.
+- Aynı fikri farklı kelimelerle tekrar etme.
+- Yapay dramatizasyon, fragman tonu ve şiirsel dolgu kullanma.
+- Tarihsel belirsizliği kesin gerçek gibi sunma.
+- Özel isim, tarih ve kararlar anlatının omurgasını oluştursun.
+- Bölüm yaklaşık {target_words} kelime olsun.
+- Tam {scene_count} scene_texts üret.
+- scene_texts birleşince chapter_text ile aynı anlatıyı oluştursun.
+- {continuation_rule}
 
 VİDEO BAĞLAMI:
 {json.dumps({
     "historical_scope": payload.get("historical_scope", ""),
-    "world_bible": payload.get("world_bible", {}),
     "video_title": payload.get("video_title", ""),
+    "topic_interpretation": payload.get("topic_interpretation", ""),
 }, ensure_ascii=False)}
 
-BU BÖLÜMÜN ÜÇ SAHNESİ:
+BU BÖLÜMÜN ANLATI ADIMLARI:
 {json.dumps(scene_context, ensure_ascii=False)}
 """
 
@@ -792,12 +815,13 @@ def _generate_long_chapter(
     model_name = "local-fallback"
     chapter_text = ""
     scene_texts: list[str] = []
+    scene_count = len(scenes)
 
     try:
         result, model_name = generate_json(
             client,
             prompt,
-            max_tokens=4200,
+            max_tokens=4300,
         )
         chapter_text = re.sub(
             r"\s+", " ", str(result.get("chapter_text", ""))
@@ -806,39 +830,47 @@ def _generate_long_chapter(
         if isinstance(supplied, list):
             scene_texts = [
                 re.sub(r"\s+", " ", str(item)).strip()
-                for item in supplied[:3]
+                for item in supplied[:scene_count]
             ]
     except Exception as exc:
         print(
-            f"Bölüm {chapter_index} yapay zekâ üretimi atlandı; "
-            f"yerel güvenli tamamlayıcı kullanılacak: {exc}"
+            f"Bölüm {chapter_index} üretimi atlandı; "
+            f"güvenli anlatı iskeleti kullanılacak: {exc}"
         )
 
-    if len(scene_texts) == 3:
-        joined = " ".join(item for item in scene_texts if item).strip()
-        if _word_count(joined) >= _word_count(chapter_text) * 0.75:
+    if len(scene_texts) == scene_count:
+        joined = " ".join(
+            item for item in scene_texts if item
+        ).strip()
+        if _word_count(joined) >= max(
+            80,
+            _word_count(chapter_text) * 0.72,
+        ):
             chapter_text = joined
 
-    if _word_count(chapter_text) < max(120, target_words - 25):
-        seed = chapter_text or " ".join(
+    # No atmospheric filler. A shorter but coherent act is preferred over
+    # repetitive generic description.
+    if _word_count(chapter_text) < 95:
+        seed = " ".join(
             str(scene.get("narration_text", "")).strip()
             for scene in scenes
         ).strip()
-        chapter_text = _local_expand_chapter(
-            seed,
-            topic,
-            chapter_index,
-            target_words,
+        chapter_text = seed or (
+            f"{topic} başlığındaki bu aşamada tarafların hedefleri, "
+            "kararları ve bu kararların doğrudan sonuçları belirleyici oldu. "
+            "Gelişmeler birbirinden bağımsız değildi; her hamle bir sonraki "
+            "kararı zorladı ve dengeleri değiştirdi."
         )
-        model_name = (
-            f"{model_name} + deterministic-local-expansion"
-        )
+        model_name = f"{model_name} + compact-local-recovery"
 
-    scene_texts = _split_narration_into_scenes(chapter_text, 3)
-    while len(scene_texts) < 3:
+    scene_texts = _split_narration_into_scenes(
+        chapter_text,
+        scene_count,
+    )
+    while len(scene_texts) < scene_count:
         scene_texts.append("")
 
-    return chapter_text, scene_texts[:3], model_name
+    return chapter_text, scene_texts[:scene_count], model_name
 
 
 def _force_long_form_package(
@@ -865,8 +897,9 @@ def _force_long_form_package(
         )
         scene["chapter_index"] = chapter_index
         scene["chapter_title"] = CHAPTER_BEATS[chapter_index - 1][0]
-        scene["beat_type"] = CHAPTER_BEATS[chapter_index - 1][1][
-            len(chapter_groups[chapter_index - 1]) % 3
+        chapter_beats = CHAPTER_BEATS[chapter_index - 1][1]
+        scene["beat_type"] = chapter_beats[
+            len(chapter_groups[chapter_index - 1]) % len(chapter_beats)
         ]
         chapter_groups[chapter_index - 1].append(scene)
 
@@ -891,6 +924,17 @@ def _force_long_form_package(
         )
         chapter_models.append(model)
         chapter_texts.append(chapter_text)
+        previous_sentences = [
+            item.strip()
+            for item in re.split(
+                r"(?<=[.!?])\s+",
+                chapter_text,
+            )
+            if item.strip()
+        ]
+        payload["_previous_chapter_tail"] = " ".join(
+            previous_sentences[-2:]
+        )
 
         for scene, scene_text in zip(scenes, scene_texts):
             scene["narration_text"] = scene_text
@@ -933,6 +977,7 @@ def _force_long_form_package(
             )
         chapter_models.append("final-local-length-guard")
 
+    payload.pop("_previous_chapter_tail", None)
     _normalize_package(payload, scene_count)
     return payload, chapter_models
 
@@ -944,12 +989,12 @@ def build_video_package(
     scene_count: int,
 ) -> tuple[dict[str, Any], str]:
     target_words = max(
-        620,
-        min(760, round(target_seconds * 2.25)),
+        500,
+        min(560, round(target_seconds * 1.82)),
     )
     minimum_words = max(
-        540,
-        round(target_words * 0.84),
+        430,
+        round(target_words * 0.82),
     )
 
     prompt = f"""
@@ -1018,9 +1063,12 @@ JSON:
 }}
 
 KURALLAR:
-- Dört bölüm ve bölüm başına üç sahne kullan.
-- Sahne sırası: hook, orientation, setting, routine, craft, community,
-  evidence, tension, turning_point, aftermath, legacy, reflection.
+- Üç perde ve perde başına dört sahne kullan.
+- Sahne sırası: hook, context, goal, obstacle, first_move, counter_move,
+  escalation, breakthrough, climax, immediate_result, human_cost, legacy.
+- Anlatımın en az yüzde 65'i olay, karar, neden ve sonuç içersin.
+- Betimleme en fazla yüzde 15 olsun.
+- Görsel promptları ayrıntılı olabilir; narration_text görsel tarif etmesin.
 - Görseller konu, dönem ve coğrafyayla doğrudan ilişkili olsun.
 - Yanlış medeniyet, modern nesne, fantastik mimari, yazı, logo ve kolaj olmasın.
 - Aynı film paleti bütün sahnelerde korunsun.
@@ -1151,6 +1199,14 @@ KURALLAR:
     )
 
     # Remaining non-fatal warnings are logged, never raised here.
+    payload, continuity_model = narrative_continuity_pass(
+        client,
+        topic,
+        payload,
+        scene_count,
+    )
+    model_history.append(continuity_model)
+
     warnings = _package_issues(
         payload,
         scene_count,
@@ -1164,6 +1220,119 @@ KURALLAR:
 
     _normalize_package(payload, scene_count)
     return payload, " -> ".join(model_history)
+
+
+def _atmosphere_sentence_count(narration: str) -> int:
+    markers = (
+        "gece",
+        "sessiz",
+        "taş duvar",
+        "ay ış",
+        "karanlık",
+        "rüzgâr",
+        "meşale",
+    )
+    sentences = [
+        item.strip().lower()
+        for item in re.split(
+            r"(?<=[.!?])\s+",
+            narration,
+        )
+        if item.strip()
+    ]
+    return sum(
+        1
+        for sentence in sentences
+        if sum(marker in sentence for marker in markers) >= 2
+    )
+
+
+def narrative_continuity_pass(
+    client: genai.Client,
+    topic: str,
+    payload: dict[str, Any],
+    scene_count: int,
+) -> tuple[dict[str, Any], str]:
+    source_narration = re.sub(
+        r"\s+",
+        " ",
+        str(payload.get("narration", "")),
+    ).strip()
+
+    prompt = f"""
+Yalnızca geçerli JSON üret:
+{{
+  "narration": "Tek parça, başlıksız Türkçe anlatım"
+}}
+
+KONU:
+{topic}
+
+MEVCUT METİN:
+{source_narration}
+
+GÖREV:
+Metni tek bir belgesel hikâyesi gibi yeniden kurgula.
+
+KURALLAR:
+- 480 ile 590 kelime arasında kal.
+- Bilgi ve olay sırasını koru; yeni kesin bilgi uydurma.
+- Üç perde net hissedilsin: gerilim, çatışma, sonuç.
+- Her paragraf bir neden, karar, eylem veya sonuç eklesin.
+- Betimleme toplam metnin yüzde 15'ini geçmesin.
+- İlk 25 kelimede ana soruyu veya çatışmayı kur.
+- Yeni bölüm başlatan tekrar girişlerini kaldır.
+- Aynı olayı veya fikri tekrar etme.
+- "gece", "sessizlik", "taş duvar", "ay ışığı" gibi atmosfer
+  kalıplarını yalnızca gerçekten gerekli olduğunda kullan.
+- Son bölüm özet listesi gibi değil, olayın etkisini anlatarak bitsin.
+- Başlık, madde işareti, bölüm adı ve kamera tarifi kullanma.
+"""
+
+    try:
+        result, model = generate_json(
+            client,
+            prompt,
+            max_tokens=5600,
+        )
+        candidate = re.sub(
+            r"\s+",
+            " ",
+            str(result.get("narration", "")),
+        ).strip()
+        words = _word_count(candidate)
+        if not 430 <= words <= 650:
+            raise ValueError(
+                f"Süreklilik metni uzunluğu uygun değil: {words}"
+            )
+        if _atmosphere_sentence_count(candidate) > 5:
+            raise ValueError(
+                "Süreklilik metni hâlâ fazla betimleyici."
+            )
+
+        payload["narration"] = candidate
+        scene_texts = _split_narration_into_scenes(
+            candidate,
+            scene_count,
+        )
+        for scene, scene_text in zip(
+            payload["scenes"],
+            scene_texts,
+        ):
+            scene["narration_text"] = scene_text
+            scene["narration_idea"] = textwrap.shorten(
+                scene_text,
+                width=170,
+                placeholder="…",
+            )
+        return payload, model
+    except Exception as exc:
+        print(
+            "Süreklilik editörü mevcut güçlü metni korudu: "
+            f"{exc}"
+        )
+        return payload, "continuity-pass-skipped"
+
 
 
 def story_director_pass(
@@ -2879,7 +3048,7 @@ def mix_narration_and_ambient(
             "-i", str(narration),
             "-i", str(ambient),
             "-filter_complex",
-            "[1:a]volume=0.34[amb];"
+            "[1:a]volume=0.18[amb];"
             "[amb][0:a]sidechaincompress=threshold=0.020:ratio=8:attack=25:release=360[ducked];"
             "[0:a][ducked]amix=inputs=2:weights='1 1':normalize=0,"
             "alimiter=limit=0.95,loudnorm=I=-17:TP=-2:LRA=7[aout]",
@@ -3137,13 +3306,20 @@ def render_intro_sequence(
     exit_frame: Path,
     target: Path,
 ) -> None:
-    durations = [3.0, 3.2, 4.2, 3.7]
-    transition = INTRO_TRANSITION_SECONDS
+    # 8-second editorial cold open. The brand is present but never stalls
+    # the story with a long ident.
+    durations = [1.5, 1.7, 3.7, 2.3]
+    transition = 0.36
 
     command = ["ffmpeg", "-y"]
     for duration, frame in zip(
         durations,
-        [clean_frame, brand_frame, title_frame, exit_frame],
+        [
+            clean_frame,
+            brand_frame,
+            title_frame,
+            exit_frame,
+        ],
     ):
         command += [
             "-loop", "1",
@@ -3154,19 +3330,22 @@ def render_intro_sequence(
 
     filters = (
         "[0:v]scale=1920:1080,setsar=1,"
-        "fade=t=in:st=0:d=0.9,format=yuv420p[v0];"
-        "[1:v]scale=1920:1080,setsar=1,format=yuv420p[v1];"
+        "fade=t=in:st=0:d=0.45,"
+        "format=yuv420p[v0];"
+        "[1:v]scale=1920:1080,setsar=1,"
+        "format=yuv420p[v1];"
         "[2:v]scale=1920:1080,setsar=1,"
-        "drawbox=x='-420+260*t':y=0:w=220:h=1080:"
-        "color=white@0.035:t=fill,format=yuv420p[v2];"
-        "[3:v]scale=1920:1080,setsar=1,format=yuv420p[v3];"
-        f"[v0][v1]xfade=transition=fadeblack:duration={transition:.3f}:"
-        "offset=2.300[x1];"
-        f"[x1][v2]xfade=transition=fade:duration={transition:.3f}:"
-        "offset=4.800[x2];"
-        f"[x2][v3]xfade=transition=fade:duration={transition:.3f}:"
-        "offset=8.300,"
-        "fade=t=out:st=11.2:d=0.8,format=yuv420p[v]"
+        "format=yuv420p[v2];"
+        "[3:v]scale=1920:1080,setsar=1,"
+        "format=yuv420p[v3];"
+        f"[v0][v1]xfade=transition=fade:duration={transition}:"
+        "offset=1.140[x1];"
+        f"[x1][v2]xfade=transition=fade:duration={transition}:"
+        "offset=2.480[x2];"
+        f"[x2][v3]xfade=transition=fade:duration={transition}:"
+        "offset=5.820,"
+        "fade=t=out:st=7.55:d=0.45,"
+        "format=yuv420p[v]"
     )
 
     command += [
@@ -3326,35 +3505,46 @@ def _chapter_label_frame(
     chapter_title: str,
 ) -> Image.Image:
     canvas = image.convert("RGBA")
-    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    overlay = Image.new(
+        "RGBA",
+        canvas.size,
+        (0, 0, 0, 0),
+    )
     draw = ImageDraw.Draw(overlay)
     draw.rounded_rectangle(
-        (92, 86, 690, 190),
-        radius=18,
-        fill=(6, 9, 14, 172),
+        (84, 82, 720, 184),
+        radius=14,
+        fill=(5, 8, 12, 158),
     )
     draw.rectangle(
-        (118, 112, 170, 119),
+        (112, 108, 188, 114),
         fill=(208, 176, 126, 255),
     )
     draw.text(
-        (118, 132),
-        f"BÖLÜM {chapter_index}",
-        font=video_font(19, bold=True),
-        fill=(205, 184, 150),
+        (112, 130),
+        "UYKU VE TARİH",
+        font=video_font(17, bold=True),
+        fill=(202, 182, 150),
     )
     title = textwrap.shorten(
-        re.sub(r"\\s+", " ", chapter_title).strip().upper(),
-        width=34,
+        re.sub(
+            r"\s+",
+            " ",
+            chapter_title,
+        ).strip().upper(),
+        width=38,
         placeholder="…",
     )
     draw.text(
-        (244, 126),
+        (292, 122),
         title,
         font=video_font(27, bold=True),
         fill=(243, 237, 225),
     )
-    return Image.alpha_composite(canvas, overlay).convert("RGB")
+    return Image.alpha_composite(
+        canvas,
+        overlay,
+    ).convert("RGB")
 
 
 def _scene_shot_frames(
@@ -3421,20 +3611,22 @@ def _render_scene_editorial_clip(
     target: Path,
 ) -> None:
     seconds = max(9.0, float(seconds))
-    transition = 0.46
+
+    # Professional documentary rhythm: mostly clean cuts.
+    # No blur transition, slide, zoom or fake camera shake.
     visible_parts = [
-        seconds * 0.44,
-        seconds * 0.33,
+        seconds * 0.48,
+        seconds * 0.31,
     ]
-    visible_parts.append(seconds - sum(visible_parts))
-    input_durations = [
-        visible_parts[0] + transition,
-        visible_parts[1] + transition,
-        visible_parts[2],
-    ]
+    visible_parts.append(
+        seconds - sum(visible_parts)
+    )
 
     command = ["ffmpeg", "-y"]
-    for frame, duration in zip(shot_frames, input_durations):
+    for frame, duration in zip(
+        shot_frames,
+        visible_parts,
+    ):
         command += [
             "-loop", "1",
             "-framerate", str(FPS),
@@ -3442,30 +3634,48 @@ def _render_scene_editorial_clip(
             "-i", str(frame),
         ]
 
-    fade_in = "fade=t=in:st=0:d=0.45," if chapter_start else ""
-    fade_out = (
-        f"fade=t=out:st={max(0.0, seconds - 0.55):.3f}:d=0.55,"
-        if chapter_end else ""
-    )
-    filters = (
-        "[0:v]scale=1920:1080,setsar=1,"
-        "eq=saturation=0.94:contrast=1.015:brightness=-0.008,"
-        "vignette=PI/9.2,format=yuv420p[v0];"
-        "[1:v]scale=1920:1080,setsar=1,"
-        "eq=saturation=0.94:contrast=1.015:brightness=-0.008,"
-        "vignette=PI/9.2,format=yuv420p[v1];"
-        "[2:v]scale=1920:1080,setsar=1,"
-        "eq=saturation=0.94:contrast=1.02:brightness=-0.010,"
-        "vignette=PI/9.2,format=yuv420p[v2];"
-        f"[v0][v1]xfade=transition=fade:duration={transition:.3f}:"
-        f"offset={visible_parts[0]:.3f}[x1];"
-        f"[x1][v2]xfade=transition=hblur:duration={transition:.3f}:"
-        f"offset={visible_parts[0] + visible_parts[1]:.3f},"
-        f"{fade_in}{fade_out}format=yuv420p[v]"
+    filters = []
+    labels = []
+    for index in range(3):
+        label = f"v{index}"
+        filters.append(
+            f"[{index}:v]"
+            "scale=1920:1080,setsar=1,"
+            "eq=saturation=0.92:contrast=1.02:brightness=-0.008,"
+            "vignette=PI/10.2,"
+            f"format=yuv420p[{label}]"
+        )
+        labels.append(f"[{label}]")
+
+    filters.append(
+        "".join(labels)
+        + "concat=n=3:v=1:a=0[cut]"
     )
 
+    final_filters = []
+    if chapter_start:
+        final_filters.append(
+            "fade=t=in:st=0:d=0.42"
+        )
+    if chapter_end:
+        final_filters.append(
+            f"fade=t=out:st={max(0.0, seconds - 0.46):.3f}:d=0.46"
+        )
+
+    if final_filters:
+        filters.append(
+            "[cut]"
+            + ",".join(final_filters)
+            + ",format=yuv420p[v]"
+        )
+    else:
+        filters.append(
+            "[cut]format=yuv420p[v]"
+        )
+
     command += [
-        "-filter_complex", filters,
+        "-filter_complex",
+        ";".join(filters),
         "-map", "[v]",
         "-t", f"{seconds:.3f}",
         "-an",
@@ -3597,8 +3807,8 @@ def render_video(
             "continuity_bridge": scene.get("continuity_bridge", ""),
             "start": round(cursor, 3),
             "duration": round(duration, 3),
-            "shots": ["wide", "medium", "detail"],
-            "internal_transitions": ["fade", "hblur"],
+            "shots": ["establishing", "action-detail", "consequence"],
+            "internal_transitions": ["cut", "cut"],
             "narration_text": scene.get("narration_text", ""),
         })
         cursor += duration
@@ -3710,7 +3920,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V7-2.txt").write_text(
+    (OUTPUT / "HATA-V8.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -3753,9 +3963,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V7.2 — VERIFIED AUDIO PIPELINE ACTIVE")
+    print("UYKU VE TARİH V8 — NARRATIVE CUT ACTIVE")
     print("Konu:", topic)
-    print("VERIFIED PIPELINE: story → TTS → images → render")
+    print("NARRATIVE CUT: one story → one voice → editorial timeline")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -3786,37 +3996,37 @@ def main() -> None:
     (OUTPUT / "senaryo.txt").write_text(payload["narration"], encoding="utf-8")
     (OUTPUT / "baslik.txt").write_text(str(payload["video_title"]), encoding="utf-8")
 
-    print("AŞAMA 1/4: Seslendirme görsellerden önce hazırlanıyor.")
+    print("AŞAMA 1/4: Tek anlatıcıyla tam metin seslendiriliyor.")
     narration_audio = OUTPUT / "seslendirme.wav"
-    try:
-        visible_durations, tts_model = synthesize_scene_narration(
-            client,
-            payload["scenes"],
-            narration_audio,
-            story_seconds,
-        )
-    except Exception as exc:
-        print("Sahne bazlı TTS başarısız; tek parça yedek:", exc)
-        raw_audio = WORK / "narration-raw.wav"
-        tts_model = synthesize_narration(client, payload["narration"], raw_audio)
-        normalized_fallback = WORK / "narration-fallback-normalized.wav"
-        normalize_audio(raw_audio, normalized_fallback)
-        fit_audio_duration(
-            normalized_fallback,
-            narration_audio,
-            story_seconds,
-        )
-        visible_durations = _allocate_exact_duration(
-            story_seconds,
-            [
-                max(
-                    1,
-                    _word_count(str(scene.get("narration_text", ""))),
-                )
-                for scene in payload["scenes"]
-            ],
-            minimum=14.0,
-        )
+    raw_audio = WORK / "narration-single-voice-raw.wav"
+    normalized_audio = WORK / "narration-single-voice-normalized.wav"
+
+    # The complete script is synthesized in one request and by one engine.
+    # A model change can only happen before generation begins, never mid-video.
+    tts_model = synthesize_narration(
+        client,
+        payload["narration"],
+        raw_audio,
+    )
+    normalize_audio(raw_audio, normalized_audio)
+    fit_audio_duration(
+        normalized_audio,
+        narration_audio,
+        story_seconds,
+    )
+    visible_durations = _allocate_exact_duration(
+        story_seconds,
+        [
+            max(
+                1,
+                _word_count(
+                    str(scene.get("narration_text", ""))
+                ),
+            )
+            for scene in payload["scenes"]
+        ],
+        minimum=12.0,
+    )
 
     print("AŞAMA 2/4: Ses hazır. Görseller üretiliyor.")
     raw_dir = WORK / "raw-images"
@@ -3877,7 +4087,7 @@ def main() -> None:
     )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v7-2-5-dakika.mp4"
+    video = OUTPUT / "uyku-tarih-v8-narrative-cut.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -3937,7 +4147,13 @@ def main() -> None:
             "quota_safe_tts_requests": True,
             "edge_tts_fallback": True,
             "concat_manifest_newline_validation": True,
-            "chapter_tts_calls": CHAPTER_COUNT,
+            "chapter_tts_calls": 0,
+            "single_full_script_tts_call": True,
+            "voice_switching_inside_video": False,
+            "description_ratio_cap_percent": 15,
+            "cause_effect_story_structure": True,
+            "continuity_editor": True,
+            "internal_blur_transitions": False,
             "editorial_shots_per_scene": 3,
             "professional_intro_seconds": INTRO_VISIBLE_SECONDS,
             "hard_final_duration_guard": True,
@@ -3959,7 +4175,7 @@ def main() -> None:
         "zero_jitter_mode": True,
         "camera_motion_inside_scenes": False,
         "transition_duration_seconds": 0.8,
-        "transition_style": "story-aware cuts, dissolves and act-break dips",
+        "transition_style": "clean cuts with restrained act-break fades",
     }
     (OUTPUT / "uretim-raporu.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -3968,8 +4184,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V7.2 Verified Audio Pipeline yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce uyku-tarih-v7-2-5-dakika.mp4 dosyasını izle.\n"
+            "V8 Narrative Cut yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce uyku-tarih-v8-narrative-cut.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -3978,7 +4194,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V7.2 VERIFIED AUDIO PIPELINE TAMAMLANDI")
+    print("V8 NARRATIVE CUT TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
