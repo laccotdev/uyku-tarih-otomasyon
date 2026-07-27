@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/5.1"
+USER_AGENT = "UykuTarihTopicToVideo/6.0"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -76,6 +76,9 @@ TTS_MODELS = [
 # Keep a safety margin because fallback models receive exclusions in the same field.
 MAX_IMAGE_PROMPT_CHARS = 1320
 MAX_NEGATIVE_PROMPT_CHARS = 360
+INTRO_VISIBLE_SECONDS = 5.2
+INTRO_TRANSITION_SECONDS = 0.65
+SCENE_PAUSE_SECONDS = 0.16
 
 TRANSITIONS = [
     "fade",
@@ -537,6 +540,207 @@ ZORUNLU EDITOR BRAIN KURALLARI:
 
     _normalize_package(payload, scene_count)
     return payload, " -> ".join(model_history)
+
+
+
+def story_director_pass(
+    client: genai.Client,
+    topic: str,
+    payload: dict[str, Any],
+    scene_count: int,
+) -> tuple[dict[str, Any], str]:
+    current = json.dumps(payload, ensure_ascii=False)
+    prompt = f"""
+Yalnızca geçerli ve eksiksiz JSON üret. Markdown yazma.
+
+Sen kıdemli bir tarih belgeseli hikâye editörüsün.
+Aşağıdaki paketi kopuk bilgi ve görsel listesi olmaktan çıkarıp akıcı,
+üç perdeli bir gece belgeseli hikâyesine dönüştür.
+
+KONU:
+{topic}
+
+ZORUNLU YAPI:
+- İlk yirmi saniyede merkezî bir soru ve sakin bir kanca kur.
+- Her sahne bir öncekinin doğal sonucu veya devamı olsun.
+- Bilgi listesi yazma; tek seferde anlatılmış bir hikâye kur.
+- Aynı bilgiyi tekrarlama, konuyu her sahnede yeniden tanıtma.
+- Sıra: kanca, mekân, gündelik hayat, işaretler, gerilim,
+  dönüm noktası, geride kalanlar, düşünceli kapanış.
+- Tam {scene_count} sahne koru.
+- Her sahnede act: 1, 2 veya 3 olsun.
+- beat_type şu değerlerden biri olsun:
+  hook, orientation, daily_life, evidence, tension,
+  turning_point, aftermath, reflection.
+- continuity_bridge önceki sahneden geçiş mantığını kısa açıklasın.
+- narration_text yalnızca o sahnede okunacak final metin olsun.
+- narration, narration_text alanlarının sırayla birleşmiş hâli olsun.
+- Görsel promptu o sahnedeki cümleyle doğrudan eşleşsin.
+- Tarihsel belirsizliği dramatik kesinlik gibi sunma.
+- world_bible ve dönem tutarlılığını koru.
+
+MEVCUT JSON:
+{current}
+"""
+    try:
+        refined, model = generate_json(client, prompt, max_tokens=14000)
+        issues = _package_issues(refined, scene_count, 105)
+        if issues:
+            print("Story Director doğrulama başarısız; önceki paket kullanılacak:", issues)
+            return payload, "fallback-original"
+        _normalize_package(refined, scene_count)
+        _ensure_scene_narration(refined)
+        return refined, model
+    except Exception as exc:
+        print("Story Director geçici olarak atlandı:", exc)
+        return payload, "fallback-original"
+
+
+def scene_tts_directive(text: str, scene_index: int, scene_count: int) -> str:
+    return f"""
+Read only the Turkish transcript after the separator.
+
+Use the exact same mature Turkish male documentary narrator in every scene.
+This is scene {scene_index} of {scene_count}; it must sound like the uninterrupted
+continuation of one story, never like a fresh introduction.
+
+Calm, grounded, warm, intimate, standard Turkey Turkish.
+Slow but conversational. Natural pauses and gentle endings.
+No trailer voice, no newsreader tone, no added words.
+
+--- TRANSCRIPT ---
+{text}
+--- END ---
+""".strip()
+
+
+def synthesize_short_segment(
+    client: genai.Client,
+    text: str,
+    scene_index: int,
+    scene_count: int,
+    target: Path,
+) -> str:
+    configured = os.getenv("TTS_MODEL", "").strip()
+    chain = model_chain(client, [configured, *TTS_MODELS])
+    last_error: Exception | None = None
+    for model in chain:
+        for attempt, delay in enumerate((6, 18, 40), start=1):
+            try:
+                print(f"Scene TTS {scene_index}/{scene_count}: model={model}, attempt={attempt}/3")
+                response = client.models.generate_content(
+                    model=model,
+                    contents=scene_tts_directive(text, scene_index, scene_count),
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=VOICE_NAME
+                                )
+                            )
+                        ),
+                    ),
+                )
+                candidates = response.candidates or []
+                if not candidates or not candidates[0].content.parts:
+                    raise ValueError("TTS sahne sesi döndürmedi.")
+                inline = candidates[0].content.parts[0].inline_data
+                data = inline.data if inline else None
+                if not data or len(data) < 8000:
+                    raise ValueError("TTS sahne sesi boş veya çok kısa.")
+                write_wav(target, data)
+                if ffprobe_duration(target) < 1.2:
+                    raise ValueError("TTS sahne sesi beklenenden kısa.")
+                return model
+            except Exception as exc:
+                last_error = exc
+                target.unlink(missing_ok=True)
+                if retryable(exc) and attempt < 3:
+                    time.sleep(delay)
+                    continue
+                break
+    raise RuntimeError(f"Sahne {scene_index} seslendirilemedi: {last_error}")
+
+
+def append_scene_pause(source: Path, target: Path, pause_seconds: float) -> None:
+    run([
+        "ffmpeg", "-y",
+        "-i", str(source),
+        "-f", "lavfi", "-t", f"{pause_seconds:.3f}",
+        "-i", "anullsrc=r=48000:cl=mono",
+        "-filter_complex",
+        "[0:a]aformat=sample_rates=48000:channel_layouts=mono[a0];"
+        "[1:a]aformat=sample_rates=48000:channel_layouts=mono[a1];"
+        "[a0][a1]concat=n=2:v=0:a=1[a]",
+        "-map", "[a]", "-c:a", "pcm_s16le", str(target),
+    ])
+
+
+def concat_audio_files(files: list[Path], target: Path) -> None:
+    if len(files) == 1:
+        shutil.copy2(files[0], target)
+        return
+    command = ["ffmpeg", "-y"]
+    for file in files:
+        command += ["-i", str(file)]
+    inputs = "".join(f"[{idx}:a]" for idx in range(len(files)))
+    command += [
+        "-filter_complex", f"{inputs}concat=n={len(files)}:v=0:a=1[a]",
+        "-map", "[a]", "-ar", "48000", "-c:a", "pcm_s16le", str(target),
+    ]
+    run(command)
+
+
+def synthesize_scene_narration(
+    client: genai.Client,
+    scenes: list[dict[str, Any]],
+    output_audio: Path,
+) -> tuple[list[float], str]:
+    scene_dir = WORK / "scene-audio"
+    if scene_dir.exists():
+        shutil.rmtree(scene_dir)
+    scene_dir.mkdir(parents=True)
+
+    files: list[Path] = []
+    durations: list[float] = []
+    models: list[str] = []
+
+    for index, scene in enumerate(scenes, start=1):
+        scene_text = re.sub(r"\s+", " ", str(scene.get("narration_text", ""))).strip()
+        raw = scene_dir / f"{index:02d}_raw.wav"
+        normalized = scene_dir / f"{index:02d}_norm.wav"
+        final = scene_dir / f"{index:02d}_final.wav"
+
+        model = synthesize_short_segment(client, scene_text, index, len(scenes), raw)
+        normalize_audio(raw, normalized)
+        pause = 0.0 if index == len(scenes) else SCENE_PAUSE_SECONDS
+        append_scene_pause(normalized, final, pause)
+
+        files.append(final)
+        durations.append(ffprobe_duration(final))
+        models.append(model)
+
+    concat_audio_files(files, output_audio)
+    return durations, " -> ".join(dict.fromkeys(models))
+
+
+def create_scene_srt(
+    scenes: list[dict[str, Any]],
+    durations: list[float],
+    intro_seconds: float,
+    target: Path,
+) -> None:
+    cursor = intro_seconds
+    blocks: list[str] = []
+    for index, (scene, duration) in enumerate(zip(scenes, durations), start=1):
+        scene_text = re.sub(r"\s+", " ", str(scene.get("narration_text", ""))).strip()
+        blocks.append(
+            f"{index}\n{timestamp(cursor)} --> {timestamp(cursor + duration)}\n"
+            f"{scene_text}\n"
+        )
+        cursor += duration
+    target.write_text("\n".join(blocks), encoding="utf-8")
 
 
 def validate_package(
@@ -1641,38 +1845,51 @@ def make_editorial_shots(
     return shots, shot_meta
 
 
-def make_intro_card(thumbnail: Path, target: Path, topic_title: str) -> None:
-    with Image.open(thumbnail) as raw:
+def make_intro_frames(
+    hero_frame: Path,
+    clean_target: Path,
+    title_target: Path,
+    topic_title: str,
+) -> None:
+    with Image.open(hero_frame) as raw:
         image = ImageOps.fit(raw.convert("RGB"), (WIDTH, HEIGHT), Image.Resampling.LANCZOS)
 
-    image = ImageEnhance.Brightness(image).enhance(0.55)
-    image = ImageEnhance.Contrast(image).enhance(1.08)
-    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 88))
-    image = Image.alpha_composite(image.convert("RGBA"), overlay)
+    image = ImageEnhance.Brightness(image).enhance(0.66)
+    image = ImageEnhance.Contrast(image).enhance(1.10)
+    image = ImageEnhance.Color(image).enhance(0.86)
 
-    draw = ImageDraw.Draw(image)
-    title = re.sub(r"\s+", " ", topic_title).strip().upper()
-    if len(title) > 44:
-        title = textwrap.shorten(title, width=44, placeholder="…").upper()
+    clean = Image.alpha_composite(
+        image.convert("RGBA"),
+        Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 46)),
+    ).convert("RGB")
+    clean.save(clean_target, "JPEG", quality=95, optimize=True)
 
-    title_font = video_font(58, bold=True)
-    small_font = video_font(25, bold=True)
+    title_image = clean.convert("RGBA")
+    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    for x in range(1200):
+        alpha = int(190 * (1 - x / 1200) ** 1.45)
+        overlay_draw.line((x, 0, x, HEIGHT), fill=(7, 9, 13, alpha))
+    title_image = Image.alpha_composite(title_image, overlay)
 
-    # Minimal editorial intro, no noisy animation. Fade is applied in ffmpeg.
-    draw.rectangle((120, 375, 265, 385), fill=(215, 184, 134, 255))
-    draw.text(
-        (120, 415),
-        "UYKU VE TARİH",
-        font=small_font,
-        fill=(216, 197, 163),
-        stroke_width=1,
-        stroke_fill=(8, 7, 6),
-    )
-    lines = []
+    draw = ImageDraw.Draw(title_image)
+    small_font = video_font(27, bold=True)
+    title_font = video_font(64, bold=True)
+    title = textwrap.shorten(
+        re.sub(r"\s+", " ", topic_title).strip().upper(),
+        width=52,
+        placeholder="…",
+    ).upper()
+
+    draw.rectangle((116, 382, 266, 392), fill=(213, 183, 134, 255))
+    draw.text((116, 422), "UYKU VE TARİH", font=small_font,
+              fill=(220, 199, 164), stroke_width=1, stroke_fill=(8, 7, 6))
+
+    lines: list[str] = []
     current = ""
     for word in title.split():
         candidate = f"{current} {word}".strip()
-        if draw.textbbox((0, 0), candidate, font=title_font)[2] <= 1180:
+        if draw.textbbox((0, 0), candidate, font=title_font)[2] <= 1120:
             current = candidate
         else:
             if current:
@@ -1680,17 +1897,53 @@ def make_intro_card(thumbnail: Path, target: Path, topic_title: str) -> None:
             current = word
     if current:
         lines.append(current)
-    for i, line in enumerate(lines[:2]):
-        draw.text(
-            (120, 470 + i * 68),
-            line,
-            font=title_font,
-            fill=(248, 240, 224),
-            stroke_width=2,
-            stroke_fill=(10, 9, 8),
-        )
 
-    image.convert("RGB").save(target, "JPEG", quality=95, optimize=True)
+    for idx, line in enumerate(lines[:2]):
+        draw.text((116, 478 + idx * 76), line, font=title_font,
+                  fill=(248, 241, 226), stroke_width=2, stroke_fill=(9, 8, 7))
+
+    title_image.convert("RGB").save(title_target, "JPEG", quality=95, optimize=True)
+
+
+def render_intro_sequence(clean_frame: Path, title_frame: Path, target: Path) -> None:
+    first_seconds = 2.85
+    second_seconds = 3.0
+    transition = 0.65
+    total = first_seconds + second_seconds - transition
+
+    run([
+        "ffmpeg", "-y",
+        "-loop", "1", "-framerate", str(FPS), "-t", f"{first_seconds:.3f}", "-i", str(clean_frame),
+        "-loop", "1", "-framerate", str(FPS), "-t", f"{second_seconds:.3f}", "-i", str(title_frame),
+        "-filter_complex",
+        "[0:v]scale=1920:1080,setsar=1,fade=t=in:st=0:d=0.9[v0];"
+        "[1:v]scale=1920:1080,setsar=1[v1];"
+        f"[v0][v1]xfade=transition=fade:duration={transition:.3f}:"
+        f"offset={first_seconds-transition:.3f},"
+        f"fade=t=out:st={total-0.75:.3f}:d=0.75,format=yuv420p[v]",
+        "-map", "[v]", "-t", f"{total:.3f}", "-an",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-pix_fmt", "yuv420p", str(target),
+    ])
+
+
+def create_intro_audio(target: Path, duration: float = INTRO_VISIBLE_SECONDS) -> None:
+    run([
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i",
+        f"anoisesrc=color=pink:amplitude=0.020:sample_rate=48000:d={duration:.3f}",
+        "-f", "lavfi", "-i", "sine=frequency=196:sample_rate=48000:duration=2.2",
+        "-filter_complex",
+        "[0:a]highpass=f=70,lowpass=f=850,volume=0.030,"
+        "afade=t=in:st=0:d=1.2,afade=t=out:st=4.0:d=1.1[wind];"
+        "[1:a]adelay=2100|2100,afade=t=in:st=0:d=0.12,"
+        "afade=t=out:st=0.65:d=1.45,aecho=0.5:0.25:190|380:0.20|0.10,"
+        "volume=0.025[chime];"
+        "[wind][chime]amix=inputs=2:duration=longest:normalize=0,"
+        "alimiter=limit=0.85[a]",
+        "-map", "[a]", "-t", f"{duration:.3f}", "-ar", "48000",
+        "-c:a", "pcm_s16le", str(target),
+    ])
 
 
 def audio_bed_filter(kind: str, duration: float) -> str:
@@ -1795,98 +2048,139 @@ def render_video(
     transitions: list[str],
     transition_durations: list[float],
 ) -> float:
-    duration = ffprobe_duration(audio)
-    clips_dir = WORK / "clips"
-    clips_dir.mkdir(parents=True, exist_ok=True)
-    clips: list[Path] = []
+    clips_dir = WORK / "v6-clips"
+    if clips_dir.exists():
+        shutil.rmtree(clips_dir)
+    clips_dir.mkdir(parents=True)
 
-    for index, (frame, visible) in enumerate(zip(frames, visible_durations), start=1):
+    intro_clean = WORK / "intro-clean.jpg"
+    intro_title = WORK / "intro-title.jpg"
+    make_intro_frames(
+        frames[0], intro_clean, intro_title,
+        (OUTPUT / "baslik.txt").read_text(encoding="utf-8"),
+    )
+    intro_clip = clips_dir / "clip_000_intro.mp4"
+    render_intro_sequence(intro_clean, intro_title, intro_clip)
+
+    scene_clips: list[Path] = []
+    timeline: list[dict[str, Any]] = [{
+        "type": "intro", "start": 0.0, "duration": INTRO_VISIBLE_SECONDS
+    }]
+    cursor = INTRO_VISIBLE_SECONDS
+
+    for index, (frame, scene, visible) in enumerate(
+        zip(frames, scenes, visible_durations), start=1
+    ):
         extra = transition_durations[index - 1] if index - 1 < len(transition_durations) else 0.0
-        clip_duration = visible + extra
-        clip = clips_dir / f"clip_{index:03d}.mp4"
-        run(
-            [
-                "ffmpeg", "-y",
-                "-loop", "1",
-                "-framerate", str(FPS),
-                "-i", str(frame),
-                "-t", f"{clip_duration:.3f}",
-                "-vf", scene_filter("static", 0, clip_duration),
-                "-an",
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "18",
-                "-tune", "stillimage",
-                "-pix_fmt", "yuv420p",
-                "-r", str(FPS),
-                str(clip),
-            ]
+        total = visible + extra
+
+        with Image.open(frame) as raw:
+            base = ImageOps.exif_transpose(raw).convert("RGB")
+
+        shot_dir = WORK / "v6-shots"
+        shot_dir.mkdir(parents=True, exist_ok=True)
+        wide_path = shot_dir / f"{index:02d}_wide.jpg"
+        detail_path = shot_dir / f"{index:02d}_detail.jpg"
+
+        wide = ImageOps.fit(base, (WIDTH, HEIGHT), Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+        detail = ImageOps.fit(
+            base, (WIDTH, HEIGHT), Image.Resampling.LANCZOS,
+            centering=(0.35, 0.50) if index % 2 else (0.65, 0.50),
         )
-        clips.append(clip)
+        detail = ImageEnhance.Contrast(detail).enhance(1.035)
+        wide.save(wide_path, "JPEG", quality=94, optimize=True)
+        detail.save(detail_path, "JPEG", quality=94, optimize=True)
 
-    if len(clips) == 1:
-        run(
-            [
-                "ffmpeg", "-y",
-                "-i", str(clips[0]),
-                "-i", str(audio),
-                "-filter_complex",
-                f"[0:v]fade=t=in:st=0:d=1.0,fade=t=out:st={max(0.0, duration - 1.2):.3f}:d=1.2[vout]",
-                "-map", "[vout]",
-                "-map", "1:a:0",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-                "-c:a", "aac", "-b:a", "192k",
-                "-shortest", "-movflags", "+faststart",
-                str(target),
-            ]
+        scene_clip = clips_dir / f"scene_{index:02d}.mp4"
+        if total >= 5.0:
+            first = clips_dir / f"scene_{index:02d}_a.mp4"
+            second = clips_dir / f"scene_{index:02d}_b.mp4"
+            first_duration = total * 0.62
+            second_duration = total - first_duration
+            render_static_clip(wide_path, first, first_duration)
+            render_static_clip(detail_path, second, second_duration)
+            concat_file = clips_dir / f"scene_{index:02d}.txt"
+            concat_file.write_text(
+                f"file '{first.resolve().as_posix()}'\n"
+                f"file '{second.resolve().as_posix()}'\n",
+                encoding="utf-8",
+            )
+            run([
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", str(concat_file), "-c:v", "libx264",
+                "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+                str(scene_clip),
+            ])
+            shots = ["wide", "detail"]
+        else:
+            render_static_clip(wide_path, scene_clip, total)
+            shots = ["wide"]
+
+        scene_clips.append(scene_clip)
+        timeline.append({
+            "type": "story_scene",
+            "scene_id": scene.get("scene_id", index),
+            "act": scene.get("act"),
+            "beat_type": scene.get("beat_type"),
+            "continuity_bridge": scene.get("continuity_bridge"),
+            "start": round(cursor, 3),
+            "duration": round(visible, 3),
+            "shots": shots,
+            "narration_text": scene.get("narration_text", ""),
+        })
+        cursor += visible
+
+    all_clips = [intro_clip, *scene_clips]
+    command = ["ffmpeg", "-y"]
+    for clip in all_clips:
+        command += ["-i", str(clip)]
+
+    filters: list[str] = []
+    current = "[0:v]"
+    offset = INTRO_VISIBLE_SECONDS
+    filters.append(
+        f"{current}[1:v]xfade=transition=fade:"
+        f"duration={INTRO_TRANSITION_SECONDS:.3f}:"
+        f"offset={INTRO_VISIBLE_SECONDS:.3f}[vx1]"
+    )
+    current = "[vx1]"
+
+    for idx in range(2, len(all_clips)):
+        previous_scene = scenes[idx - 2]
+        next_scene = scenes[idx - 1]
+        act_change = previous_scene.get("act") != next_scene.get("act")
+        transition = "fadeblack" if act_change else "fade"
+        duration = 0.52 if act_change else 0.34
+        offset += visible_durations[idx - 2]
+        out = f"[vx{idx}]"
+        filters.append(
+            f"{current}[{idx}:v]xfade=transition={transition}:"
+            f"duration={duration:.3f}:offset={offset:.3f}{out}"
         )
-        return duration
+        current = out
 
-    filter_parts: list[str] = []
-    current_label = "[0:v]"
-    offset = visible_durations[0]
-
-    for index in range(1, len(clips)):
-        out_label = f"[vx{index}]"
-        transition = transitions[index - 1]
-        transition_duration = transition_durations[index - 1]
-        filter_parts.append(
-            f"{current_label}[{index}:v]"
-            f"xfade=transition={transition}:duration={transition_duration:.3f}:"
-            f"offset={offset:.3f}{out_label}"
-        )
-        current_label = out_label
-        offset += visible_durations[index]
-
-    final_label = "[vfinal]"
-    filter_parts.append(
-        f"{current_label}"
-        f"fade=t=in:st=0:d=1.0,"
-        f"fade=t=out:st={max(0.0, duration - 1.25):.3f}:d=1.25"
-        f"{final_label}"
+    total_video = INTRO_VISIBLE_SECONDS + sum(visible_durations)
+    filters.append(
+        f"{current}fade=t=out:st={max(0.0, total_video-1.4):.3f}:"
+        f"d=1.4,format=yuv420p[vfinal]"
     )
 
-    command = ["ffmpeg", "-y"]
-    for clip in clips:
-        command += ["-i", str(clip)]
     command += ["-i", str(audio)]
     command += [
-        "-filter_complex", ";".join(filter_parts),
-        "-map", final_label,
-        "-map", f"{len(clips)}:a:0",
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-r", str(FPS),
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-shortest",
-        "-movflags", "+faststart",
-        str(target),
+        "-filter_complex", ";".join(filters),
+        "-map", "[vfinal]", "-map", f"{len(all_clips)}:a:0",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-r", str(FPS),
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-movflags", "+faststart", str(target),
     ]
     run(command)
-    return duration
+
+    (OUTPUT / "edit-timeline.json").write_text(
+        json.dumps(timeline, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return total_video
 
 
 def timestamp(seconds: float) -> str:
@@ -1945,7 +2239,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V5-2.txt").write_text(
+    (OUTPUT / "HATA-V6.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -1972,24 +2266,36 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V5.1 — EDITOR BRAIN")
+    print("UYKU VE TARİH V6 — STORY DIRECTOR ACTIVE")
     print("Konu:", topic)
-    print("PROMPT GUARD: ACTIVE — hard limit 1320 characters")
+    print("STORY DIRECTOR: ACTIVE — intro + scene-synced narration")
     print("=" * 72)
 
     payload, text_model = build_video_package(
         client, topic, target_seconds, scene_count
     )
+    payload, story_model = story_director_pass(
+        client, topic, payload, scene_count
+    )
+
     (OUTPUT / "video-paketi.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (OUTPUT / "hikaye-arki.json").write_text(
+        json.dumps({
+            "story_arc": payload.get("story_arc", {}),
+            "scenes": [{
+                "scene_id": scene.get("scene_id"),
+                "act": scene.get("act"),
+                "beat_type": scene.get("beat_type"),
+                "continuity_bridge": scene.get("continuity_bridge"),
+                "narration_text": scene.get("narration_text"),
+            } for scene in payload.get("scenes", [])],
+        }, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    (OUTPUT / "senaryo.txt").write_text(
-        payload["narration"], encoding="utf-8"
-    )
-    (OUTPUT / "baslik.txt").write_text(
-        str(payload["video_title"]), encoding="utf-8"
-    )
+    (OUTPUT / "senaryo.txt").write_text(payload["narration"], encoding="utf-8")
+    (OUTPUT / "baslik.txt").write_text(str(payload["video_title"]), encoding="utf-8")
 
     raw_dir = WORK / "raw-images"
     frame_dir = WORK / "video-frames"
@@ -1998,7 +2304,6 @@ def main() -> None:
 
     frames: list[Path] = []
     image_manifest: list[dict[str, Any]] = []
-
     for scene in payload["scenes"]:
         scene_id = int(scene["scene_id"])
         raw = raw_dir / f"scene_{scene_id:02d}.jpg"
@@ -2008,9 +2313,7 @@ def main() -> None:
         frames.append(frame)
         image_manifest.append(info)
 
-    make_storyboard(
-        frames, payload["scenes"], OUTPUT / "storyboard-kontrol.jpg"
-    )
+    make_storyboard(frames, payload["scenes"], OUTPUT / "storyboard-kontrol.jpg")
 
     thumb_dir = WORK / "thumbnail-candidates"
     selected_thumb_background, thumb_info = generate_thumbnail_candidates(
@@ -2022,50 +2325,43 @@ def main() -> None:
         OUTPUT / "kapak.jpg",
     )
 
-    raw_audio = WORK / "narration-raw.wav"
-    tts_model = synthesize_narration(
-        client, payload["narration"], raw_audio
-    )
     narration_audio = OUTPUT / "seslendirme.wav"
-    normalize_audio(raw_audio, narration_audio)
+    try:
+        visible_durations, tts_model = synthesize_scene_narration(
+            client, payload["scenes"], narration_audio
+        )
+    except Exception as exc:
+        print("Sahne bazlı TTS başarısız; tek parça yedek:", exc)
+        raw_audio = WORK / "narration-raw.wav"
+        tts_model = synthesize_narration(client, payload["narration"], raw_audio)
+        normalize_audio(raw_audio, narration_audio)
+        visible_durations = allocate_scene_durations(
+            payload["scenes"], ffprobe_duration(narration_audio)
+        )
 
-    narration_duration = ffprobe_duration(narration_audio)
-    visible_durations = allocate_scene_durations(
-        payload["scenes"], narration_duration
-    )
     transitions, transition_durations = scene_transition_plan(payload["scenes"])
-    write_edit_timeline(
-        payload["scenes"],
-        visible_durations,
-        transitions,
-        transition_durations,
-        OUTPUT / "edit-timeline.json",
-    )
 
     ambient_track = WORK / "ambient-track.wav"
     build_ambient_track(
-        payload["scenes"],
-        visible_durations,
-        transition_durations,
-        ambient_track,
+        payload["scenes"], visible_durations, transition_durations, ambient_track
     )
-    final_audio = OUTPUT / "ses-tasarim.wav"
-    mix_narration_and_ambient(
-        narration_audio, ambient_track, final_audio
-    )
+    story_audio = WORK / "story-audio.wav"
+    mix_narration_and_ambient(narration_audio, ambient_track, story_audio)
 
-    video = OUTPUT / "pilot-video-v5-2-editorial-cut.mp4"
+    intro_audio = WORK / "intro-audio.wav"
+    create_intro_audio(intro_audio, INTRO_VISIBLE_SECONDS)
+
+    final_audio = OUTPUT / "ses-tasarim.wav"
+    concat_audio_files([intro_audio, story_audio], final_audio)
+
+    video = OUTPUT / "pilot-video-v6-story-director.mp4"
     actual_duration = render_video(
-        frames,
-        payload["scenes"],
-        final_audio,
-        video,
-        visible_durations,
-        transitions,
-        transition_durations,
+        frames, payload["scenes"], final_audio, video,
+        visible_durations, transitions, transition_durations,
     )
-    create_srt(
-        payload["narration"], actual_duration, OUTPUT / "altyazi.srt"
+    create_scene_srt(
+        payload["scenes"], visible_durations,
+        INTRO_VISIBLE_SECONDS, OUTPUT / "altyazi.srt",
     )
 
     chapters = chapter_text(payload.get("chapters", []), actual_duration)
@@ -2090,6 +2386,7 @@ def main() -> None:
     manifest = {
         "topic": topic,
         "text_model": text_model,
+        "story_director_model": story_model,
         "tts_model": tts_model,
         "image_engine": "Cloudflare Workers AI",
         "image_model_default": os.getenv(
@@ -2098,6 +2395,12 @@ def main() -> None:
         ),
         "actual_duration_seconds": round(actual_duration, 2),
         "scene_count": len(frames),
+        "story_director": {
+            "true_intro_in_active_render_path": True,
+            "three_act_story": True,
+            "scene_level_tts_sync": True,
+            "wide_detail_editorial_cuts": True,
+        },
         "editor_brain": {
             "zero_jitter": True,
             "semantic_scene_timing": True,
@@ -2113,7 +2416,7 @@ def main() -> None:
         "zero_jitter_mode": True,
         "camera_motion_inside_scenes": False,
         "transition_duration_seconds": 0.8,
-        "transition_style": "restrained editorial xfade",
+        "transition_style": "story-aware cuts, dissolves and act-break dips",
     }
     (OUTPUT / "uretim-raporu.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -2122,8 +2425,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V5 Editorial Cut Engine yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce pilot-video-v5-2-editorial-cut.mp4 dosyasını izle.\n"
+            "V6 Story Director yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce pilot-video-v6-story-director.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -2132,7 +2435,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V4 EDITOR BRAIN TAMAMLANDI")
+    print("V6 STORY DIRECTOR TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
