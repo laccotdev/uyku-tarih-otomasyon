@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/3.3"
+USER_AGENT = "UykuTarihTopicToVideo/3.4"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -67,6 +67,15 @@ TEXT_MODELS = [
 TTS_MODELS = [
     "gemini-3.1-flash-tts-preview",
     "gemini-2.5-flash-preview-tts",
+]
+
+TRANSITIONS = [
+    "fade",
+    "smoothleft",
+    "smoothright",
+    "fadeblack",
+    "smoothup",
+    "smoothdown",
 ]
 
 
@@ -735,6 +744,113 @@ def generate_thumbnail_background(
 
     raise RuntimeError(f"Kapak arka planı üretilemedi: {last_error}")
 
+def review_thumbnail_candidate(
+    client: genai.Client,
+    image_path: Path,
+    title_text: str,
+) -> tuple[int, str]:
+    data = image_path.read_bytes()
+    prompt = f"""
+Yalnızca JSON üret:
+{{
+  "score": 0,
+  "reason": "Kısa açıklama"
+}}
+
+Bu görsel bir YouTube tarih videosu kapağı için arka plan adayıdır.
+Başlık metni: {title_text}
+
+Puanlama kriterleri:
+- Hattuşa ve geç hitit/antik anadolu atmosferine uygun mu?
+- Premium ve sinematik mi?
+- Sol tarafta başlık için temiz ve koyu alan var mı?
+- Güçlü tek ana odak var mı?
+- Yazı, logo, filigran, kolaj veya dikkat dağıtıcı unsur var mı?
+- Videonun gece / ay ışığı / meşale tonu ile uyumlu mu?
+
+0-100 arasında puan ver.
+"""
+    part = types.Part.from_bytes(data=data, mime_type="image/jpeg")
+    try:
+        payload, _ = generate_json_with_parts(client, prompt, part)
+        return int(payload.get("score", 0)), str(payload.get("reason", ""))
+    except Exception as exc:
+        print("Kapak değerlendirmesi atlandı:", exc)
+        return 65, "Kapak değerlendirmesi atlandı."
+
+
+def generate_thumbnail_candidates(
+    client: genai.Client,
+    topic: str,
+    payload: dict[str, Any],
+    target_dir: Path,
+) -> tuple[Path, dict[str, Any]]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    base_prompt = str(payload['thumbnail_prompt']).strip()
+    variants = [
+        "Monumental night entrance, imposing gate, cinematic scale, strong subject on right, moody negative space on left.",
+        "Wide courtyard and temple facade at blue hour, a few torch lights, soft mist, powerful architecture, title-safe dark space left.",
+        "Closer dramatic stone portal with moonlight and low torch glow, ancient Hattusa atmosphere, clear depth, title-safe left third.",
+    ]
+    best_path: Path | None = None
+    best_score = -1
+    best_info: dict[str, Any] = {}
+
+    for idx, extra in enumerate(variants, start=1):
+        target = target_dir / f"thumbnail_candidate_{idx}.jpg"
+        prompt = (
+            f"{base_prompt}\n\n{extra}\n\n"
+            f"VIDEO VISUAL IDENTITY:\n{payload['visual_identity'].strip()}\n\n"
+            f"MASTER STYLE:\n{STYLE_BIBLE}\n"
+            "YouTube thumbnail background only. Main focal subject on the right third. "
+            "Left third must be darker, calmer and cleaner for bold title placement. "
+            "Single cohesive environment, no collage, no text."
+        )
+        negative = (
+            f"{GLOBAL_NEGATIVE}, "
+            f"{str(payload.get('thumbnail_negative_prompt', '')).strip()}, "
+            "words, title, typography, collage, multiple panels, busy left side"
+        )
+        info = generate_thumbnail_background_with_prompt(topic, prompt, negative, target, candidate_id=idx)
+        score, reason = review_thumbnail_candidate(client, target, str(payload.get('thumbnail_text', '')))
+        info['review_score'] = score
+        info['review_reason'] = reason
+        if score > best_score:
+            best_score = score
+            best_path = target
+            best_info = info
+
+    if best_path is None:
+        raise RuntimeError('Kapak adayı seçilemedi.')
+    best_info['selected_file'] = best_path.name
+    return best_path, best_info
+
+
+def generate_thumbnail_background_with_prompt(
+    topic: str,
+    prompt: str,
+    negative: str,
+    target: Path,
+    candidate_id: int,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    models = cloudflare_model_chain()
+    max_attempts = min(4, len(models))
+    for attempt, model in enumerate(models[:max_attempts], start=1):
+        seed = deterministic_seed(topic, 900 + candidate_id, attempt)
+        try:
+            print(f"Kapak adayı {candidate_id}: model={model}, deneme={attempt}/{max_attempts}")
+            cloudflare_image_request(prompt, negative, seed, target, model)
+            return {"model": model, "seed": seed, "file": target.name, "candidate_id": candidate_id}
+        except Exception as exc:
+            last_error = exc
+            target.unlink(missing_ok=True)
+            print(f"Kapak adayı başarısız ({model}): {exc}")
+            time.sleep(min(12, 3 * attempt))
+
+    raise RuntimeError(f"Kapak adayı üretilemedi: {last_error}")
+
+
 def video_font(size: int, bold: bool = False):
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf"
@@ -1106,7 +1222,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V3-3.txt").write_text(
+    (OUTPUT / "HATA-V3-4.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -1133,7 +1249,7 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V3.3 — KONUDAN VİDEOYA")
+    print("UYKU VE TARİH V3.4 — KONUDAN VİDEOYA")
     print("Konu:", topic)
     print("=" * 72)
 
@@ -1172,10 +1288,12 @@ def main() -> None:
         frames, payload["scenes"], OUTPUT / "storyboard-kontrol.jpg"
     )
 
-    thumb_raw = WORK / "thumbnail-background.jpg"
-    thumb_info = generate_thumbnail_background(topic, payload, thumb_raw)
+    thumb_dir = WORK / "thumbnail-candidates"
+    selected_thumb_background, thumb_info = generate_thumbnail_candidates(
+        client, topic, payload, thumb_dir
+    )
     make_thumbnail(
-        thumb_raw,
+        selected_thumb_background,
         str(payload["thumbnail_text"]),
         OUTPUT / "kapak.jpg",
     )
@@ -1187,7 +1305,7 @@ def main() -> None:
     audio = OUTPUT / "seslendirme.wav"
     normalize_audio(raw_audio, audio)
 
-    video = OUTPUT / "pilot-video-v3-3.mp4"
+    video = OUTPUT / "pilot-video-v3-4.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], audio, video
     )
@@ -1237,8 +1355,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V3 yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce pilot-video-v3-3.mp4 dosyasını izle.\n"
+            "V3.4 yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce pilot-video-v3-4.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -1247,7 +1365,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V3 ÜRETİM TAMAMLANDI")
+    print("V3.4 ÜRETİM TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
