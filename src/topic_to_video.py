@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/8.0"
+USER_AGENT = "UykuTarihTopicToVideo/8.1"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -452,7 +452,7 @@ ZORUNLU HEDEFLER:
 - thumbnail_text en fazla dört kelime olsun.
 - intro_hook en fazla sekiz kelime olsun.
 - Sahnelere chapter_index, chapter_title ve beat_type alanlarını ekle.
-- Dört bölüm ve bölüm başına üç sahne kullan.
+- Üç perde ve perde başına dört sahne kullan.
 
 MEVCUT JSON:
 {existing}
@@ -636,6 +636,16 @@ def _merge_package_defaults(
     return payload
 
 
+def _safe_chapter_index(chapter_index: Any) -> int:
+    try:
+        value = int(chapter_index)
+    except (TypeError, ValueError):
+        value = CHAPTER_COUNT
+
+    available = max(1, len(CHAPTER_BEATS))
+    return max(1, min(available, value))
+
+
 def _local_expand_chapter(
     seed_text: str,
     topic: str,
@@ -643,44 +653,43 @@ def _local_expand_chapter(
     target_words: int,
 ) -> str:
     seed = re.sub(r"\s+", " ", str(seed_text)).strip()
-    chapter_title = CHAPTER_BEATS[chapter_index - 1][0]
+    safe_index = _safe_chapter_index(chapter_index)
+    chapter_title = CHAPTER_BEATS[safe_index - 1][0]
 
+    # This is only an emergency length guard. It expands cause-and-effect
+    # reasoning without inventing dates, names or visual atmosphere.
     additions = [
         (
-            f"Bu bölüm, {topic} başlığını yalnızca büyük olaylar üzerinden değil, "
-            f"o dünyada yaşayan insanların gündelik ritmi üzerinden de okumaya "
-            f"çalışır. {chapter_title} içinde görülen ayrıntılar, mekânın nasıl "
-            f"kullanıldığını ve zamanın insanlar için nasıl aktığını anlamamıza "
-            f"yardım eder."
+            f"{chapter_title} aşamasında asıl belirleyici olan, önceki kararların "
+            f"yeni bir zorunluluk yaratmasıydı. {topic} çerçevesindeki gelişmeler "
+            "tek bir anda ortaya çıkmadı; birbirini etkileyen tercihler, "
+            "beklentiler ve karşı hamleler sonucunda biçimlendi."
         ),
         (
-            "Elde kalan arkeolojik izler ve yazılı kaynaklar her soruya eksiksiz "
-            "bir cevap vermez. Bu nedenle anlatılan tablo, doğrulanmış bilgilerle "
-            "dönemin koşullarından çıkarılabilecek makul olasılıkları dikkatli "
-            "biçimde birbirinden ayırır."
+            "Bu noktada tarafların hedefleri aynı değildi. Bir grubun güvenlik, "
+            "düzen veya iktidar için attığı adım, diğer tarafın seçeneklerini "
+            "daralttı ve yeni bir karar alınmasını zorunlu hâle getirdi."
         ),
         (
-            "Taş, ahşap, toprak, kumaş ve gündelik araçlar gibi sıradan görünen "
-            "unsurlar, geçmişteki hayatın en güçlü tanıklarıdır. İnsanların "
-            "çalışma biçimi, dinlenme zamanı ve çevreyle kurduğu ilişki bu küçük "
-            "izler üzerinden daha görünür hâle gelir."
+            "Kaynaklar her ayrıntıyı aynı açıklıkta aktarmadığı için, kesin olarak "
+            "bilinen gelişmelerle daha sonra yapılan yorumları birbirinden ayırmak "
+            "gerekir. Buna rağmen olayların sırası, kararların sonuçlarını "
+            "anlamaya yetecek kadar belirgindir."
         ),
         (
-            "Gece çöktüğünde şehirlerin ve yerleşimlerin temposu değişir; sesler "
-            "azalır, ışık kaynakları sınırlanır ve gün içinde fark edilmeyen "
-            "ayrıntılar öne çıkar. Bu sakinlik, tarihsel mekânı daha yakından "
-            "düşünmek için doğal bir çerçeve sunar."
+            "Alınan karar yalnızca o anı değiştirmedi. Yönetim, ekonomi, güvenlik "
+            "ve gündelik yaşam üzerinde birbirine bağlı sonuçlar doğurdu; sonraki "
+            "adımlar da bu yeni koşullara cevap vermek zorunda kaldı."
         ),
         (
-            "Burada amaç geçmişi romantikleştirmek ya da tek bir açıklamaya "
-            "indirgemek değildir. Aksine, insanların belirsizlikler karşısında "
-            "nasıl yaşadığını, çalıştığını ve çevresini anlamlandırdığını sakin "
-            "bir anlatı içinde görünür kılmaktır."
+            "Bu gelişmenin insanlara yansıması aynı ölçüde önemliydi. Büyük "
+            "siyasi veya askerî değişimler, barınma, çalışma, ticaret ve toplumsal "
+            "düzen gibi gündelik alanlarda somut karşılıklar üretti."
         ),
         (
-            "Bu ayrıntılar tek başına kesin bir hüküm oluşturmasa da, birbirleriyle "
-            "birlikte değerlendirildiğinde dönemin sosyal düzeni ve gündelik "
-            "alışkanlıkları hakkında daha dengeli bir görüntü ortaya çıkarır."
+            "Sonuçta ortaya çıkan dönüşüm, tek bir kişinin veya tek bir kararın "
+            "ürünü değildi. Önceki gerilimler, mevcut imkânlar ve verilen "
+            "karşılıklar birleşerek olayın yönünü belirledi."
         ),
     ]
 
@@ -689,7 +698,7 @@ def _local_expand_chapter(
     while _word_count(" ".join(parts)) < target_words:
         parts.append(additions[cursor % len(additions)])
         cursor += 1
-        if cursor > 20:
+        if cursor >= 18:
             break
 
     combined = re.sub(r"\s+", " ", " ".join(parts)).strip()
@@ -701,18 +710,13 @@ def _local_expand_chapter(
 
     selected: list[str] = []
     for sentence in sentences:
-        if (
-            selected
-            and _word_count(" ".join(selected + [sentence]))
-            > target_words + 18
-        ):
+        proposed = " ".join(selected + [sentence])
+        if selected and _word_count(proposed) > target_words + 16:
             break
         selected.append(sentence)
 
     result = " ".join(selected).strip()
-    if _word_count(result) < target_words:
-        result = combined
-    return result
+    return result or combined
 
 
 def _chapter_generation_prompt(
@@ -958,7 +962,7 @@ def _force_long_form_package(
         payload["narration"] = _local_expand_chapter(
             payload["narration"],
             topic,
-            4,
+            CHAPTER_COUNT,
             deficit_target,
         )
         all_scene_texts = _split_narration_into_scenes(
@@ -1009,12 +1013,12 @@ KONU:
 
 ÖNEMLİ:
 Bu ilk çağrıda önce güçlü ve eksiksiz bir video planı kur.
-Metin beklenenden kısa kalırsa sistem dört bölümü ayrı ayrı yazacaktır.
+Metin beklenenden kısa kalırsa sistem üç perdeyi ayrı ayrı tamamlayacaktır.
 Kullanıcıdan ek bilgi isteme.
 
 HEDEF:
 Yaklaşık {target_seconds} saniyelik, uyku öncesi dinlemeye uygun,
-dört bölümlü Türkçe tarih videosu.
+üç perdeli Türkçe tarih videosu.
 Tam {scene_count} sahne üret.
 
 JSON:
@@ -1058,7 +1062,7 @@ JSON:
       "continuity_bridge": "Önceki sahneden doğal geçiş"
     }}
   ],
-  "chapters": ["Dört bölüm adı"],
+  "chapters": ["Üç perde adı"],
   "tags": ["etiket"]
 }}
 
@@ -1151,7 +1155,7 @@ KURALLAR:
 
     if current_words < minimum_words:
         print(
-            "FAIL-SOFT STORY RECOVERY: Senaryo dört ayrı bölüm "
+            "FAIL-SOFT STORY RECOVERY: Senaryo üç ayrı perde "
             "olarak tamamlanıyor."
         )
         payload, chapter_models = _force_long_form_package(
@@ -1356,12 +1360,12 @@ KONU:
 {topic}
 
 UZUN FORMAT YAPI:
-- Tam {scene_count} sahne ve tam dört bölüm kullan.
-- Her bölümde üç sahne bulunsun.
-- Bölüm 1: hook, orientation, setting.
-- Bölüm 2: routine, craft, community.
-- Bölüm 3: evidence, tension, turning_point.
-- Bölüm 4: aftermath, legacy, reflection.
+- Tam {scene_count} sahne ve tam üç perde kullan.
+- Her perdede dört sahne bulunsun.
+- Perde 1: hook, context, goal, obstacle.
+- Perde 2: first_move, counter_move, escalation, breakthrough.
+- Perde 3: climax, immediate_result, human_cost, legacy.
+
 - İlk otuz saniyede merkezî soruyu kur.
 - Her sahne önceki sahnenin düşüncesini sürdürsün.
 - Bilgi listesi, maddeleme, tekrar ve her sahnede yeniden giriş yapma.
@@ -1374,7 +1378,7 @@ UZUN FORMAT YAPI:
 - Her sahnede chapter_index, chapter_title, beat_type ve continuity_bridge bulunsun.
 - Görsel promptu yalnızca o sahnenin somut anlatımına odaklansın.
 - Aynı film paleti, dönem, coğrafya ve mimari bütün sahnelerde korunsun.
-- chapters alanı dört kısa Türkçe bölüm başlığı içersin.
+- chapters alanı üç kısa Türkçe perde başlığı içersin.
 
 MEVCUT JSON:
 {current}
@@ -3920,13 +3924,55 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V8.txt").write_text(
+    (OUTPUT / "HATA-V8-1.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
 
 
+def run_internal_preflight() -> None:
+    if CHAPTER_COUNT != len(CHAPTER_BEATS):
+        raise RuntimeError(
+            "İç yapı hatası: CHAPTER_COUNT ile CHAPTER_BEATS eşleşmiyor."
+        )
+
+    if CHAPTER_COUNT < 1:
+        raise RuntimeError("İç yapı hatası: en az bir perde gerekli.")
+
+    # Reproduce the exact V8 crash condition deliberately. The safe clamp
+    # must handle an out-of-range chapter without raising IndexError.
+    probe = _local_expand_chapter(
+        "Kararlar birbirini izledi.",
+        "Ön kontrol konusu",
+        CHAPTER_COUNT + 1,
+        55,
+    )
+    if _word_count(probe) < 20:
+        raise RuntimeError(
+            "İç yapı hatası: yerel hikâye tamamlayıcı çalışmıyor."
+        )
+
+    test_scene_count = 12
+    assigned = [
+        min(
+            CHAPTER_COUNT,
+            1 + index * CHAPTER_COUNT // test_scene_count,
+        )
+        for index in range(test_scene_count)
+    ]
+    if min(assigned) < 1 or max(assigned) > CHAPTER_COUNT:
+        raise RuntimeError(
+            "İç yapı hatası: sahne-perde dağılımı sınır dışı."
+        )
+
+    print(
+        "INTERNAL PREFLIGHT OK: "
+        f"{CHAPTER_COUNT} perde, güvenli indeks ve yerel fallback doğrulandı."
+    )
+
+
 def main() -> None:
+    run_internal_preflight()
     reset_dirs()
 
     topic = os.getenv("VIDEO_TOPIC", "").strip()
@@ -3963,9 +4009,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V8 — NARRATIVE CUT ACTIVE")
+    print("UYKU VE TARİH V8.1 — GUARDED NARRATIVE CUT ACTIVE")
     print("Konu:", topic)
-    print("NARRATIVE CUT: one story → one voice → editorial timeline")
+    print("GUARDED CUT: preflight → story → one voice → render")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -4087,7 +4133,7 @@ def main() -> None:
     )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v8-narrative-cut.mp4"
+    video = OUTPUT / "uyku-tarih-v8-1-guarded-cut.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -4153,6 +4199,10 @@ def main() -> None:
             "description_ratio_cap_percent": 15,
             "cause_effect_story_structure": True,
             "continuity_editor": True,
+            "chapter_index_clamp": True,
+            "hardcoded_chapter_four_removed": True,
+            "internal_preflight_before_api": True,
+            "exact_v8_indexerror_regression_test": True,
             "internal_blur_transitions": False,
             "editorial_shots_per_scene": 3,
             "professional_intro_seconds": INTRO_VISIBLE_SECONDS,
@@ -4184,8 +4234,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V8 Narrative Cut yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce uyku-tarih-v8-narrative-cut.mp4 dosyasını izle.\n"
+            "V8.1 Guarded Narrative Cut yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce uyku-tarih-v8-1-guarded-cut.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -4194,7 +4244,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V8 NARRATIVE CUT TAMAMLANDI")
+    print("V8.1 GUARDED NARRATIVE CUT TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
