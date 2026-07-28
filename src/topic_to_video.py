@@ -26,9 +26,9 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/8.2"
+USER_AGENT = "UykuTarihTopicToVideo/8.3"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
-VOICE_NAME = "Schedar"
+VOICE_NAME = "Charon"
 
 CLOUDFLARE_IMAGE_MODELS = [
     "@cf/black-forest-labs/flux-2-klein-4b",
@@ -1572,11 +1572,10 @@ def synthesize_short_segment(
             print(f"Gemini bölüm TTS atlandı: {model}: {exc}")
             continue
 
-    print(
-        f"Gemini bölüm TTS kullanılamadı; ücretsiz yedek ses motoruna "
-        f"geçiliyor. Son hata: {last_error}"
+    raise RuntimeError(
+        "Seçilen Charon sesi üretilemedi. Farklı bir anlatıcıya geçilmedi. "
+        f"Son hata: {last_error}"
     )
-    return synthesize_edge_tts(text, target)
 
 
 def append_scene_pause(
@@ -2917,11 +2916,11 @@ def synthesize_narration(
             target.unlink(missing_ok=True)
             print(f"Gemini TTS atlandı: {model}: {exc}")
 
-    print(
-        "Gemini tek parça TTS kullanılamadı; ücretsiz yedek ses "
-        f"motoruna geçiliyor. Son hata: {last_error}"
+    raise RuntimeError(
+        "Seçilen Charon sesi üretilemedi. Ses bütünlüğünü korumak için "
+        "başka bir anlatıcı kullanılmadı. "
+        f"Son hata: {last_error}"
     )
-    return synthesize_edge_tts(narration, target)
 
 
 def normalize_audio(source: Path, target: Path) -> None:
@@ -3959,7 +3958,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V8-2.txt").write_text(
+    (OUTPUT / "HATA-V8-3.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -4044,9 +4043,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V8.2 — NATURAL VOICE CUT ACTIVE")
+    print("UYKU VE TARİH V8.3 — CHARON VOICE LOCK ACTIVE")
     print("Konu:", topic)
-    print("NATURAL VOICE: full script → one narrator → no forced slowdown")
+    print("VOICE LOCK: Charon → one narrator → no fallback voice change")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -4077,7 +4076,9 @@ def main() -> None:
     (OUTPUT / "senaryo.txt").write_text(payload["narration"], encoding="utf-8")
     (OUTPUT / "baslik.txt").write_text(str(payload["video_title"]), encoding="utf-8")
 
-    print("AŞAMA 1/4: Tek anlatıcıyla tam metin seslendiriliyor.")
+    print(
+        "AŞAMA 1/4: Charon sesiyle tam metin tek parça seslendiriliyor."
+    )
     narration_audio = OUTPUT / "seslendirme.wav"
     raw_audio = WORK / "narration-single-voice-raw.wav"
     normalized_audio = WORK / "narration-single-voice-normalized.wav"
@@ -4171,7 +4172,7 @@ def main() -> None:
         )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v8-2-natural-voice.mp4"
+    video = OUTPUT / "uyku-tarih-v8-3-charon.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -4236,6 +4237,10 @@ def main() -> None:
             "chapter_tts_calls": 0,
             "single_full_script_tts_call": True,
             "voice_switching_inside_video": False,
+            "selected_voice": "Charon",
+            "voice_lock_enabled": True,
+            "different_voice_fallback_disabled": True,
+            "fail_before_images_if_charon_unavailable": True,
             "forced_speech_slowdown": False,
             "maximum_voice_slowdown_percent": 2,
             "maximum_voice_speedup_percent": 8,
@@ -4280,8 +4285,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V8.2 Natural Voice Cut yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce uyku-tarih-v8-2-natural-voice.mp4 dosyasını izle.\n"
+            "V8.3 Charon Voice Lock yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce uyku-tarih-v8-3-charon.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -4290,7 +4295,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V8.2 NATURAL VOICE CUT TAMAMLANDI")
+    print("V8.3 CHARON VOICE LOCK TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
