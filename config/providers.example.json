@@ -1,0 +1,7 @@
+{
+  "text_provider": "gemini_free",
+  "tts_provider": "gemini_charon",
+  "visual_provider": "wikimedia_commons",
+  "ai_image_fallback": "disabled",
+  "youtube_upload": "disabled"
+}
