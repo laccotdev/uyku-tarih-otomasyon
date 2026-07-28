@@ -23,7 +23,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from google import genai
 from google.genai import types
 
-VERSION = "10.0.0"
+VERSION = "10.1.0"
 ROOT = Path(__file__).resolve().parents[1]
 PROJECTS = ROOT / "projects"
 FPS = 24
@@ -460,10 +460,589 @@ KURALLAR:
 """
 
 
+def chapter_word_targets(
+    chapter: dict[str, Any],
+) -> tuple[int, int]:
+    requested = max(
+        650,
+        int(chapter.get("target_words", 1000)),
+    )
+    minimum = max(
+        520,
+        round(requested * 0.78),
+    )
+    return requested, minimum
+
+
+def _research_context_for_prompt(
+    research: dict[str, Any],
+    *,
+    limit: int = 10,
+    extract_chars: int = 2500,
+) -> list[dict[str, str]]:
+    return [
+        {
+            "title": str(source.get("title", "")),
+            "url": str(source.get("url", "")),
+            "extract": str(source.get("extract", ""))[:extract_chars],
+        }
+        for source in research.get("sources", [])[:limit]
+    ]
+
+
+def _tail_sentences(
+    narration: str,
+    count: int = 3,
+) -> str:
+    sentences = [
+        item.strip()
+        for item in re.split(
+            r"(?<=[.!?])\s+",
+            re.sub(r"\s+", " ", narration).strip(),
+        )
+        if item.strip()
+    ]
+    return " ".join(sentences[-count:])
+
+
+def _normalize_narration_piece(value: Any) -> str:
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value or ""),
+    ).strip()
+
+
+def _append_narration_piece(
+    narration: str,
+    addition: str,
+) -> str:
+    narration = _normalize_narration_piece(narration)
+    addition = _normalize_narration_piece(addition)
+    if not addition:
+        return narration
+    if not narration:
+        return addition
+
+    # Remove a repeated opening sentence when the model restarts from the
+    # previous tail instead of continuing it.
+    existing_sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?])\s+", narration)
+        if item.strip()
+    ]
+    addition_sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?])\s+", addition)
+        if item.strip()
+    ]
+    existing_tail = {
+        sentence.lower()
+        for sentence in existing_sentences[-4:]
+    }
+    while (
+        addition_sentences
+        and addition_sentences[0].lower() in existing_tail
+    ):
+        addition_sentences.pop(0)
+
+    clean_addition = " ".join(addition_sentences).strip()
+    if not clean_addition:
+        return narration
+    return f"{narration} {clean_addition}".strip()
+
+
+def chapter_segment_prompt(
+    topic: str,
+    plan: dict[str, Any],
+    chapter: dict[str, Any],
+    research: dict[str, Any],
+    *,
+    segment_index: int,
+    segment_count: int,
+    segment_target_words: int,
+    narration_so_far: str,
+) -> str:
+    sources = _research_context_for_prompt(
+        research,
+        limit=10,
+        extract_chars=2200,
+    )
+    previous_tail = _tail_sentences(
+        narration_so_far,
+        3,
+    )
+
+    if segment_index == 1:
+        continuity = (
+            "Bu ilk parçadır. İlk 30 kelime içinde bölümün temel sorusunu "
+            "veya çatışmasını kur. Uzun bir genel giriş yapma."
+        )
+    else:
+        continuity = (
+            "Bu yeni bir bölüm başlangıcı değildir. Aşağıdaki önceki son "
+            "cümlelerden doğrudan devam et; giriş, başlık ve özet tekrarı yapma.\n"
+            f"ÖNCEKİ SON CÜMLELER:\n{previous_tail}"
+        )
+
+    if segment_index == segment_count:
+        ending = (
+            "Bu son parçadır. Bölümün olay sonucunu anlat ve planın "
+            "closing_bridge alanına doğal biçimde bağlan; madde madde özet yapma."
+        )
+    else:
+        ending = (
+            "Bu parçada nihai sonuç yazma. Olayı bir sonraki parçaya taşıyacak "
+            "somut bir karar, gelişme veya gerilim noktasında bırak."
+        )
+
+    return f"""
+Yalnızca geçerli JSON üret:
+{{
+  "segment": "Türkçe anlatım parçası"
+}}
+
+VİDEO KONUSU:
+{topic}
+
+HİKÂYE ANAYASASI:
+{json.dumps(plan.get('story_bible', {}), ensure_ascii=False)}
+
+BÖLÜM PLANI:
+{json.dumps(chapter, ensure_ascii=False)}
+
+KAYNAK BAĞLAMI:
+{json.dumps(sources, ensure_ascii=False)}
+
+PARÇA:
+{segment_index}/{segment_count}
+
+HEDEF:
+Yaklaşık {segment_target_words} Türkçe kelime.
+
+KURALLAR:
+- Bu bir olay anlatısıdır; betimleyici dolgu metni değildir.
+- Kim ne istedi, ne yaptı, neyle karşılaştı ve bunun sonucu ne oldu sorularını
+  neden-sonuç ilişkisiyle anlat.
+- Özel isimleri, tarihleri, mekânları ve kararları kaynak bağlamına uygun kullan.
+- Kaynaklarda desteklenmeyen kesin ayrıntı uydurma.
+- Aynı bilgiyi farklı kelimelerle tekrar etme.
+- Başlık, bölüm numarası, madde işareti veya kamera tarifi yazma.
+- Şiirsel giriş, fragman dili ve uzun atmosfer betimlemesi kullanma.
+- {continuity}
+- {ending}
+"""
+
+
+def chapter_continuation_prompt(
+    topic: str,
+    plan: dict[str, Any],
+    chapter: dict[str, Any],
+    research: dict[str, Any],
+    *,
+    narration_so_far: str,
+    needed_words: int,
+) -> str:
+    sources = _research_context_for_prompt(
+        research,
+        limit=10,
+        extract_chars=1800,
+    )
+    target = max(
+        180,
+        min(360, needed_words + 60),
+    )
+    return f"""
+Yalnızca geçerli JSON üret:
+{{
+  "continuation": "Mevcut anlatımın doğrudan devamı"
+}}
+
+KONU:
+{topic}
+
+BÖLÜM:
+{json.dumps(chapter, ensure_ascii=False)}
+
+HİKÂYE ANAYASASI:
+{json.dumps(plan.get('story_bible', {}), ensure_ascii=False)}
+
+KAYNAKLAR:
+{json.dumps(sources, ensure_ascii=False)}
+
+MEVCUT ANLATIMIN SONU:
+{_tail_sentences(narration_so_far, 5)}
+
+GÖREV:
+Anlatımı yaklaşık {target} kelime daha devam ettir.
+
+KURALLAR:
+- Baştan başlama ve mevcut cümleleri tekrar etme.
+- Yeni başlık veya giriş kullanma.
+- Bölüm planındaki henüz anlatılmamış olay, karar ve sonuçları tamamla.
+- Kaynaklarda desteklenmeyen kesin bilgi uydurma.
+- Şiirsel dolgu ve genel tarih dersi yazma.
+- Son cümlede bölümün closing_bridge alanına doğal biçimde yaklaş.
+"""
+
+
+def visual_beats_prompt(
+    topic: str,
+    chapter: dict[str, Any],
+    narration: str,
+    beat_count: int,
+) -> str:
+    chunks = split_by_word_weight(
+        narration,
+        beat_count,
+    )
+    numbered = [
+        {
+            "beat_id": index,
+            "narration_excerpt": chunk,
+        }
+        for index, chunk in enumerate(chunks, start=1)
+    ]
+    return f"""
+Yalnızca geçerli JSON üret:
+{{
+  "visual_beats": [
+    {{
+      "beat_id": 1,
+      "narration_excerpt": "verilen parçayı aynen veya çok yakın biçimde kullan",
+      "visual_contract": "karede görünmesi gereken somut olay",
+      "must_show": ["ana özne", "ana eylem", "mekân veya nesne"],
+      "query_tr": "Wikimedia Commons Türkçe arama sorgusu",
+      "query_en": "Wikimedia Commons English search query",
+      "asset_type": "painting|photo|architecture|artifact|timeline|map",
+      "local_graphic_title": "yalnız timeline/map ise Türkçe başlık",
+      "local_graphic_points": ["yalnız timeline/map ise 2-4 kısa nokta"]
+    }}
+  ]
+}}
+
+KONU:
+{topic}
+
+BÖLÜM:
+{json.dumps(chapter, ensure_ascii=False)}
+
+NİHAİ ANLATIM PARÇALARI:
+{json.dumps(numbered, ensure_ascii=False)}
+
+KURALLAR:
+- Tam {beat_count} visual_beats üret.
+- Her beat_id verilen anlatım parçasıyla aynı sırada ve aynı olayda kalsın.
+- Görsel, anlatıcının o anda söylediği kişi, eylem, nesne ve mekânı doğrudan
+  desteklemeli; genel veya alakasız tarih atmosferi önermemeli.
+- query_tr ve query_en soyut değil; Wikimedia Commons'ta aranabilecek özel isim,
+  yapı, şehir, tablo, gravür, eser veya arkeolojik nesne içersin.
+- En fazla 2 adet map/timeline beat kullan.
+- Aynı görsel sorgusunu art arda tekrar etme.
+"""
+
+
+def _fallback_visual_beats(
+    narration: str,
+    chapter: dict[str, Any],
+    beat_count: int,
+) -> list[dict[str, Any]]:
+    chunks = split_by_word_weight(
+        narration,
+        beat_count,
+    )
+    result: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks, start=1):
+        compact = re.sub(
+            r"\s+",
+            " ",
+            chunk,
+        ).strip()
+        result.append({
+            "beat_id": index,
+            "narration_excerpt": compact,
+            "visual_contract": compact[:260],
+            "must_show": [],
+            "query_tr": (
+                f'{chapter.get("title", "")} '
+                f'{compact[:100]}'
+            ).strip(),
+            "query_en": (
+                f'{chapter.get("title", "")} '
+                "historical painting engraving"
+            ).strip(),
+            "asset_type": "painting",
+            "local_graphic_title": "",
+            "local_graphic_points": [],
+        })
+    return result
+
+
+def build_chapter_script_resilient(
+    client: genai.Client,
+    topic: str,
+    plan: dict[str, Any],
+    chapter: dict[str, Any],
+    research: dict[str, Any],
+    beat_count: int,
+    chapter_dir: Path,
+) -> dict[str, Any]:
+    target_words, minimum_words = chapter_word_targets(
+        chapter,
+    )
+    draft_file = chapter_dir / "script-draft.json"
+    segments_file = chapter_dir / "narration-segments.json"
+
+    draft = read_json(
+        draft_file,
+        {},
+    )
+    narration = _normalize_narration_piece(
+        draft.get("narration", "")
+    )
+    text_models: list[str] = list(
+        draft.get("text_models", [])
+    )
+    segments = read_json(
+        segments_file,
+        [],
+    )
+    if not isinstance(segments, list):
+        segments = []
+
+    segment_count = 4
+    segment_target = max(
+        210,
+        round(target_words / segment_count),
+    )
+
+    log(
+        "RESILIENT SCRIPT: "
+        f"hedef={target_words}, minimum={minimum_words}, "
+        f"mevcut={word_count(narration)} kelime"
+    )
+
+    for segment_index in range(
+        len(segments) + 1,
+        segment_count + 1,
+    ):
+        payload, model = generate_json(
+            client,
+            chapter_segment_prompt(
+                topic,
+                plan,
+                chapter,
+                research,
+                segment_index=segment_index,
+                segment_count=segment_count,
+                segment_target_words=segment_target,
+                narration_so_far=narration,
+            ),
+            max_tokens=5200,
+        )
+        piece = _normalize_narration_piece(
+            payload.get("segment")
+            or payload.get("continuation")
+            or payload.get("narration")
+        )
+        if word_count(piece) < 90:
+            log(
+                "Kısa segment alındı; aynı parça bir kez daha üretilecek: "
+                f"{word_count(piece)} kelime"
+            )
+            retry_payload, retry_model = generate_json(
+                client,
+                chapter_segment_prompt(
+                    topic,
+                    plan,
+                    chapter,
+                    research,
+                    segment_index=segment_index,
+                    segment_count=segment_count,
+                    segment_target_words=segment_target + 80,
+                    narration_so_far=narration,
+                ),
+                max_tokens=6200,
+            )
+            retry_piece = _normalize_narration_piece(
+                retry_payload.get("segment")
+                or retry_payload.get("continuation")
+                or retry_payload.get("narration")
+            )
+            if word_count(retry_piece) > word_count(piece):
+                piece = retry_piece
+                model = retry_model
+
+        if word_count(piece) < 50:
+            raise ControlledStop(
+                "Gemini bölüm parçasını yeterli uzunlukta üretemedi. "
+                f"Parça {segment_index}: {word_count(piece)} kelime. "
+                "Mevcut segment checkpointleri korundu."
+            )
+
+        narration = _append_narration_piece(
+            narration,
+            piece,
+        )
+        segments.append({
+            "segment_index": segment_index,
+            "model": model,
+            "word_count": word_count(piece),
+            "text": piece,
+        })
+        if model not in text_models:
+            text_models.append(model)
+
+        write_json(
+            segments_file,
+            segments,
+        )
+        write_json(
+            draft_file,
+            {
+                "chapter_title": chapter.get("title", ""),
+                "narration": narration,
+                "text_models": text_models,
+                "target_words": target_words,
+                "minimum_words": minimum_words,
+                "status": "segments_in_progress",
+            },
+        )
+        log(
+            f"Segment {segment_index}/{segment_count} hazır: "
+            f"toplam {word_count(narration)} kelime"
+        )
+
+    # The model may still undershoot its requested word count. Continue in
+    # small source-grounded passes rather than discarding the entire chapter.
+    continuation_pass = 0
+    while (
+        word_count(narration) < minimum_words
+        and continuation_pass < 4
+    ):
+        continuation_pass += 1
+        needed = minimum_words - word_count(narration)
+        payload, model = generate_json(
+            client,
+            chapter_continuation_prompt(
+                topic,
+                plan,
+                chapter,
+                research,
+                narration_so_far=narration,
+                needed_words=needed,
+            ),
+            max_tokens=5200,
+        )
+        piece = _normalize_narration_piece(
+            payload.get("continuation")
+            or payload.get("segment")
+            or payload.get("narration")
+        )
+        before = word_count(narration)
+        narration = _append_narration_piece(
+            narration,
+            piece,
+        )
+        gained = word_count(narration) - before
+
+        if model not in text_models:
+            text_models.append(model)
+
+        write_json(
+            draft_file,
+            {
+                "chapter_title": chapter.get("title", ""),
+                "narration": narration,
+                "text_models": text_models,
+                "target_words": target_words,
+                "minimum_words": minimum_words,
+                "continuation_pass": continuation_pass,
+                "status": "length_recovery",
+            },
+        )
+        log(
+            f"Uzunluk tamamlama {continuation_pass}/4: "
+            f"+{gained}, toplam={word_count(narration)} kelime"
+        )
+        if gained < 45:
+            break
+
+    if word_count(narration) < minimum_words:
+        raise ControlledStop(
+            "Bölüm anlatımı otomatik tamamlama sonrasında hâlâ kısa kaldı: "
+            f"{word_count(narration)} / minimum {minimum_words} kelime. "
+            "Taslak ve tamamlanan segmentler checkpointte korundu; aynı "
+            "project_slug ile tekrar çalıştırıldığında kaldığı yerden devam eder."
+        )
+
+    # Visual beats are generated only after the final narration is ready.
+    beats: list[dict[str, Any]]
+    beat_model = "local-fallback"
+    try:
+        beat_payload, beat_model = generate_json(
+            client,
+            visual_beats_prompt(
+                topic,
+                chapter,
+                narration,
+                beat_count,
+            ),
+            max_tokens=9000,
+        )
+        candidate = beat_payload.get("visual_beats")
+        if not isinstance(candidate, list) or len(candidate) != beat_count:
+            raise ValueError(
+                f"Görsel plan {len(candidate) if isinstance(candidate, list) else 0}"
+                f"/{beat_count} beat döndürdü."
+            )
+        beats = candidate
+    except Exception as exc:
+        log(
+            "Görsel beat modeli kullanılamadı; nihai anlatımdan güvenli "
+            f"yerel plan oluşturuldu: {exc}"
+        )
+        beats = _fallback_visual_beats(
+            narration,
+            chapter,
+            beat_count,
+        )
+
+    result = {
+        "chapter_title": chapter.get("title", ""),
+        "narration": narration,
+        "visual_beats": beats,
+        "text_model": ", ".join(text_models) or "unknown",
+        "visual_plan_model": beat_model,
+        "target_words": target_words,
+        "minimum_words": minimum_words,
+        "actual_words": word_count(narration),
+        "generation_mode": "resilient-segmented",
+    }
+    result = validate_chapter_script(
+        result,
+        chapter,
+        beat_count,
+    )
+    write_json(
+        draft_file,
+        {
+            **result,
+            "status": "complete",
+        },
+    )
+    return result
+
+
 def validate_chapter_script(payload: dict[str, Any], chapter: dict[str, Any], beat_count: int) -> dict[str, Any]:
     narration = re.sub(r"\s+", " ", str(payload.get("narration", ""))).strip()
-    if word_count(narration) < max(600, int(chapter.get("target_words", 1000) * 0.68)):
-        raise ValueError(f"Bölüm metni çok kısa: {word_count(narration)} kelime")
+    _, minimum_words = chapter_word_targets(chapter)
+    if word_count(narration) < minimum_words:
+        raise ControlledStop(
+            "Bölüm metni minimum uzunluğa ulaşmadı: "
+            f"{word_count(narration)} / {minimum_words} kelime. "
+            "Taslak checkpointi korunuyor."
+        )
     beats = payload.get("visual_beats")
     if not isinstance(beats, list):
         beats = []
@@ -1095,9 +1674,10 @@ def main() -> None:
     session = requests_session()
 
     log("=" * 72)
-    log(f"UYKU VE TARİH V10 LONGFORM CORE {VERSION}")
+    log(f"UYKU VE TARİH V10.1 RESILIENT LONGFORM CORE {VERSION}")
     log(f"Proje: {ctx.slug} | mod={ctx.mode} | hedef={ctx.target_minutes} dk")
     log("Checkpoint/resume aktif. Tamamlanan dosyalar yeniden üretilmez.")
+    log("Resilient script: bölüm metni segmentlere ayrılır ve her segment kaydedilir.")
     log("=" * 72)
 
     try:
@@ -1149,19 +1729,15 @@ def main() -> None:
             script_file = chapter_dir / "script.json"
             script = read_json(script_file)
             if script is None:
-                payload, model = generate_json(
+                script = build_chapter_script_resilient(
                     client,
-                    chapter_script_prompt(
-                        ctx.topic,
-                        plan,
-                        chapter,
-                        chapter_research,
-                        args.beats_per_chapter,
-                    ),
-                    max_tokens=14000,
+                    ctx.topic,
+                    plan,
+                    chapter,
+                    chapter_research,
+                    args.beats_per_chapter,
+                    chapter_dir,
                 )
-                script = validate_chapter_script(payload, chapter, args.beats_per_chapter)
-                script["text_model"] = model
                 write_json(script_file, script)
             chapter_state["script"] = "ready"
             save_state(ctx, st)
