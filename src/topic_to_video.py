@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 24
-USER_AGENT = "UykuTarihTopicToVideo/9.2"
+USER_AGENT = "UykuTarihTopicToVideo/9.3"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Charon"
 
@@ -47,7 +47,7 @@ cyan, vivid orange, green casts and radically different color temperatures.
 Realistic skin and anatomy, immersive 16:9 composition, no fantasy spectacle.
 The visual must look like a frame from one cohesive historical film. No text,
 no letters, no numbers, no captions, no logos, no watermarks, no borders,
-no collage and no museum display.
+no collage and no museum display. Every visible surface must be free of writing, glyphs and letter-like markings.
 """.strip()
 
 GLOBAL_NEGATIVE = """
@@ -56,8 +56,38 @@ split screen, collage, infographic, museum display, object on white background,
 modern clothing, modern technology, electricity, neon, fantasy armor,
 fantasy castle, science fiction, cartoon, anime, illustration, oversaturated,
 plastic skin, deformed face, malformed hands, extra fingers, extra limbs,
-duplicate people, blurry, low resolution
+duplicate people, blurry, low resolution, fake writing, pseudo alphabet, glyphs, runes, inscriptions, signs, labels, map text, tablet markings
 """.strip()
+
+
+ZERO_TEXT_PIXEL_RULE = """
+ABSOLUTE ZERO-TEXT PIXEL RULE: The final image must contain no readable or
+unreadable writing of any kind. No alphabet, pseudo-alphabet, fake language,
+runes, glyphs, hieroglyph-like marks, numbers, labels, captions, subtitles,
+signs, banners, plaques, seals, emblems, carved inscriptions, map labels,
+book pages, scroll writing, tablet markings or decorative letter-like shapes.
+All parchments, maps, tablets, walls, shields, banners and documents must be
+completely blank, unmarked and free of glyph-like patterns. Do not reserve
+space for a title. Do not render typography anywhere in the frame.
+""".strip()
+
+ZERO_TEXT_NEGATIVE = """
+text, typography, readable writing, unreadable writing, fake writing,
+pseudo text, pseudo alphabet, foreign alphabet, glyphs, runes, symbols,
+letters, numbers, words, caption, subtitles, lower third, title card,
+watermark, logo, label, sign, signage, banner, plaque, seal, emblem,
+inscription, carved letters, wall writing, map labels, document writing,
+scroll writing, book text, tablet markings, hieroglyph-like marks
+""".strip()
+
+TEXT_RISK_TERMS = (
+    "map", "harita", "tablet", "kil tablet", "stone tablet", "taş levha",
+    "parchment", "parşömen", "scroll", "papyrus", "book", "kitap",
+    "document", "belge", "letter", "mektup", "inscription", "yazıt",
+    "written", "yazılı", "label", "sign", "banner", "plaque", "seal",
+    "emblem", "wall carving", "duvar işlemesi", "script", "alphabet",
+)
+
 
 TEXT_MODELS = [
     "gemini-3.5-flash-lite",
@@ -2229,6 +2259,47 @@ def _fit_prompt(parts: list[str], limit: int = MAX_IMAGE_PROMPT_CHARS) -> str:
     return _compact_text(". ".join(reduced), limit)
 
 
+def _scene_has_text_risk(scene: dict[str, Any]) -> bool:
+    haystack = " ".join([
+        str(scene.get("narration_text", "")),
+        str(scene.get("visual_goal", "")),
+        str(scene.get("visual_contract", "")),
+        str(scene.get("image_prompt", "")),
+        " ".join(str(item) for item in scene.get("must_show", [])),
+    ]).lower()
+    return any(term in haystack for term in TEXT_RISK_TERMS)
+
+
+def _zero_text_prompt(scene: dict[str, Any]) -> str:
+    if _scene_has_text_risk(scene):
+        return (
+            ZERO_TEXT_PIXEL_RULE
+            + " Text-risk scene rule: any map, parchment, tablet, wall, "
+              "shield, banner or document must be visually blank and "
+              "unmarked. Show shape, material and context only."
+        )
+    return ZERO_TEXT_PIXEL_RULE
+
+
+def _model_order_for_scene(scene: dict[str, Any]) -> list[str]:
+    # In the supplied production log, Schnell often corrected captions and
+    # fake labels produced by the first model. Use it first on text-risk scenes.
+    if _scene_has_text_risk(scene):
+        preferred = [
+            "@cf/black-forest-labs/flux-1-schnell",
+            "@cf/black-forest-labs/flux-2-klein-4b",
+        ]
+    else:
+        preferred = [
+            "@cf/black-forest-labs/flux-2-klein-4b",
+            "@cf/black-forest-labs/flux-1-schnell",
+        ]
+    return list(dict.fromkeys([
+        *preferred,
+        *cloudflare_model_chain(),
+    ]))[:2]
+
+
 def combined_prompt(payload: dict[str, Any], scene: dict[str, Any]) -> str:
     world = _world_bible_text(payload)
     must_show = scene.get("must_show", [])
@@ -2238,6 +2309,7 @@ def combined_prompt(payload: dict[str, Any], scene: dict[str, Any]) -> str:
         430,
     )
     return _fit_prompt([
+        _zero_text_prompt(scene),
         str(scene.get("image_prompt", "")),
         f"Exact narration being illustrated: {narration}",
         "Mandatory visible elements: "
@@ -2251,13 +2323,19 @@ def combined_prompt(payload: dict[str, Any], scene: dict[str, Any]) -> str:
         f"Visual identity: {payload.get('visual_identity', '')}",
         "Photorealistic premium historical documentary, one coherent 16:9 film "
         "frame, no text, no collage.",
+        "FINAL CHECK: zero letters, zero numbers, zero fake language, zero "
+        "glyph-like marks anywhere in the pixels.",
     ])
 
 
 def combined_negative(scene: dict[str, Any]) -> str:
     extra = str(scene.get("negative_prompt", "")).strip()
     return _compact_text(
-        f"{GLOBAL_NEGATIVE}, {extra}" if extra else GLOBAL_NEGATIVE,
+        (
+            f"{GLOBAL_NEGATIVE}, {ZERO_TEXT_NEGATIVE}, {extra}"
+            if extra
+            else f"{GLOBAL_NEGATIVE}, {ZERO_TEXT_NEGATIVE}"
+        ),
         MAX_NEGATIVE_PROMPT_CHARS,
     )
 
@@ -2967,11 +3045,7 @@ def generate_scene_image(
 ) -> dict[str, Any]:
     del client
 
-    selected_models = list(dict.fromkeys([
-        "@cf/black-forest-labs/flux-2-klein-4b",
-        "@cf/black-forest-labs/flux-1-schnell",
-        *cloudflare_model_chain(),
-    ]))[:2]
+    selected_models = _model_order_for_scene(scene)
 
     last_error: Exception | None = None
 
@@ -2986,13 +3060,27 @@ def generate_scene_image(
                 f"FAST VISUAL: scene={scene['scene_id']}, "
                 f"model={model}, attempt={attempt}/{len(selected_models)}"
             )
+            candidate = target.with_name(
+                target.stem + f"-candidate-{attempt}.jpg"
+            )
+            candidate.unlink(missing_ok=True)
             cloudflare_image_request(
                 combined_prompt(payload, scene),
                 combined_negative(scene),
                 seed,
-                target,
+                candidate,
                 model,
             )
+            valid, reason = _validate_generated_frame(candidate)
+            if not valid:
+                raise RuntimeError(reason)
+
+            sanitizer_info = sanitize_external_generated_image(
+                candidate,
+                target,
+            )
+            candidate.unlink(missing_ok=True)
+
             valid, reason = _validate_generated_frame(target)
             if not valid:
                 raise RuntimeError(reason)
@@ -3005,11 +3093,18 @@ def generate_scene_image(
                 "review": "Cümleye kilitli prompt kullanıldı. " + reason,
                 "fast_visual_mode": True,
                 "separate_gemini_image_review": False,
+                "zero_text_prompt": True,
+                "text_risk_scene": _scene_has_text_risk(scene),
+                "text_sanitizer": sanitizer_info,
                 "file": target.name,
             }
         except Exception as exc:
             last_error = exc
             target.unlink(missing_ok=True)
+            for leftover in target.parent.glob(
+                target.stem + "-candidate-*.jpg"
+            ):
+                leftover.unlink(missing_ok=True)
             print(
                 f"FAST VISUAL external attempt failed: "
                 f"scene={scene['scene_id']}, model={model}: {exc}"
@@ -3134,6 +3229,103 @@ def video_font(size: int, bold: bool = False):
         if Path(candidate).exists():
             return ImageFont.truetype(candidate, size=size)
     return ImageFont.load_default()
+
+
+def _edge_density_rows(image: Image.Image) -> list[float]:
+    gray = ImageOps.grayscale(image)
+    width = 640
+    height = max(1, round(gray.height * width / max(1, gray.width)))
+    gray = gray.resize((width, height), Image.Resampling.BILINEAR)
+    edges = ImageOps.autocontrast(gray.filter(ImageFilter.FIND_EDGES))
+    pixels = edges.load()
+    densities: list[float] = []
+    for y in range(height):
+        count = 0
+        for x in range(width):
+            if pixels[x, y] >= 105:
+                count += 1
+        densities.append(count / width)
+    return densities
+
+
+def _caption_risk_score(
+    image: Image.Image,
+    top_ratio: float,
+    bottom_ratio: float,
+) -> float:
+    top = max(0, min(image.height - 1, round(image.height * top_ratio)))
+    bottom = max(top + 1, min(image.height, round(image.height * bottom_ratio)))
+    band = image.crop((0, top, image.width, bottom))
+    rows = _edge_density_rows(band)
+    if not rows:
+        return 0.0
+
+    # Captions and fake labels create several thin, high-frequency horizontal
+    # rows. Natural horizons are usually one or two broad structures.
+    strong_rows = sum(density >= 0.115 for density in rows)
+    very_strong_rows = sum(density >= 0.185 for density in rows)
+    return (
+        strong_rows / len(rows)
+        + 1.7 * very_strong_rows / len(rows)
+    )
+
+
+def sanitize_external_generated_image(
+    source: Path,
+    target: Path,
+) -> dict[str, Any]:
+    """
+    Remove the regions where image models most often place fake captions.
+    This is applied only to external AI images, never to intentional local
+    Turkish editorial cards.
+    """
+    with Image.open(source) as raw:
+        image = ImageOps.exif_transpose(raw).convert("RGB")
+
+    top_score = _caption_risk_score(image, 0.00, 0.18)
+    bottom_score = _caption_risk_score(image, 0.72, 1.00)
+
+    # A small safety crop is always used because fake captions are commonly
+    # attached directly to the outer frame. Expand it only when the band looks
+    # text-like.
+    crop_left = round(image.width * 0.018)
+    crop_right = round(image.width * 0.982)
+    crop_top_ratio = 0.075 if top_score >= 0.20 else 0.028
+    crop_bottom_ratio = 0.80 if bottom_score >= 0.20 else 0.885
+
+    crop_top = round(image.height * crop_top_ratio)
+    crop_bottom = round(image.height * crop_bottom_ratio)
+    if crop_bottom <= crop_top + 100:
+        crop_top = round(image.height * 0.028)
+        crop_bottom = round(image.height * 0.885)
+
+    cleaned = image.crop(
+        (crop_left, crop_top, crop_right, crop_bottom)
+    )
+    cleaned = ImageOps.fit(
+        cleaned,
+        image.size,
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.48),
+    )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    cleaned.save(target, "JPEG", quality=95, optimize=True)
+
+    info = {
+        "top_text_risk_score": round(top_score, 4),
+        "bottom_text_risk_score": round(bottom_score, 4),
+        "crop_top_percent": round(crop_top_ratio * 100, 2),
+        "crop_bottom_removed_percent": round((1.0 - crop_bottom_ratio) * 100, 2),
+    }
+    print(
+        "ZERO-TEXT SANITIZER: "
+        f"top={info['top_text_risk_score']}, "
+        f"bottom={info['bottom_text_risk_score']}, "
+        f"crop_top={info['crop_top_percent']}%, "
+        f"crop_bottom={info['crop_bottom_removed_percent']}%"
+    )
+    return info
 
 
 def clean_video_frame(source: Path, target: Path) -> None:
@@ -4694,7 +4886,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V9-2.txt").write_text(
+    (OUTPUT / "HATA-V9-3.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -4779,9 +4971,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V9.2 — FAST FINAL SAFE ACTIVE")
+    print("UYKU VE TARİH V9.3 — ZERO TEXT FRAMES ACTIVE")
     print("Konu:", topic)
-    print("FAST FINAL SAFE: prompt-locked images → fast render → non-fatal sidecars")
+    print("ZERO TEXT FRAMES: no glyphs → safe crop → fast render")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -4955,7 +5147,7 @@ def main() -> None:
         )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v9-2-fast-final-safe.mp4"
+    video = OUTPUT / "uyku-tarih-v9-3-zero-text-frames.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -5028,6 +5220,11 @@ def main() -> None:
             "thumbnail_extra_api_request": False,
             "render_preset": "veryfast-stillimage",
             "render_fps": 24,
+            "zero_text_pixel_rule": True,
+            "pseudo_alphabet_forbidden": True,
+            "external_caption_band_sanitizer": True,
+            "text_risk_model_routing": True,
+            "intentional_local_turkish_cards_preserved": True,
                 "finite_audio_padding": True,
                 "zero_pause_direct_copy": True,
                 "ffmpeg_timeout_seconds": 900,
@@ -5105,8 +5302,8 @@ def main() -> None:
 
         (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
             (
-                "V9.2 Fast Final Safe yalnızca konu girdisiyle üretildi.\n\n"
-                "Önce uyku-tarih-v9-2-fast-final-safe.mp4 dosyasını izle.\n"
+                "V9.3 Zero Text Frames yalnızca konu girdisiyle üretildi.\n\n"
+                "Önce uyku-tarih-v9-3-zero-text-frames.mp4 dosyasını izle.\n"
                 "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
                 "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
                 "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -5130,7 +5327,7 @@ def main() -> None:
             pass
 
     print("=" * 72)
-    print("V9.2 FAST FINAL SAFE TAMAMLANDI")
+    print("V9.3 ZERO TEXT FRAMES TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
