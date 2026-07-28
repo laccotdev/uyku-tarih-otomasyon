@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 24
-USER_AGENT = "UykuTarihTopicToVideo/9.4"
+USER_AGENT = "UykuTarihTopicToVideo/9.5"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Charon"
 
@@ -3090,6 +3090,124 @@ def _validate_generated_frame(path: Path) -> tuple[bool, str]:
     return True, "Yerel dosya ve çözünürlük kontrolü başarılı."
 
 
+class RealVisualsUnavailable(RuntimeError):
+    """Raised when a real external historical image cannot be produced."""
+
+
+def _is_cloudflare_daily_quota_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "used up your daily free allocation",
+            "10,000 neurons",
+            "account limited",
+            "workers paid plan",
+            "daily free allocation",
+        )
+    )
+
+
+def _write_visual_stop_report(
+    *,
+    topic: str,
+    reason: str,
+    completed_images: int = 0,
+    filename: str = "GORSEL_URETIMI_DURDU.txt",
+) -> Path:
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    target = OUTPUT / filename
+    target.write_text(
+        (
+            "UYKU VE TARİH — GERÇEK GÖRSEL KORUMASI\n\n"
+            f"Konu: {topic}\n"
+            f"Tamamlanan gerçek görsel: {completed_images}\n\n"
+            "Video oluşturulmadı. Yerel bilgi kartları veya sahte görsel "
+            "kullanılmadı.\n\n"
+            f"Neden:\n{reason}\n\n"
+            "Cloudflare ücretsiz görsel kotası doluysa kota 00:00 UTC'de "
+            "yenilenir. Türkiye saatiyle bu 03:00'tür.\n"
+            "Ücretli plana geçiş otomatik yapılmaz.\n"
+        ),
+        encoding="utf-8",
+    )
+    return target
+
+
+def cloudflare_visual_preflight(topic: str) -> bool:
+    """
+    Run one real image request before story, TTS and the long render.
+
+    If the daily free allocation is exhausted, finish the workflow normally
+    with a clear text artifact instead of spending 20–25 minutes and producing
+    fake editorial cards.
+    """
+    probe = WORK / "cloudflare-visual-preflight.jpg"
+    probe.unlink(missing_ok=True)
+
+    prompt = (
+        "Photorealistic premium historical documentary still, ancient stone "
+        "harbor at dawn, one wooden ship, clear subject, rich realistic color, "
+        "crisp details, no text, no letters, no numbers, no signs, 16:9."
+    )
+    negative = (
+        "text, letters, numbers, caption, watermark, logo, fake writing, "
+        "modern objects, fantasy, blur, low detail"
+    )
+
+    print("CLOUDFLARE VISUAL PREFLIGHT: gerçek görsel kotası kontrol ediliyor.")
+    try:
+        cloudflare_image_request(
+            prompt,
+            negative,
+            deterministic_seed(topic, 0, 1),
+            probe,
+            "@cf/black-forest-labs/flux-1-schnell",
+        )
+        valid, reason = _validate_generated_frame(probe)
+        if not valid:
+            raise RealVisualsUnavailable(
+                f"Cloudflare ön test görseli geçersiz: {reason}"
+            )
+        probe.unlink(missing_ok=True)
+        print("CLOUDFLARE VISUAL PREFLIGHT OK: gerçek görsel üretimi hazır.")
+        return True
+    except Exception as exc:
+        probe.unlink(missing_ok=True)
+
+        if _is_cloudflare_daily_quota_error(exc):
+            report = _write_visual_stop_report(
+                topic=topic,
+                reason=(
+                    "Cloudflare Workers AI günlük ücretsiz 10.000 neuron "
+                    f"kotası dolmuş.\n\nTeknik hata:\n{exc}"
+                ),
+                filename="GORSEL_KOTASI_DOLU.txt",
+            )
+            print(
+                "CLOUDFLARE FREE QUOTA EXHAUSTED — "
+                "uzun üretim başlatılmadı."
+            )
+            print("Bilgi dosyası:", report)
+            return False
+
+        report = _write_visual_stop_report(
+            topic=topic,
+            reason=(
+                "Cloudflare gerçek görsel ön testi başarısız oldu. "
+                "API anahtarı, hesap yetkisi, model erişimi veya geçici servis "
+                f"sorunu olabilir.\n\nTeknik hata:\n{exc}"
+            ),
+            filename="GORSEL_SERVISI_HAZIR_DEGIL.txt",
+        )
+        print(
+            "CLOUDFLARE VISUAL PREFLIGHT FAILED — "
+            "uzun üretim başlatılmadı."
+        )
+        print("Bilgi dosyası:", report)
+        return False
+
+
 def generate_scene_image(
     client: genai.Client,
     topic: str,
@@ -3172,21 +3290,16 @@ def generate_scene_image(
                 break
 
     detail = str(last_error or "External image generation unavailable.")
-    make_local_visual_bridge(topic, scene, target, detail)
-    return {
-        "scene_id": scene["scene_id"],
-        "model": "local-editorial-bridge",
-        "seed": 0,
-        "review_score": 0,
-        "review": (
-            "Dış görsel üretimi tamamlanamadı; "
-            "sahneye özel editoryal köprü kullanıldı. " + detail
-        ),
-        "quality_fallback": True,
-        "local_visual_bridge": True,
-        "fast_visual_mode": True,
-        "file": target.name,
-    }
+    if last_error is not None and _is_cloudflare_daily_quota_error(last_error):
+        raise RealVisualsUnavailable(
+            "Cloudflare günlük ücretsiz görsel kotası üretim sırasında doldu. "
+            + detail
+        )
+
+    raise RealVisualsUnavailable(
+        f"Sahne {scene['scene_id']} için iki gerçek görsel modeli de "
+        f"başarısız oldu. Yerel kart kullanılmadı. {detail}"
+    )
 
 
 def generate_thumbnail_candidates(
@@ -4954,7 +5067,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V9-4.txt").write_text(
+    (OUTPUT / "HATA-V9-5.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -5039,10 +5152,17 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V9.4 — STORY LOCKED RICH FRAMES ACTIVE")
+    print("UYKU VE TARİH V9.5 — QUOTA PREFLIGHT REAL IMAGES ACTIVE")
     print("Konu:", topic)
-    print("STORY LOCKED RICH FRAMES: exact narrated beat → richer grade → safe final")
+    print("QUOTA PREFLIGHT: real images required → no fake-card video")
     print("=" * 72)
+
+    if not cloudflare_visual_preflight(topic):
+        print(
+            "V9.5 EARLY SAFE EXIT: video üretilmedi; "
+            "20–25 dakikalık işlem ve sahte kartlar engellendi."
+        )
+        return
 
     payload, text_model = build_video_package(
         client, topic, int(story_seconds), scene_count
@@ -5142,24 +5262,40 @@ def main() -> None:
         raw = raw_dir / f"scene_{scene_id:02d}.jpg"
         try:
             info = generate_scene_image(
-                client, topic, payload, scene, raw
+                client,
+                topic,
+                payload,
+                scene,
+                raw,
             )
-        except Exception as exc:
+        except RealVisualsUnavailable as exc:
+            report = _write_visual_stop_report(
+                topic=topic,
+                reason=str(exc),
+                completed_images=len(frames),
+                filename="GERCEK_GORSEL_URETIMI_YARIDA_DURDU.txt",
+            )
             print(
-                f"EMERGENCY VISUAL FALLBACK: scene={scene_id}; error={exc}"
+                "REAL-IMAGE SAFE EXIT: yerel kart kullanılmadı; "
+                f"video oluşturulmadı. Rapor: {report}"
             )
-            make_local_visual_bridge(topic, scene, raw, str(exc))
-            info = {
-                "scene_id": scene_id,
-                "model": "local-emergency-bridge",
-                "seed": 0,
-                "review_score": 0,
-                "review": str(exc),
-                "quality_fallback": True,
-                "local_visual_bridge": True,
-                "emergency_fallback": True,
-                "file": raw.name,
-            }
+            return
+        except Exception as exc:
+            report = _write_visual_stop_report(
+                topic=topic,
+                reason=(
+                    "Beklenmeyen gerçek görsel hatası oluştu. "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                completed_images=len(frames),
+                filename="GERCEK_GORSEL_BEKLENMEYEN_HATA.txt",
+            )
+            print(
+                "REAL-IMAGE SAFE EXIT: beklenmeyen hata kontrollü şekilde "
+                f"durduruldu. Rapor: {report}"
+            )
+            return
+
         frame = frame_dir / f"frame_{scene_id:02d}.jpg"
         clean_video_frame(raw, frame)
         frames.append(frame)
@@ -5215,7 +5351,7 @@ def main() -> None:
         )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v9-4-story-locked-rich-frames.mp4"
+    video = OUTPUT / "uyku-tarih-v9-5-real-images.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -5298,6 +5434,11 @@ def main() -> None:
             "sync_keyword_checklist_in_prompt": True,
             "richer_frame_grade": True,
             "less_destructive_text_crop": True,
+            "cloudflare_quota_preflight_before_story": True,
+            "real_images_required": True,
+            "local_visual_cards_in_final": False,
+            "quota_failure_is_early_green_exit": True,
+            "no_tts_when_visual_quota_empty": True,
                 "finite_audio_padding": True,
                 "zero_pause_direct_copy": True,
                 "ffmpeg_timeout_seconds": 900,
@@ -5375,8 +5516,8 @@ def main() -> None:
 
         (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
             (
-                "V9.4 Story Locked Rich Frames yalnızca konu girdisiyle üretildi.\n\n"
-                "Önce uyku-tarih-v9-4-story-locked-rich-frames.mp4 dosyasını izle.\n"
+                "V9.5 Quota Preflight Real Images yalnızca konu girdisiyle üretildi.\n\n"
+                "Önce uyku-tarih-v9-5-real-images.mp4 dosyasını izle.\n"
                 "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
                 "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
                 "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -5400,7 +5541,7 @@ def main() -> None:
             pass
 
     print("=" * 72)
-    print("V9.4 STORY LOCKED RICH FRAMES TAMAMLANDI")
+    print("V9.5 QUOTA PREFLIGHT REAL IMAGES TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
