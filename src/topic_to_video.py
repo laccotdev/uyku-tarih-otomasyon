@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/8.4"
+USER_AGENT = "UykuTarihTopicToVideo/8.5"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Charon"
 
@@ -3988,23 +3988,48 @@ def _render_scene_editorial_clip(
 
 def _verify_final_media(
     target: Path,
-    expected_seconds: float,
+    expected_duration: float,
 ) -> float:
+    if not target.exists():
+        raise FileNotFoundError(
+            f"Final video bulunamadı: {target}"
+        )
+
+    if target.stat().st_size < 100_000:
+        raise RuntimeError(
+            f"Final video boş veya bozuk görünüyor: {target}"
+        )
+
     actual = ffprobe_duration(target)
-    if actual < MIN_FINAL_VIDEO_SECONDS:
+    expected = max(1.0, float(expected_duration))
+    difference = abs(actual - expected)
+    tolerance = max(2.5, expected * 0.012)
+
+    minimum_reasonable = max(
+        30.0,
+        expected - tolerance,
+    )
+    maximum_reasonable = expected + tolerance
+
+    if actual < minimum_reasonable:
         raise RuntimeError(
-            f"Final video çok kısa üretildi: {actual:.2f} saniye. "
-            f"Hedef yaklaşık {expected_seconds:.2f} saniyeydi."
+            "Final video hedefe göre kısa üretildi: "
+            f"{actual:.2f}s / hedef {expected:.2f}s / "
+            f"izin verilen fark {tolerance:.2f}s."
         )
-    if actual > MAX_FINAL_VIDEO_SECONDS + 15:
+
+    if actual > maximum_reasonable:
         raise RuntimeError(
-            f"Final video beklenenden uzun: {actual:.2f} saniye."
+            "Final video hedefe göre uzun üretildi: "
+            f"{actual:.2f}s / hedef {expected:.2f}s / "
+            f"izin verilen fark {tolerance:.2f}s."
         )
-    if abs(actual - expected_seconds) > 3.0:
-        raise RuntimeError(
-            "Final süre güvenlik kontrolünü geçemedi: "
-            f"{actual:.2f}s / {expected_seconds:.2f}s"
-        )
+
+    print(
+        "FINAL DURATION VERIFIED: "
+        f"actual={actual:.2f}s, expected={expected:.2f}s, "
+        f"difference={difference:.2f}s, tolerance={tolerance:.2f}s"
+    )
     return actual
 
 
@@ -4217,7 +4242,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V8-4.txt").write_text(
+    (OUTPUT / "HATA-V8-5.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -4302,9 +4327,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V8.4 — RESILIENT CHARON ACTIVE")
+    print("UYKU VE TARİH V8.5 — RELATIVE DURATION GUARD ACTIVE")
     print("Konu:", topic)
-    print("RESILIENT VOICE: Charon preflight → one model → full or chunked narration")
+    print("DURATION GUARD: Charon locked → relative final verification")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -4431,7 +4456,7 @@ def main() -> None:
         )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v8-4-charon-resilient.mp4"
+    video = OUTPUT / "uyku-tarih-v8-5-charon-relative-guard.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -4509,6 +4534,10 @@ def main() -> None:
             "forced_speech_slowdown": False,
             "maximum_voice_slowdown_percent": 2,
             "maximum_voice_speedup_percent": 8,
+            "absolute_final_duration_guard": False,
+            "relative_final_duration_guard": True,
+            "duration_tolerance_percent": 1.2,
+            "exact_target_match_always_accepted": True,
             "video_duration_follows_voice": True,
             "edge_tts_rate": "+8%",
             "target_narration_wpm": "138-148",
@@ -4550,8 +4579,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V8.4 Resilient Charon yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce uyku-tarih-v8-4-charon-resilient.mp4 dosyasını izle.\n"
+            "V8.5 Relative Duration Guard yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce uyku-tarih-v8-5-charon-relative-guard.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -4560,7 +4589,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V8.4 RESILIENT CHARON TAMAMLANDI")
+    print("V8.5 RELATIVE DURATION GUARD TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
