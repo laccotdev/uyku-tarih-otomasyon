@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/8.5"
+USER_AGENT = "UykuTarihTopicToVideo/9.0"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Charon"
 
@@ -76,11 +76,12 @@ TTS_MODELS = [
 # Keep a safety margin because fallback models receive exclusions in the same field.
 MAX_IMAGE_PROMPT_CHARS = 1320
 MAX_NEGATIVE_PROMPT_CHARS = 360
-INTRO_VISIBLE_SECONDS = 8.0
+INTRO_VISIBLE_SECONDS = 5.0
 INTRO_TRANSITION_SECONDS = 0.70
 SCENE_PAUSE_SECONDS = 0.18
 DEFAULT_TARGET_SECONDS = 300
 DEFAULT_SCENE_COUNT = 12
+DEFAULT_VISUAL_BEAT_COUNT = 20
 CHAPTER_COUNT = 3
 MIN_FINAL_VIDEO_SECONDS = 260
 MAX_FINAL_VIDEO_SECONDS = 330
@@ -2208,11 +2209,26 @@ def _fit_prompt(parts: list[str], limit: int = MAX_IMAGE_PROMPT_CHARS) -> str:
 
 def combined_prompt(payload: dict[str, Any], scene: dict[str, Any]) -> str:
     world = _world_bible_text(payload)
+    must_show = scene.get("must_show", [])
+    must_not_show = scene.get("must_not_show", [])
+    narration = _compact_text(
+        str(scene.get("narration_text", "")),
+        430,
+    )
     return _fit_prompt([
         str(scene.get("image_prompt", "")),
+        f"Exact narration being illustrated: {narration}",
+        "Mandatory visible elements: "
+        + _compact_text(json.dumps(must_show, ensure_ascii=False), 260),
+        "Do not show these contradictions: "
+        + _compact_text(json.dumps(must_not_show, ensure_ascii=False), 220),
+        "Literal synchronization rule: depict the concrete subject and action "
+        "named in this narration beat. Never replace it with a generic camp, "
+        "generic landscape or symbolic atmosphere.",
         f"Strict historical continuity: {world}",
         f"Visual identity: {payload.get('visual_identity', '')}",
-        "Photorealistic premium late-night historical documentary, cohesive film still, plausible period architecture and materials, blue-black moonlit shadows, restrained amber firelight, 16:9, no text or collage.",
+        "Photorealistic premium historical documentary, one coherent 16:9 film "
+        "frame, no text, no collage.",
     ])
 
 
@@ -2451,30 +2467,47 @@ Yalnızca JSON üret:
 {{
   "pass": true,
   "score": 0,
+  "semantic_match": true,
   "reason": "Kısa açıklama"
 }}
 
-Bu yapay zekâ görselini aşağıdaki sahne amacıyla karşılaştır:
-SAHNE AMACI: {scene['visual_goal']}
-ANLATILAN FİKİR: {scene['narration_idea']}
+Bu görseli anlatımla birebir eşleşme açısından değerlendir.
+
+ANLATILAN METİN:
+{scene.get('narration_text', '')}
+
+GÖRSEL HEDEF:
+{scene.get('visual_goal', '')}
+
+EKRANDA KESİNLİKLE GÖRÜNMESİ GEREKENLER:
+{json.dumps(scene.get('must_show', []), ensure_ascii=False)}
+
+GÖRÜNMEMESİ GEREKEN ÇELİŞKİLER:
+{json.dumps(scene.get('must_not_show', []), ensure_ascii=False)}
 
 Kriterler:
-- Sahne amacını açıkça gösteriyor mu?
+- Görsel, anlatıcının bu parçada söz ettiği ana kişi, yer, nesne veya eylemi
+  açıkça ve doğrudan gösteriyor mu?
+- Başka bir beat'in olayını ya da yalnızca genel bir tarih atmosferini mi gösteriyor?
+- Zorunlu unsurlar görünür mü, çelişen unsurlar var mı?
 - Modern, fantastik veya dönem dışı unsur var mı?
-- Görselde yazı, sayı, logo, filigran veya çerçeve var mı?
-- Belirgin anatomi bozukluğu veya yapay katalog görünümü var mı?
+- Yazı, sayı, logo, filigran, kolaj veya belirgin anatomi bozukluğu var mı?
 - Premium tarih belgeseli karesi gibi görünüyor mu?
 
-score 0-100 olsun. pass yalnızca score 64 veya üzerindeyse true olsun.
+semantic_match yalnızca anlatılan ana olay gerçekten görünüyorsa true olsun.
+score 0-100 olsun. pass yalnızca semantic_match=true ve score en az 68 ise true.
 """
     part = types.Part.from_bytes(data=data, mime_type="image/jpeg")
     try:
         payload, _ = generate_json_with_parts(client, prompt, part)
         score = int(payload.get("score", 0))
-        passed = bool(payload.get("pass")) and score >= 64
-        return passed, score, str(payload.get("reason", ""))
+        semantic_match = bool(payload.get("semantic_match"))
+        passed = bool(payload.get("pass")) and semantic_match and score >= 68
+        reason = str(payload.get("reason", ""))
+        if not semantic_match:
+            reason = "SEMANTIC_MISMATCH: " + reason
+        return passed, score, reason
     except Exception as exc:
-        # Görsel değerlendirme servisi geçici olarak çalışmazsa üretimi durdurma.
         print("Görsel kalite değerlendirmesi atlandı:", exc)
         return True, 70, "Otomatik inceleme geçici olarak atlandı."
 
@@ -2528,6 +2561,12 @@ def _fatal_candidate_reason(reason: str, score: int) -> bool:
         "watermark",
         "ağır anatomi",
         "severe anatomy",
+        "semantic_mismatch",
+        "sahne amacını yansıtmıyor",
+        "anlatılan ana olay görünmüyor",
+        "zorunlu unsur görünmüyor",
+        "başka bir beat",
+        "unrelated",
     )
     return score < 28 or any(marker in normalized for marker in fatal_markers)
 
@@ -2704,8 +2743,9 @@ def generate_scene_image(
     )
     preferred_models = list(dict.fromkeys([
         "@cf/black-forest-labs/flux-2-klein-4b",
+        "@cf/black-forest-labs/flux-1-schnell",
         *models,
-    ]))[:1]
+    ]))[:2]
 
     for repair_attempt, model in enumerate(preferred_models, start=1):
         seed = deterministic_seed(
@@ -2762,7 +2802,7 @@ def generate_scene_image(
     # Do not throw away the entire video for a usable but imperfect image.
     if (
         best_file.exists()
-        and best_score >= 40
+        and best_score >= 55
         and not _fatal_candidate_reason(best_reason, best_score)
     ):
         shutil.copyfile(best_file, target)
@@ -3233,6 +3273,405 @@ def allocate_scene_durations(
 
     scale = total_duration / max(0.001, sum(durations))
     return [max(0.5, item * scale) for item in durations]
+
+
+def _sentence_units(narration: str) -> list[str]:
+    clean = re.sub(r"\s+", " ", str(narration)).strip()
+    sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?])\s+", clean)
+        if item.strip()
+    ]
+    return sentences or ([clean] if clean else [])
+
+
+def _split_narration_into_visual_beats(
+    narration: str,
+    beat_count: int,
+) -> list[str]:
+    sentences = _sentence_units(narration)
+    if not sentences:
+        return []
+
+    beat_count = max(1, min(int(beat_count), max(1, len(sentences) * 2)))
+    total_words = max(1, sum(_word_count(item) for item in sentences))
+    target_words = total_words / beat_count
+
+    beats: list[str] = []
+    current: list[str] = []
+    current_words = 0
+
+    for sentence_index, sentence in enumerate(sentences):
+        words = _word_count(sentence)
+        remaining_beats = beat_count - len(beats)
+        if (
+            current
+            and current_words + words > target_words * 1.18
+            and remaining_beats > 1
+        ):
+            beats.append(" ".join(current).strip())
+            current = []
+            current_words = 0
+        current.append(sentence)
+        current_words += words
+
+    if current:
+        beats.append(" ".join(current).strip())
+
+    # When the narration has long sentences, split only at commas/semicolons;
+    # never split at arbitrary word positions unless absolutely necessary.
+    while len(beats) < beat_count:
+        index = max(range(len(beats)), key=lambda i: _word_count(beats[i]))
+        candidate = beats[index]
+        clauses = [
+            item.strip()
+            for item in re.split(r"(?<=[,;:])\s+", candidate)
+            if item.strip()
+        ]
+        if len(clauses) >= 2:
+            midpoint = max(1, len(clauses) // 2)
+            left = " ".join(clauses[:midpoint]).strip()
+            right = " ".join(clauses[midpoint:]).strip()
+        else:
+            words = candidate.split()
+            if len(words) < 18:
+                break
+            midpoint = len(words) // 2
+            left = " ".join(words[:midpoint]).strip()
+            right = " ".join(words[midpoint:]).strip()
+        beats[index:index + 1] = [left, right]
+
+    while len(beats) > beat_count:
+        # Merge the smallest adjacent pair to preserve story order.
+        pair_index = min(
+            range(len(beats) - 1),
+            key=lambda i: _word_count(beats[i]) + _word_count(beats[i + 1]),
+        )
+        beats[pair_index:pair_index + 2] = [
+            f"{beats[pair_index]} {beats[pair_index + 1]}".strip()
+        ]
+
+    return [beat for beat in beats if beat]
+
+
+def _local_visual_beat(
+    topic: str,
+    payload: dict[str, Any],
+    beat_id: int,
+    beat_count: int,
+    narration_text: str,
+) -> dict[str, Any]:
+    chapter_index = min(
+        CHAPTER_COUNT,
+        1 + (beat_id - 1) * CHAPTER_COUNT // max(1, beat_count),
+    )
+    chapter_title = CHAPTER_BEATS[chapter_index - 1][0]
+    excerpt = textwrap.shorten(
+        narration_text,
+        width=210,
+        placeholder="…",
+    )
+    return {
+        "scene_id": beat_id,
+        "visual_beat_id": beat_id,
+        "chapter_index": chapter_index,
+        "chapter_title": chapter_title,
+        "beat_type": "literal_story_beat",
+        "narration_text": narration_text,
+        "narration_idea": excerpt,
+        "visual_goal": f"Anlatılan olayı doğrudan göster: {excerpt}",
+        "must_show": [excerpt],
+        "must_not_show": [
+            "unrelated generic camp",
+            "symbolic substitute instead of the named event",
+            "wrong location or period",
+        ],
+        "image_prompt": (
+            f"Photorealistic historical documentary frame directly depicting "
+            f"this exact narration beat: {narration_text}. "
+            f"Topic context: {topic}. Show the concrete people, action, place, "
+            f"object or consequence named in the narration, not a generic "
+            f"historical atmosphere. One single coherent 16:9 scene."
+        ),
+        "negative_prompt": (
+            "unrelated scene, generic army camp when another event is named, "
+            "symbolic metaphor, wrong action, wrong location, wrong century, "
+            "split screen, collage, text, logo"
+        ),
+        "transition": "cut",
+        "transition_duration": 0.20,
+        "ambient_profile": "exterior_wind",
+        "importance": "normal",
+        "continuity_bridge": "Exact next passage of the same narration.",
+        "sync_keywords": [],
+    }
+
+
+def build_sentence_visual_plan(
+    client: genai.Client,
+    topic: str,
+    payload: dict[str, Any],
+    beat_count: int,
+) -> tuple[list[dict[str, Any]], str]:
+    narration = re.sub(
+        r"\s+", " ", str(payload.get("narration", ""))
+    ).strip()
+    chunks = _split_narration_into_visual_beats(
+        narration,
+        beat_count,
+    )
+    if not chunks:
+        raise RuntimeError("Görsel senkron planı için anlatım bulunamadı.")
+
+    beats = [
+        _local_visual_beat(
+            topic,
+            payload,
+            index,
+            len(chunks),
+            chunk,
+        )
+        for index, chunk in enumerate(chunks, start=1)
+    ]
+
+    compact_input = [
+        {
+            "beat_id": beat["visual_beat_id"],
+            "narration_text": beat["narration_text"],
+        }
+        for beat in beats
+    ]
+
+    prompt = f"""
+Yalnızca geçerli JSON üret:
+{{
+  "beats": [
+    {{
+      "beat_id": 1,
+      "visual_goal": "Türkçe ve somut görsel hedef",
+      "must_show": ["Ekranda kesin bulunması gereken somut unsurlar"],
+      "must_not_show": ["Bu anlatım parçasıyla çelişen unsurlar"],
+      "sync_keywords": ["Anlatımdaki kişi, yer, nesne ve eylemler"],
+      "image_prompt": "Ayrıntılı İngilizce 16:9 görsel promptu",
+      "negative_prompt": "İngilizce sahneye özgü negatif prompt",
+      "ambient_profile": "exterior_wind"
+    }}
+  ]
+}}
+
+KONU:
+{topic}
+
+TARİHSEL DÜNYA:
+{_world_bible_text(payload)}
+
+GÖRSEL KİMLİK:
+{payload.get('visual_identity', '')}
+
+SABİT ANLATIM PARÇALARI:
+{json.dumps(compact_input, ensure_ascii=False)}
+
+KURALLAR:
+- Tam {len(beats)} beat üret ve beat_id değerlerini değiştirme.
+- narration_text alanını yeniden yazma veya özetleme.
+- Her görsel yalnızca kendi narration_text parçasında anlatılan ana olayı gösterir.
+- Anlatım bir kişi, yer, araç, savaş, karar veya sonuçtan söz ediyorsa o unsur
+  ekranda açıkça görünmelidir.
+- Soyut sembol, rastgele ordugâh veya yalnızca güzel atmosfer kullanma.
+- "Harita" deniyorsa harita; "fırtına" deniyorsa fırtına; "mağara" deniyorsa
+  mağara; "liman" deniyorsa liman görünmelidir.
+- Bir önceki ya da sonraki beat'in olayını bu görsele taşıma.
+- Aynı kompozisyonu veya aynı ana görseli tekrar etme.
+- Her beat farklı kamera konumu değil, gerçekten farklı bir tarihsel an olsun.
+- image_prompt tek bir tutarlı sahne tarif etsin; kolaj ve split screen olmasın.
+- Dönem, coğrafya, kıyafet, mimari ve araçlar tarihsel bağlama uygun olsun.
+- ambient_profile yalnızca şu değerlerden biri olsun:
+  {sorted(ALLOWED_AMBIENT_PROFILES)}
+"""
+
+    model_name = "local-literal-visual-plan"
+    try:
+        result, model_name = generate_json(
+            client,
+            prompt,
+            max_tokens=12000,
+        )
+        returned = result.get("beats", [])
+        if not isinstance(returned, list):
+            raise ValueError("beats alanı liste değil.")
+        by_id = {
+            int(item.get("beat_id")): item
+            for item in returned
+            if isinstance(item, dict)
+            and str(item.get("beat_id", "")).isdigit()
+        }
+        for beat in beats:
+            item = by_id.get(int(beat["visual_beat_id"]))
+            if not item:
+                continue
+            for key in (
+                "visual_goal", "must_show", "must_not_show",
+                "sync_keywords", "image_prompt", "negative_prompt",
+                "ambient_profile",
+            ):
+                value = item.get(key)
+                if value not in (None, "", [], {}):
+                    beat[key] = value
+    except Exception as exc:
+        print(
+            "Görsel senkron yönetmeni kullanılamadı; anlatım metnine bağlı "
+            f"yerel plan korunuyor: {exc}"
+        )
+        model_name = "local-literal-visual-plan"
+
+    for index, beat in enumerate(beats, start=1):
+        beat["scene_id"] = index
+        beat["visual_beat_id"] = index
+        profile = str(beat.get("ambient_profile", "exterior_wind"))
+        if profile not in ALLOWED_AMBIENT_PROFILES:
+            beat["ambient_profile"] = "exterior_wind"
+        beat["transition"] = "cut"
+        beat["transition_duration"] = 0.20
+
+    joined = " ".join(
+        str(beat.get("narration_text", "")).strip()
+        for beat in beats
+    )
+    if _word_count(joined) < _word_count(narration) * 0.97:
+        raise RuntimeError(
+            "Görsel beat planı anlatımın tamamını kapsamıyor."
+        )
+
+    return beats, model_name
+
+
+def _speech_weight(text: str) -> float:
+    words = max(1, _word_count(text))
+    comma_pauses = len(re.findall(r"[,;:]", text)) * 0.45
+    sentence_pauses = len(re.findall(r"[.!?]", text)) * 1.35
+    return words + comma_pauses + sentence_pauses
+
+
+def _silence_midpoints(audio: Path) -> list[float]:
+    command = [
+        "ffmpeg", "-hide_banner", "-nostats",
+        "-i", str(audio),
+        "-af", "silencedetect=noise=-38dB:d=0.16",
+        "-f", "null", "-",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            timeout=180,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        print("Sessizlik analizi kullanılamadı:", exc)
+        return []
+
+    starts: list[float] = []
+    points: list[float] = []
+    for line in (completed.stderr or "").splitlines():
+        start_match = re.search(r"silence_start:\s*([0-9.]+)", line)
+        if start_match:
+            starts.append(float(start_match.group(1)))
+            continue
+        end_match = re.search(r"silence_end:\s*([0-9.]+)", line)
+        if end_match and starts:
+            start = starts.pop(0)
+            end = float(end_match.group(1))
+            if end > start:
+                points.append((start + end) / 2.0)
+    return points
+
+
+def align_visual_beats_to_audio(
+    audio: Path,
+    beats: list[dict[str, Any]],
+) -> tuple[list[float], dict[str, Any]]:
+    duration = ffprobe_duration(audio)
+    if duration <= 0:
+        raise RuntimeError("Seslendirme süresi okunamadı.")
+    if not beats:
+        raise RuntimeError("Senkronlanacak görsel beat bulunamadı.")
+
+    weights = [
+        _speech_weight(str(beat.get("narration_text", "")))
+        for beat in beats
+    ]
+    total_weight = max(1.0, sum(weights))
+    expected_boundaries: list[float] = []
+    cumulative = 0.0
+    for weight in weights[:-1]:
+        cumulative += weight
+        expected_boundaries.append(duration * cumulative / total_weight)
+
+    candidates = [
+        point for point in _silence_midpoints(audio)
+        if 1.0 < point < duration - 1.0
+    ]
+
+    boundaries: list[float] = []
+    used: set[int] = set()
+    previous = 0.0
+    minimum_beat = max(5.0, min(9.0, duration / len(beats) * 0.48))
+
+    for index, expected in enumerate(expected_boundaries):
+        remaining = len(expected_boundaries) - index
+        latest = duration - remaining * minimum_beat
+        earliest = previous + minimum_beat
+        expected = max(earliest, min(latest, expected))
+
+        best_index = None
+        best_distance = 9999.0
+        for candidate_index, point in enumerate(candidates):
+            if candidate_index in used:
+                continue
+            if point < earliest or point > latest:
+                continue
+            distance = abs(point - expected)
+            if distance <= 4.2 and distance < best_distance:
+                best_index = candidate_index
+                best_distance = distance
+
+        if best_index is not None:
+            boundary = candidates[best_index]
+            used.add(best_index)
+            source = "silence"
+        else:
+            boundary = expected
+            source = "weighted"
+
+        boundary = max(earliest, min(latest, boundary))
+        boundaries.append(boundary)
+        previous = boundary
+
+    points = [0.0, *boundaries, duration]
+    durations = [
+        max(0.1, points[index + 1] - points[index])
+        for index in range(len(beats))
+    ]
+
+    # Float rounding guard: final sum must equal the actual audio duration.
+    durations[-1] += duration - sum(durations)
+
+    report = {
+        "audio_duration_seconds": round(duration, 3),
+        "beat_count": len(beats),
+        "silence_candidates": len(candidates),
+        "boundaries_seconds": [round(item, 3) for item in boundaries],
+        "durations_seconds": [round(item, 3) for item in durations],
+        "method": "silence-assisted weighted sentence alignment",
+        "minimum_beat_seconds": round(minimum_beat, 3),
+    }
+    print(
+        "VISUAL SYNC READY: "
+        f"{len(beats)} farklı görsel, {len(candidates)} sessizlik adayı, "
+        f"toplam {sum(durations):.2f}s"
+    )
+    return durations, report
 
 
 def scene_transition_plan(scenes: list[dict[str, Any]]) -> tuple[list[str], list[float]]:
@@ -3844,146 +4283,46 @@ def _chapter_label_frame(
     ).convert("RGB")
 
 
-def _scene_shot_frames(
+def _render_single_visual_beat_clip(
     frame: Path,
-    scene: dict[str, Any],
-    index: int,
-    target_dir: Path,
-    chapter_start: bool,
-) -> list[Path]:
-    with Image.open(frame) as raw:
-        base = ImageOps.exif_transpose(raw).convert("RGB")
-
-    wide = ImageOps.fit(
-        base,
-        (WIDTH, HEIGHT),
-        Image.Resampling.LANCZOS,
-        centering=(0.5, 0.5),
-    )
-    medium = ImageOps.fit(
-        base,
-        (WIDTH, HEIGHT),
-        Image.Resampling.LANCZOS,
-        centering=(0.40, 0.50) if index % 2 else (0.60, 0.50),
-    )
-    medium = ImageEnhance.Contrast(medium).enhance(1.03)
-
-    crop_w = int(base.width * 0.72)
-    crop_h = int(base.height * 0.72)
-    center_x = int(base.width * (0.38 if index % 2 else 0.62))
-    center_y = int(base.height * 0.52)
-    left = max(0, min(base.width - crop_w, center_x - crop_w // 2))
-    top = max(0, min(base.height - crop_h, center_y - crop_h // 2))
-    detail = base.crop((left, top, left + crop_w, top + crop_h))
-    detail = ImageOps.fit(
-        detail,
-        (WIDTH, HEIGHT),
-        Image.Resampling.LANCZOS,
-    )
-    detail = ImageEnhance.Brightness(detail).enhance(0.97)
-    detail = ImageEnhance.Contrast(detail).enhance(1.05)
-
-    if chapter_start:
-        wide = _chapter_label_frame(
-            wide,
-            int(scene.get("chapter_index", 1)),
-            str(scene.get("chapter_title", "")),
-        )
-
-    paths = [
-        target_dir / f"scene_{index:02d}_wide.jpg",
-        target_dir / f"scene_{index:02d}_medium.jpg",
-        target_dir / f"scene_{index:02d}_detail.jpg",
-    ]
-    for image, path in zip([wide, medium, detail], paths):
-        image.save(path, "JPEG", quality=94, optimize=True)
-    return paths
-
-
-def _render_scene_editorial_clip(
-    shot_frames: list[Path],
     seconds: float,
     chapter_start: bool,
     chapter_end: bool,
     target: Path,
 ) -> None:
-    seconds = max(9.0, float(seconds))
-
-    # Professional documentary rhythm: mostly clean cuts.
-    # No blur transition, slide, zoom or fake camera shake.
-    visible_parts = [
-        seconds * 0.48,
-        seconds * 0.31,
+    seconds = max(2.0, float(seconds))
+    filters = [
+        "scale=1920:1080:force_original_aspect_ratio=increase",
+        "crop=1920:1080",
+        "setsar=1",
+        "eq=saturation=0.92:contrast=1.02:brightness=-0.008",
+        "vignette=PI/10.2",
     ]
-    visible_parts.append(
-        seconds - sum(visible_parts)
-    )
-
-    command = ["ffmpeg", "-y"]
-    for frame, duration in zip(
-        shot_frames,
-        visible_parts,
-    ):
-        command += [
-            "-loop", "1",
-            "-framerate", str(FPS),
-            "-t", f"{duration:.3f}",
-            "-i", str(frame),
-        ]
-
-    filters = []
-    labels = []
-    for index in range(3):
-        label = f"v{index}"
-        filters.append(
-            f"[{index}:v]"
-            "scale=1920:1080,setsar=1,"
-            "eq=saturation=0.92:contrast=1.02:brightness=-0.008,"
-            "vignette=PI/10.2,"
-            f"format=yuv420p[{label}]"
-        )
-        labels.append(f"[{label}]")
-
-    filters.append(
-        "".join(labels)
-        + "concat=n=3:v=1:a=0[cut]"
-    )
-
-    final_filters = []
     if chapter_start:
-        final_filters.append(
-            "fade=t=in:st=0:d=0.42"
-        )
-    if chapter_end:
-        final_filters.append(
-            f"fade=t=out:st={max(0.0, seconds - 0.46):.3f}:d=0.46"
-        )
-
-    if final_filters:
+        filters.append("fade=t=in:st=0:d=0.35")
+    if chapter_end and seconds > 1.0:
         filters.append(
-            "[cut]"
-            + ",".join(final_filters)
-            + ",format=yuv420p[v]"
+            f"fade=t=out:st={max(0.0, seconds - 0.38):.3f}:d=0.38"
         )
-    else:
-        filters.append(
-            "[cut]format=yuv420p[v]"
-        )
+    filters.append("format=yuv420p")
 
-    command += [
-        "-filter_complex",
-        ";".join(filters),
-        "-map", "[v]",
+    run([
+        "ffmpeg", "-y",
+        "-loop", "1",
+        "-framerate", str(FPS),
         "-t", f"{seconds:.3f}",
+        "-i", str(frame),
+        "-vf", ",".join(filters),
         "-an",
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "18",
         "-pix_fmt", "yuv420p",
         "-r", str(FPS),
+        "-t", f"{seconds:.3f}",
         str(target),
-    ]
-    run(command)
+    ])
+
 
 
 def _verify_final_media(
@@ -4042,12 +4381,10 @@ def render_video(
     transitions: list[str],
     transition_durations: list[float],
 ) -> float:
-    clips_dir = WORK / "v7-clips"
-    shots_dir = WORK / "v7-shots"
-    for folder in (clips_dir, shots_dir):
-        if folder.exists():
-            shutil.rmtree(folder)
-        folder.mkdir(parents=True)
+    clips_dir = WORK / "v9-sync-clips"
+    if clips_dir.exists():
+        shutil.rmtree(clips_dir)
+    clips_dir.mkdir(parents=True)
 
     intro_clean = WORK / "intro-clean.jpg"
     intro_brand = WORK / "intro-brand.jpg"
@@ -4083,7 +4420,7 @@ def render_video(
         "type": "intro",
         "start": 0.0,
         "duration": INTRO_VISIBLE_SECONDS,
-        "style": "cold-open / ident / title reveal / story handoff",
+        "style": "short title handoff",
     }]
     cursor = INTRO_VISIBLE_SECONDS
 
@@ -4103,16 +4440,9 @@ def render_video(
         chapter_start = previous_chapter != current_chapter
         chapter_end = next_chapter != current_chapter
 
-        shot_frames = _scene_shot_frames(
+        scene_clip = clips_dir / f"{index:03d}_beat.mp4"
+        _render_single_visual_beat_clip(
             frame,
-            scene,
-            index,
-            shots_dir,
-            chapter_start,
-        )
-        scene_clip = clips_dir / f"{index:03d}_scene.mp4"
-        _render_scene_editorial_clip(
-            shot_frames,
             duration,
             chapter_start,
             chapter_end,
@@ -4121,25 +4451,26 @@ def render_video(
         scene_clips.append(scene_clip)
 
         timeline.append({
-            "type": "story_scene",
-            "scene_id": scene.get("scene_id", index),
+            "type": "sentence_visual_beat",
+            "visual_beat_id": scene.get("visual_beat_id", index),
             "chapter_index": current_chapter,
-            "chapter_title": scene.get("chapter_title", ""),
-            "beat_type": scene.get("beat_type", ""),
-            "continuity_bridge": scene.get("continuity_bridge", ""),
             "start": round(cursor, 3),
             "duration": round(duration, 3),
-            "shots": ["establishing", "action-detail", "consequence"],
-            "internal_transitions": ["cut", "cut"],
+            "source_image": frame.name,
+            "image_reuse": False,
+            "camera_motion": "none",
+            "transition": "hard cut",
+            "sync_keywords": scene.get("sync_keywords", []),
+            "visual_goal": scene.get("visual_goal", ""),
             "narration_text": scene.get("narration_text", ""),
         })
         cursor += duration
 
-    concat_file = WORK / "v7-video-concat.txt"
+    concat_file = WORK / "v9-video-concat.txt"
     all_clips = [intro_clip, *scene_clips]
     write_concat_manifest(all_clips, concat_file)
 
-    video_only = WORK / "v7-video-only.mp4"
+    video_only = WORK / "v9-video-only.mp4"
     run([
         "ffmpeg", "-y",
         "-fflags", "+genpts",
@@ -4186,46 +4517,6 @@ def render_video(
     return _verify_final_media(target, expected_duration)
 
 
-def timestamp(seconds: float) -> str:
-    millis = max(0, round(seconds * 1000))
-    hours, rem = divmod(millis, 3_600_000)
-    minutes, rem = divmod(rem, 60_000)
-    secs, ms = divmod(rem, 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
-
-
-def create_srt(narration: str, duration: float, target: Path) -> None:
-    sentences = [
-        item.strip()
-        for item in re.split(r"(?<=[.!?])\s+", narration.strip())
-        if item.strip()
-    ]
-    chunks: list[str] = []
-    current = ""
-    for sentence in sentences:
-        candidate = f"{current} {sentence}".strip()
-        if len(candidate) <= 145:
-            current = candidate
-        else:
-            if current:
-                chunks.append(current)
-            current = sentence
-    if current:
-        chunks.append(current)
-
-    weights = [max(1, len(chunk)) for chunk in chunks]
-    total = sum(weights)
-    cursor = 0.0
-    blocks = []
-    for index, (chunk, weight) in enumerate(zip(chunks, weights), start=1):
-        piece = duration * weight / total
-        end = min(duration, cursor + piece)
-        blocks.append(
-            f"{index}\n{timestamp(cursor)} --> {timestamp(end)}\n{chunk}\n"
-        )
-        cursor = end
-    target.write_text("\n".join(blocks), encoding="utf-8")
-
 
 def chapter_text(chapters: list[str], duration: float) -> list[str]:
     clean = [str(item).strip() for item in chapters if str(item).strip()]
@@ -4242,7 +4533,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V8-5.txt").write_text(
+    (OUTPUT / "HATA-V9.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -4327,9 +4618,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V8.5 — RELATIVE DURATION GUARD ACTIVE")
+    print("UYKU VE TARİH V9 — SENTENCE VISUAL LOCK ACTIVE")
     print("Konu:", topic)
-    print("DURATION GUARD: Charon locked → relative final verification")
+    print("VISUAL LOCK: final narration → literal beats → audio-aligned cuts")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -4340,6 +4631,34 @@ def main() -> None:
         payload, story_model = story_director_pass(
             client, topic, payload, scene_count
         )
+
+    original_story_scenes = list(payload.get("scenes", []))
+    try:
+        visual_beat_count = int(
+            os.getenv("VISUAL_BEAT_COUNT", str(DEFAULT_VISUAL_BEAT_COUNT))
+        )
+    except ValueError:
+        visual_beat_count = DEFAULT_VISUAL_BEAT_COUNT
+    visual_beat_count = max(16, min(24, visual_beat_count))
+
+    visual_beats, visual_plan_model = build_sentence_visual_plan(
+        client,
+        topic,
+        payload,
+        visual_beat_count,
+    )
+    payload["story_scenes"] = original_story_scenes
+    payload["scenes"] = visual_beats
+    payload["visual_beat_count"] = len(visual_beats)
+    payload["visual_plan_model"] = visual_plan_model
+
+    (OUTPUT / "visual-sync-plan.json").write_text(
+        json.dumps({
+            "model": visual_plan_model,
+            "beats": visual_beats,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     (OUTPUT / "video-paketi.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -4380,21 +4699,16 @@ def main() -> None:
         narration_audio,
         story_seconds,
     )
-    visible_durations = _allocate_exact_duration(
-        actual_story_seconds,
-        [
-            max(
-                1,
-                _word_count(
-                    str(scene.get("narration_text", ""))
-                ),
-            )
-            for scene in payload["scenes"]
-        ],
-        minimum=12.0,
+    visible_durations, visual_sync_report = align_visual_beats_to_audio(
+        narration_audio,
+        payload["scenes"],
+    )
+    (OUTPUT / "visual-sync-report.json").write_text(
+        json.dumps(visual_sync_report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
-    print("AŞAMA 2/4: Ses hazır. Görseller üretiliyor.")
+    print("AŞAMA 2/4: Sesle eşleştirilmiş farklı görseller üretiliyor.")
     raw_dir = WORK / "raw-images"
     frame_dir = WORK / "video-frames"
     raw_dir.mkdir()
@@ -4456,7 +4770,7 @@ def main() -> None:
         )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v8-5-charon-relative-guard.mp4"
+    video = OUTPUT / "uyku-tarih-v9-sentence-visual-lock.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -4489,6 +4803,7 @@ def main() -> None:
         "topic": topic,
         "text_model": text_model,
         "story_director_model": story_model,
+        "visual_plan_model": visual_plan_model,
         "tts_model": tts_model,
         "narration_tempo_factor": round(narration_tempo, 4),
         "natural_story_duration_seconds": round(actual_story_seconds, 2),
@@ -4499,10 +4814,17 @@ def main() -> None:
         ),
         "actual_duration_seconds": round(actual_duration, 2),
         "scene_count": len(frames),
+        "visual_sync_report": visual_sync_report,
         "story_director": {
             "true_intro_in_active_render_path": True,
             "three_act_story": True,
-            "scene_level_tts_sync": True,
+            "scene_level_tts_sync": False,
+            "sentence_visual_lock": True,
+            "silence_assisted_audio_alignment": True,
+            "distinct_image_per_visual_beat": True,
+            "same_image_multi_crop_disabled": True,
+            "same_image_zoom_disabled": True,
+            "visual_prompt_regenerated_after_final_narration": True,
             "critic_guided_image_recovery": True,
             "finite_audio_padding": True,
             "zero_pause_direct_copy": True,
@@ -4549,15 +4871,16 @@ def main() -> None:
             "internal_preflight_before_api": True,
             "exact_v8_indexerror_regression_test": True,
             "internal_blur_transitions": False,
-            "editorial_shots_per_scene": 3,
+            "editorial_shots_per_scene": 1,
             "professional_intro_seconds": INTRO_VISIBLE_SECONDS,
             "hard_final_duration_guard": True,
             "usable_best_candidate_fallback": True,
-            "wide_detail_editorial_cuts": True,
+            "wide_detail_editorial_cuts": False,
         },
         "editor_brain": {
             "zero_jitter": True,
             "semantic_scene_timing": True,
+            "literal_narration_to_image_matching": True,
             "semantic_transitions": True,
             "procedural_ambience": True,
             "automatic_audio_ducking": True,
@@ -4569,8 +4892,9 @@ def main() -> None:
         "final_video_contains_scene_titles": False,
         "zero_jitter_mode": True,
         "camera_motion_inside_scenes": False,
+        "same_image_reused_as_multiple_shots": False,
         "transition_duration_seconds": 0.8,
-        "transition_style": "clean cuts with restrained act-break fades",
+        "transition_style": "hard cuts between distinct images with act-break fades",
     }
     (OUTPUT / "uretim-raporu.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -4579,8 +4903,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V8.5 Relative Duration Guard yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce uyku-tarih-v8-5-charon-relative-guard.mp4 dosyasını izle.\n"
+            "V9 Sentence Visual Lock yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce uyku-tarih-v9-sentence-visual-lock.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -4589,7 +4913,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V8.5 RELATIVE DURATION GUARD TAMAMLANDI")
+    print("V9 SENTENCE VISUAL LOCK TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
