@@ -1,0 +1,42 @@
+name: Uyku ve Tarih - Ses Secim Testi
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sesleri-uret:
+    name: Dort sesi ayni metinle uret
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Projeyi al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Gemini kutuphanesini kur
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "google-genai>=1.66,<2"
+
+      - name: Ses testlerini uret
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python src/voice_test.py
+
+      - name: Sesleri indirilebilir kaydet
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uyku-tarih-ses-secim-testi
+          path: ses-test-sonuclari/
+          if-no-files-found: warn
+          retention-days: 7
