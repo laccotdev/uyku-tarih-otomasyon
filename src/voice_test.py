@@ -43,19 +43,18 @@ VOICES = [
 ]
 
 MODEL_CANDIDATES = [
-    "gemini-3.1-flash-tts-preview",
     "gemini-2.5-flash-preview-tts",
+    "gemini-3.1-flash-tts-preview",
     "gemini-2.5-pro-preview-tts",
 ]
 
 TEST_TEXT = (
-    "Bin dört yüz elli üç yılının baharında, İstanbul yalnızca büyük bir "
-    "kuşatmanın değil, uzun süredir biriken siyasi ve askerî kararların "
-    "merkezindeydi. Osmanlı ordusu surların önünde hazırlık yaparken, şehirde "
-    "yaşayan insanlar her gün daralan imkânlarla hayatlarını sürdürmeye "
-    "çalışıyordu. Sonucu belirleyen şey tek bir saldırı değil; planlama, "
-    "teknoloji, zamanlama ve karşılıklı kararların birbirini değiştirmesiydi."
+    "İstanbul'un fethi, tek bir saldırının değil; aylar süren hazırlığın, "
+    "teknolojik yeniliklerin ve birbirini etkileyen kararların sonucuydu. "
+    "Şehrin surları önünde verilen her karar, kuşatmanın yönünü ve insanların "
+    "geleceğini değiştirdi."
 )
+
 
 
 def write_wav(
@@ -123,6 +122,62 @@ No music, no sound effects, no whispering.
 """.strip()
 
 
+def is_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "429",
+            "resource_exhausted",
+            "rate limit",
+            "quota exceeded",
+            "too many requests",
+        )
+    )
+
+
+def generate_sample_with_retry(
+    client: genai.Client,
+    *,
+    model: str,
+    voice_name: str,
+    transcript: str,
+    target: Path,
+) -> tuple[int, str]:
+    delays = [0, 90, 150]
+
+    last_error: Exception | None = None
+    for attempt, delay in enumerate(delays, start=1):
+        if delay:
+            print(
+                f"{voice_name}: kota beklemesi {delay} saniye "
+                f"(deneme {attempt}/3)"
+            )
+            time.sleep(delay)
+
+        try:
+            generate_sample(
+                client,
+                model=model,
+                voice_name=voice_name,
+                transcript=transcript,
+                target=target,
+            )
+            return attempt, ""
+        except Exception as exc:
+            last_error = exc
+            target.unlink(missing_ok=True)
+            print(
+                f"{voice_name} deneme {attempt}/3 başarısız: {exc}"
+            )
+
+            # Invalid voice/model errors will not heal with waiting.
+            if not is_rate_limit_error(exc):
+                break
+
+    return len(delays), str(last_error or "Bilinmeyen hata")
+
+
 def generate_sample(
     client: genai.Client,
     *,
@@ -168,17 +223,20 @@ def choose_model_and_generate_first(
                 f"Model kontrolü: {model} / ses={first_voice['name']}"
             )
             target = OUTPUT / first_voice["filename"]
-            generate_sample(
+            attempts, error = generate_sample_with_retry(
                 client,
                 model=model,
                 voice_name=first_voice["name"],
                 transcript=transcript,
                 target=target,
             )
+            if error:
+                raise RuntimeError(error)
             return model, {
                 **first_voice,
                 "status": "success",
                 "model": model,
+                "attempts": attempts,
                 "error": "",
             }
         except Exception as exc:
@@ -347,39 +405,48 @@ def main() -> None:
     # Aynı karşılaştırmada model değiştirilmez. Ses farkının tek değişkeni
     # voice_name olmalıdır.
     for voice in VOICES[1:]:
+        # Preview TTS limits can be restrictive. Keep every request in a
+        # separate minute window instead of sending four calls back-to-back.
+        print(
+            f"Sıradaki ses için 75 saniye bekleniyor: {voice['name']}"
+        )
+        time.sleep(75)
+
         target = OUTPUT / voice["filename"]
-        try:
-            print(
-                f"Ses üretiliyor: {voice['number']}. {voice['name']} "
-                f"/ model={selected_model}"
-            )
-            generate_sample(
-                client,
-                model=selected_model,
-                voice_name=voice["name"],
-                transcript=transcript,
-                target=target,
-            )
+        print(
+            f"Ses üretiliyor: {voice['number']}. {voice['name']} "
+            f"/ model={selected_model}"
+        )
+        attempts, error = generate_sample_with_retry(
+            client,
+            model=selected_model,
+            voice_name=voice["name"],
+            transcript=transcript,
+            target=target,
+        )
+
+        if not error:
             results.append({
                 **voice,
                 "status": "success",
                 "model": selected_model,
+                "attempts": attempts,
                 "error": "",
             })
-        except Exception as exc:
+        else:
             target.unlink(missing_ok=True)
             results.append({
                 **voice,
                 "status": "failed",
                 "model": selected_model,
-                "error": str(exc),
+                "attempts": attempts,
+                "error": error,
             })
-            print(f"{voice['name']} üretilemedi: {exc}")
-
-        # Ücretsiz kota üzerinde ani arka arkaya yük oluşturmamak için.
-        time.sleep(6)
+            print(f"{voice['name']} üretilemedi: {error}")
 
     report = {
+        "test_version": "2.0-rate-limit-safe",
+        "request_spacing_seconds": 75,
         "selected_model": selected_model,
         "test_text": transcript,
         "voices": results,
@@ -398,11 +465,17 @@ def main() -> None:
     successful = int(report["successful_count"])
     print(f"Ses testi tamamlandı: {successful}/4 örnek hazır.")
 
-    # En az ilk model testi başarılıysa artifact mutlaka oluşturulur.
-    # Bazı sesler geçici kota yüzünden eksikse workflow kırmızıya dönmez;
-    # rapor hangi örneğin eksik olduğunu açıkça gösterir.
-    if successful < 1:
-        raise RuntimeError("Hiçbir ses örneği üretilemedi.")
+    if successful != len(VOICES):
+        missing = [
+            item["name"]
+            for item in results
+            if item["status"] != "success"
+        ]
+        raise RuntimeError(
+            "Ses testi eksik tamamlandı. Eksik sesler: "
+            + ", ".join(missing)
+            + ". Artifact içindeki ses-raporu.json ayrıntıyı gösterir."
+        )
 
 
 if __name__ == "__main__":
