@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/8.3"
+USER_AGENT = "UykuTarihTopicToVideo/8.4"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Charon"
 
@@ -1520,6 +1520,303 @@ def synthesize_edge_tts(
     return f"edge-tts/{voice}"
 
 
+CHARON_MODEL_CHAIN = [
+    "gemini-2.5-flash-preview-tts",
+    "gemini-3.1-flash-tts-preview",
+]
+
+
+def _is_transient_tts_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "429",
+            "503",
+            "resource_exhausted",
+            "unavailable",
+            "high demand",
+            "rate limit",
+            "quota exceeded",
+            "timeout",
+            "timed out",
+            "deadline",
+            "internal",
+            "temporarily",
+            "connection reset",
+        )
+    )
+
+
+def _extract_audio_pcm(response: Any) -> bytes:
+    if response is None:
+        raise ValueError("TTS yanıtı boş döndü.")
+
+    containers: list[Any] = []
+    candidates = getattr(response, "candidates", None) or []
+
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        if content is not None:
+            containers.append(content)
+
+    containers.append(response)
+
+    for container in containers:
+        parts = getattr(container, "parts", None) or []
+        for part in parts:
+            inline = (
+                getattr(part, "inline_data", None)
+                or getattr(part, "inlineData", None)
+            )
+            if inline is None:
+                continue
+
+            data = getattr(inline, "data", None)
+            if not data:
+                continue
+
+            if isinstance(data, str):
+                try:
+                    decoded = base64.b64decode(data)
+                except Exception as exc:
+                    raise ValueError(
+                        f"TTS base64 ses verisi çözülemedi: {exc}"
+                    ) from exc
+                if decoded:
+                    return decoded
+
+            if isinstance(data, bytearray):
+                data = bytes(data)
+
+            if isinstance(data, bytes) and data:
+                return data
+
+    content_states = [
+        "none"
+        if getattr(candidate, "content", None) is None
+        else "content-without-audio"
+        for candidate in candidates
+    ]
+    raise ValueError(
+        "TTS yanıtında kullanılabilir ses parçası yok. "
+        f"candidate_count={len(candidates)}, states={content_states}"
+    )
+
+
+def _minimum_tts_duration(text: str) -> float:
+    words = max(1, _word_count(text))
+    return max(7.0, words / 220.0 * 60.0 * 0.68)
+
+
+def _generate_charon_once(
+    client: genai.Client,
+    *,
+    model: str,
+    narration: str,
+    target: Path,
+    label: str,
+) -> None:
+    response = client.models.generate_content(
+        model=model,
+        contents=tts_directive(narration),
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=VOICE_NAME
+                    )
+                )
+            ),
+        ),
+    )
+
+    pcm = _extract_audio_pcm(response)
+    if len(pcm) < 24000:
+        raise ValueError(f"{label}: TTS verisi boş veya çok kısa.")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    write_wav(target, pcm)
+
+    actual = ffprobe_duration(target)
+    minimum = _minimum_tts_duration(narration)
+    if actual < minimum:
+        target.unlink(missing_ok=True)
+        raise ValueError(
+            f"{label}: ses kesilmiş görünüyor; "
+            f"{actual:.2f}s, minimum {minimum:.2f}s."
+        )
+
+
+def _generate_charon_with_retry(
+    client: genai.Client,
+    *,
+    model: str,
+    narration: str,
+    target: Path,
+    label: str,
+    delays: tuple[int, ...] = (0, 25, 70),
+) -> None:
+    last_error: Exception | None = None
+
+    for attempt, delay in enumerate(delays, start=1):
+        if delay:
+            print(
+                f"{label}: {delay} saniye bekleniyor "
+                f"(deneme {attempt}/{len(delays)})"
+            )
+            time.sleep(delay)
+
+        try:
+            print(
+                f"{label}: model={model}, voice={VOICE_NAME}, "
+                f"deneme={attempt}/{len(delays)}"
+            )
+            _generate_charon_once(
+                client,
+                model=model,
+                narration=narration,
+                target=target,
+                label=label,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+            target.unlink(missing_ok=True)
+            print(f"{label} başarısız: {exc}")
+
+            if not _is_transient_tts_error(exc) and attempt >= 2:
+                break
+
+    raise RuntimeError(
+        f"{label} üretilemedi. Son hata: {last_error}"
+    )
+
+
+def _charon_probe_text(narration: str) -> str:
+    words = re.findall(r"\S+", narration)
+    selected = words[:42]
+    if len(selected) < 20:
+        selected = words
+    return " ".join(selected).strip()
+
+
+def _safe_model_slug(model: str) -> str:
+    clean = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(model)).strip("-")
+    return clean or "tts-model"
+
+
+def _split_tts_chunks(
+    narration: str,
+    target_words: int = 185,
+) -> list[str]:
+    sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?])\s+", narration)
+        if item.strip()
+    ]
+    if not sentences:
+        return [narration.strip()]
+
+    chunks: list[str] = []
+    current: list[str] = []
+
+    for sentence in sentences:
+        proposed = " ".join(current + [sentence]).strip()
+        if current and _word_count(proposed) > target_words:
+            chunks.append(" ".join(current).strip())
+            current = [sentence]
+        else:
+            current.append(sentence)
+
+    if current:
+        chunks.append(" ".join(current).strip())
+
+    if len(chunks) >= 2 and _word_count(chunks[-1]) < 65:
+        chunks[-2] = f"{chunks[-2]} {chunks[-1]}".strip()
+        chunks.pop()
+
+    return [chunk for chunk in chunks if chunk]
+
+
+def _try_charon_model(
+    client: genai.Client,
+    *,
+    model: str,
+    narration: str,
+    target: Path,
+) -> str:
+    probe = _charon_probe_text(narration)
+    probe_target = WORK / (
+        f"charon-probe-{_safe_model_slug(model)}.wav"
+    )
+
+    print(f"CHARON PREFLIGHT: model={model}")
+    _generate_charon_with_retry(
+        client,
+        model=model,
+        narration=probe,
+        target=probe_target,
+        label=f"Charon ön kontrol {model}",
+        delays=(0, 20, 55),
+    )
+    probe_target.unlink(missing_ok=True)
+    print(f"CHARON PREFLIGHT OK: model={model}")
+
+    try:
+        _generate_charon_with_retry(
+            client,
+            model=model,
+            narration=narration,
+            target=target,
+            label=f"Charon tam metin {model}",
+            delays=(0, 30, 75),
+        )
+        return f"{model}/Charon/full"
+    except Exception as full_error:
+        print(
+            "Tam metin TTS başarısız; aynı model ve aynı Charon sesiyle "
+            f"parçalara geçiliyor: {full_error}"
+        )
+
+    chunks = _split_tts_chunks(narration)
+    if len(chunks) < 2:
+        raise RuntimeError(
+            f"{model}: tam metin başarısız ve metin parçalanamadı."
+        )
+
+    chunk_dir = WORK / "charon-tts-chunks"
+    shutil.rmtree(chunk_dir, ignore_errors=True)
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    chunk_files: list[Path] = []
+
+    for index, chunk in enumerate(chunks, start=1):
+        chunk_target = chunk_dir / f"charon_{index:02d}.wav"
+        _generate_charon_with_retry(
+            client,
+            model=model,
+            narration=chunk,
+            target=chunk_target,
+            label=f"Charon parça {index}/{len(chunks)}",
+            delays=(0, 30, 75),
+        )
+        chunk_files.append(chunk_target)
+
+    concat_audio_files(chunk_files, target)
+    actual = ffprobe_duration(target)
+    minimum = _minimum_tts_duration(narration)
+    if actual < minimum:
+        target.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"{model}: birleşik Charon sesi kısa; "
+            f"{actual:.2f}s / minimum {minimum:.2f}s."
+        )
+
+    return f"{model}/Charon/chunked-{len(chunks)}"
+
+
 def synthesize_short_segment(
     client: genai.Client,
     text: str,
@@ -1527,53 +1824,28 @@ def synthesize_short_segment(
     scene_count: int,
     target: Path,
 ) -> str:
-    configured = os.getenv("TTS_MODEL", "").strip()
-    chain = model_chain(client, [configured, *TTS_MODELS])
     last_error: Exception | None = None
 
-    # One request per Gemini model. A quota error must never trigger repeated
-    # waiting and consume the remaining free-tier quota.
-    for model in chain:
+    for model in CHARON_MODEL_CHAIN:
         try:
-            print(
-                f"Chapter TTS {scene_index}/{scene_count}: "
-                f"model={model}, attempt=1/1"
-            )
-            response = client.models.generate_content(
+            _generate_charon_with_retry(
+                client,
                 model=model,
-                contents=scene_tts_directive(
-                    text, scene_index, scene_count
-                ),
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=VOICE_NAME
-                            )
-                        )
-                    ),
-                ),
+                narration=text,
+                target=target,
+                label=f"Charon bölüm {scene_index}/{scene_count}",
+                delays=(0, 20, 55),
             )
-            candidates = response.candidates or []
-            if not candidates or not candidates[0].content.parts:
-                raise ValueError("TTS bölüm sesi döndürmedi.")
-            inline = candidates[0].content.parts[0].inline_data
-            data = inline.data if inline else None
-            if not data or len(data) < 12000:
-                raise ValueError("TTS bölüm sesi boş veya çok kısa.")
-            write_wav(target, data)
-            if ffprobe_duration(target) < 8.0:
-                raise ValueError("TTS bölüm sesi beklenenden kısa.")
-            return model
+            return f"{model}/Charon"
         except Exception as exc:
             last_error = exc
             target.unlink(missing_ok=True)
-            print(f"Gemini bölüm TTS atlandı: {model}: {exc}")
-            continue
+            print(
+                f"Charon bölüm modeli atlandı: {model}: {exc}"
+            )
 
     raise RuntimeError(
-        "Seçilen Charon sesi üretilemedi. Farklı bir anlatıcıya geçilmedi. "
+        "Charon bölüm sesi üretilemedi. "
         f"Son hata: {last_error}"
     )
 
@@ -2879,46 +3151,33 @@ def synthesize_narration(
     narration: str,
     target: Path,
 ) -> str:
-    configured = os.getenv("TTS_MODEL", "").strip()
-    chain = model_chain(client, [configured, *TTS_MODELS])
     last_error: Exception | None = None
 
-    for model in chain:
+    for model in CHARON_MODEL_CHAIN:
+        target.unlink(missing_ok=True)
         try:
-            print(f"TTS: model={model}, deneme=1/1")
-            response = client.models.generate_content(
+            selected = _try_charon_model(
+                client,
                 model=model,
-                contents=tts_directive(narration),
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=VOICE_NAME
-                            )
-                        )
-                    ),
-                ),
+                narration=narration,
+                target=target,
             )
-            candidates = response.candidates or []
-            if not candidates or not candidates[0].content.parts:
-                raise ValueError("TTS ses parçası döndürmedi.")
-            inline = candidates[0].content.parts[0].inline_data
-            data = inline.data if inline else None
-            if not data or len(data) < 48000:
-                raise ValueError("TTS verisi boş veya çok kısa.")
-            write_wav(target, data)
-            if ffprobe_duration(target) < 35:
-                raise ValueError("TTS sesi beklenenden kısa.")
-            return model
+            print(f"CHARON LOCK READY: {selected}")
+            return selected
         except Exception as exc:
             last_error = exc
             target.unlink(missing_ok=True)
-            print(f"Gemini TTS atlandı: {model}: {exc}")
+            shutil.rmtree(
+                WORK / "charon-tts-chunks",
+                ignore_errors=True,
+            )
+            print(
+                f"Charon modeli tamamen atlandı: {model}: {exc}"
+            )
 
     raise RuntimeError(
-        "Seçilen Charon sesi üretilemedi. Ses bütünlüğünü korumak için "
-        "başka bir anlatıcı kullanılmadı. "
+        "Charon sesi mevcut Gemini TTS modellerinin hiçbirinde "
+        "üretilemedi. Farklı bir anlatıcıya geçilmedi. "
         f"Son hata: {last_error}"
     )
 
@@ -3958,7 +4217,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V8-3.txt").write_text(
+    (OUTPUT / "HATA-V8-4.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -4043,9 +4302,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V8.3 — CHARON VOICE LOCK ACTIVE")
+    print("UYKU VE TARİH V8.4 — RESILIENT CHARON ACTIVE")
     print("Konu:", topic)
-    print("VOICE LOCK: Charon → one narrator → no fallback voice change")
+    print("RESILIENT VOICE: Charon preflight → one model → full or chunked narration")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -4077,7 +4336,7 @@ def main() -> None:
     (OUTPUT / "baslik.txt").write_text(str(payload["video_title"]), encoding="utf-8")
 
     print(
-        "AŞAMA 1/4: Charon sesiyle tam metin tek parça seslendiriliyor."
+        "AŞAMA 1/4: Charon ön kontrolü ve tek-model seslendirme başlıyor."
     )
     narration_audio = OUTPUT / "seslendirme.wav"
     raw_audio = WORK / "narration-single-voice-raw.wav"
@@ -4172,7 +4431,7 @@ def main() -> None:
         )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v8-3-charon.mp4"
+    video = OUTPUT / "uyku-tarih-v8-4-charon-resilient.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -4241,6 +4500,12 @@ def main() -> None:
             "voice_lock_enabled": True,
             "different_voice_fallback_disabled": True,
             "fail_before_images_if_charon_unavailable": True,
+            "charon_model_preflight": True,
+            "stale_tts_model_override_ignored": True,
+            "transient_503_retry": True,
+            "safe_empty_response_handling": True,
+            "same_model_chunk_fallback": True,
+            "mixed_tts_models_in_final_audio": False,
             "forced_speech_slowdown": False,
             "maximum_voice_slowdown_percent": 2,
             "maximum_voice_speedup_percent": 8,
@@ -4285,8 +4550,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V8.3 Charon Voice Lock yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce uyku-tarih-v8-3-charon.mp4 dosyasını izle.\n"
+            "V8.4 Resilient Charon yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce uyku-tarih-v8-4-charon-resilient.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -4295,7 +4560,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V8.3 CHARON VOICE LOCK TAMAMLANDI")
+    print("V8.4 RESILIENT CHARON TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
