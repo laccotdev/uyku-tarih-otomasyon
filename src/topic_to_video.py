@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/9.0"
+USER_AGENT = "UykuTarihTopicToVideo/9.1"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Charon"
 
@@ -2456,55 +2456,300 @@ def cloudflare_image_request(
     _save_generated_image(_decode_cloudflare_image(response), target)
 
 
+
+ABSTRACT_VISUAL_MARKERS = (
+    "karar", "sonuç", "etki", "yönetim", "ekonomi", "düzen",
+    "güvenlik", "denge", "dönüşüm", "süreç", "ilişki",
+    "iktidar", "toplumsal", "gelecek", "miras",
+)
+
+
+def _is_abstract_visual_beat(scene: dict[str, Any]) -> bool:
+    mode = str(scene.get("representation_mode", "")).strip().lower()
+    if mode in {"concrete_consequence", "editorial_bridge"}:
+        return True
+    if mode == "literal":
+        return False
+
+    narration = re.sub(
+        r"\s+", " ", str(scene.get("narration_text", ""))
+    ).lower()
+    abstract_hits = sum(
+        marker in narration for marker in ABSTRACT_VISUAL_MARKERS
+    )
+    concrete_keywords = [
+        item for item in scene.get("sync_keywords", [])
+        if str(item).strip()
+    ]
+    return abstract_hits >= 2 and len(concrete_keywords) <= 2
+
+
+def _scene_visual_contract(scene: dict[str, Any]) -> str:
+    explicit = re.sub(
+        r"\s+", " ", str(scene.get("visual_contract", ""))
+    ).strip()
+    if explicit:
+        return explicit
+
+    goal = re.sub(
+        r"\s+", " ", str(scene.get("visual_goal", ""))
+    ).strip()
+    must_show = [
+        re.sub(r"\s+", " ", str(item)).strip()
+        for item in scene.get("must_show", [])
+        if str(item).strip()
+    ]
+    return " | ".join(
+        item for item in [goal, *must_show[:4]] if item
+    )
+
+
+def _technical_candidate_failure(reason: str, score: int) -> bool:
+    normalized = re.sub(r"\s+", " ", str(reason or "")).lower()
+    markers = (
+        "tamamen siyah", "completely black", "boş görüntü",
+        "blank image", "filigran", "watermark", "bozuk yazı",
+        "hatalı metin", "text or logo", "ağır anatomi",
+        "severe anatomy", "modern silah", "modern nesne",
+        "wrong century", "yanlış yüzyıl",
+    )
+    return score < 28 or any(marker in normalized for marker in markers)
+
+
+def _bridge_card_lines(scene: dict[str, Any]) -> list[str]:
+    candidates = [
+        *scene.get("sync_keywords", []),
+        *scene.get("must_show", []),
+    ]
+    result: list[str] = []
+    for item in candidates:
+        clean = re.sub(r"\s+", " ", str(item)).strip()
+        if not clean:
+            continue
+        clean = textwrap.shorten(clean, width=32, placeholder="…")
+        if clean.lower() not in {value.lower() for value in result}:
+            result.append(clean)
+        if len(result) >= 3:
+            break
+
+    if not result:
+        goal = re.sub(
+            r"\s+", " ", str(scene.get("visual_goal", ""))
+        ).strip()
+        result = [
+            textwrap.shorten(
+                goal or "Tarihsel sonuç",
+                width=32,
+                placeholder="…",
+            )
+        ]
+    return result
+
+
+def make_local_visual_bridge(
+    topic: str,
+    scene: dict[str, Any],
+    target: Path,
+    reason: str = "",
+) -> None:
+    """Create a unique local editorial frame instead of aborting."""
+    image = Image.new("RGB", (WIDTH, HEIGHT), (12, 20, 32))
+    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    for index in range(14):
+        inset = index * 34
+        alpha = max(4, 34 - index * 2)
+        draw.rounded_rectangle(
+            (inset, inset, WIDTH - inset, HEIGHT - inset),
+            radius=90,
+            outline=(145, 126, 98, alpha),
+            width=26,
+        )
+
+    draw.rounded_rectangle(
+        (150, 150, WIDTH - 150, HEIGHT - 150),
+        radius=38,
+        fill=(29, 31, 34, 232),
+        outline=(191, 158, 105, 185),
+        width=3,
+    )
+    draw.rectangle(
+        (210, 225, 430, 235),
+        fill=(205, 171, 112, 255),
+    )
+
+    chapter = re.sub(
+        r"\s+", " ",
+        str(scene.get("chapter_title", "Tarihsel Sonuç")),
+    ).strip().upper()
+    draw.text(
+        (210, 260),
+        chapter,
+        font=video_font(30, bold=True),
+        fill=(203, 183, 149, 255),
+    )
+
+    goal = re.sub(
+        r"\s+", " ", str(scene.get("visual_goal", ""))
+    ).strip()
+    goal = textwrap.shorten(
+        goal or topic,
+        width=78,
+        placeholder="…",
+    )
+    title_font = video_font(58, bold=True)
+    body_font = video_font(27, bold=False)
+
+    words = goal.upper().split()
+    headline: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        bbox = draw.textbbox((0, 0), candidate, font=title_font)
+        if bbox[2] <= WIDTH - 500:
+            current = candidate
+        else:
+            if current:
+                headline.append(current)
+            current = word
+    if current:
+        headline.append(current)
+
+    for index, line in enumerate(headline[:2]):
+        draw.text(
+            (210, 330 + index * 72),
+            line,
+            font=title_font,
+            fill=(244, 237, 224, 255),
+        )
+
+    labels = _bridge_card_lines(scene)
+    node_width = 430
+    gap = 55
+    total_width = len(labels) * node_width + max(0, len(labels) - 1) * gap
+    start_x = max(210, (WIDTH - total_width) // 2)
+    start_y = 575
+
+    for index, label in enumerate(labels):
+        x = start_x + index * (node_width + gap)
+        draw.rounded_rectangle(
+            (x, start_y, x + node_width, start_y + 160),
+            radius=24,
+            fill=(48, 50, 50, 245),
+            outline=(167, 142, 101, 210),
+            width=2,
+        )
+        draw.ellipse(
+            (x + 24, start_y + 47, x + 84, start_y + 107),
+            fill=(191, 157, 103, 255),
+        )
+        draw.text(
+            (x + 105, start_y + 54),
+            label,
+            font=body_font,
+            fill=(232, 224, 210, 255),
+        )
+        if index < len(labels) - 1:
+            arrow_x = x + node_width + 12
+            draw.line(
+                (arrow_x, start_y + 80, arrow_x + 30, start_y + 80),
+                fill=(191, 157, 103, 230),
+                width=5,
+            )
+
+    draw.text(
+        (210, HEIGHT - 225),
+        f"UYKU VE TARİH  ·  SAHNE {scene.get('scene_id', '')}",
+        font=video_font(24, bold=True),
+        fill=(174, 157, 129, 255),
+    )
+
+    image = Image.alpha_composite(
+        image.convert("RGBA"), overlay
+    ).convert("RGB")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    image.save(target, "JPEG", quality=95, optimize=True)
+    print(
+        "LOCAL VISUAL BRIDGE READY: "
+        f"scene={scene.get('scene_id')}; "
+        f"reason={textwrap.shorten(str(reason), width=120, placeholder='…')}"
+    )
+
+
 def image_review(
     client: genai.Client,
     scene: dict[str, Any],
     image_path: Path,
 ) -> tuple[bool, int, str]:
     data = image_path.read_bytes()
+    representation_mode = str(
+        scene.get("representation_mode", "literal")
+    ).strip().lower()
+    visual_contract = _scene_visual_contract(scene)
+    abstract_beat = _is_abstract_visual_beat(scene)
+
     prompt = f"""
 Yalnızca JSON üret:
 {{
   "pass": true,
   "score": 0,
   "semantic_match": true,
+  "technical_failure": false,
   "reason": "Kısa açıklama"
 }}
 
-Bu görseli anlatımla birebir eşleşme açısından değerlendir.
-
-ANLATILAN METİN:
+ANLATIM BAĞLAMI:
 {scene.get('narration_text', '')}
 
-GÖRSEL HEDEF:
-{scene.get('visual_goal', '')}
+SOMUT GÖRSEL SÖZLEŞMESİ:
+{visual_contract}
 
-EKRANDA KESİNLİKLE GÖRÜNMESİ GEREKENLER:
+TEMSİL MODU:
+{representation_mode}
+
+SOYUT ANLATIM PARÇASI:
+{abstract_beat}
+
+EKRANDA GÖRÜNMESİ GEREKENLER:
 {json.dumps(scene.get('must_show', []), ensure_ascii=False)}
 
-GÖRÜNMEMESİ GEREKEN ÇELİŞKİLER:
+GÖRÜNMEMESİ GEREKENLER:
 {json.dumps(scene.get('must_not_show', []), ensure_ascii=False)}
 
-Kriterler:
-- Görsel, anlatıcının bu parçada söz ettiği ana kişi, yer, nesne veya eylemi
-  açıkça ve doğrudan gösteriyor mu?
-- Başka bir beat'in olayını ya da yalnızca genel bir tarih atmosferini mi gösteriyor?
-- Zorunlu unsurlar görünür mü, çelişen unsurlar var mı?
+KURALLAR:
+- Öncelikle somut görsel sözleşmesini ve must_show unsurlarını değerlendir.
+- Anlatım soyutsa yönetim, ekonomi, güvenlik veya toplumsal etkinin
+  dönemsel ve gözle görülebilir sonucu geçerli bir eşleşmedir.
+- Liman ticareti, yönetim toplantısı, tahıl dağıtımı, muhafız düzeni,
+  yeniden inşa veya gündelik hayattaki değişim; uygun sözleşmeyle
+  concrete_consequence olarak kabul edilebilir.
+- Soyut kelimelerin fiziksel olarak görünmesini bekleme.
 - Modern, fantastik veya dönem dışı unsur var mı?
-- Yazı, sayı, logo, filigran, kolaj veya belirgin anatomi bozukluğu var mı?
+- Yazı, logo, filigran, bozuk altyazı veya ağır anatomi var mı?
 - Premium tarih belgeseli karesi gibi görünüyor mu?
 
-semantic_match yalnızca anlatılan ana olay gerçekten görünüyorsa true olsun.
-score 0-100 olsun. pass yalnızca semantic_match=true ve score en az 68 ise true.
+technical_failure yalnızca siyah/boş görüntü, filigran-yazı, ağır anatomi,
+modern nesne veya yanlış dönem gibi kullanılamaz sorunlarda true olsun.
+
+pass yalnızca semantic_match=true, technical_failure=false ve score>=66 ise true.
 """
     part = types.Part.from_bytes(data=data, mime_type="image/jpeg")
     try:
         payload, _ = generate_json_with_parts(client, prompt, part)
         score = int(payload.get("score", 0))
         semantic_match = bool(payload.get("semantic_match"))
-        passed = bool(payload.get("pass")) and semantic_match and score >= 68
+        technical_failure = bool(payload.get("technical_failure"))
+        passed = (
+            bool(payload.get("pass"))
+            and semantic_match
+            and not technical_failure
+            and score >= 66
+        )
         reason = str(payload.get("reason", ""))
-        if not semantic_match:
+        if technical_failure:
+            reason = "TECHNICAL_FAILURE: " + reason
+        elif not semantic_match:
             reason = "SEMANTIC_MISMATCH: " + reason
         return passed, score, reason
     except Exception as exc:
@@ -2730,10 +2975,11 @@ def generate_scene_image(
             print(f"Sahne görseli başarısız ({model}): {exc}")
             message = str(exc).lower()
             if "10,000 neurons" in message or "account limited" in message:
-                raise RuntimeError(
-                    "Cloudflare günlük ücretsiz görsel kotası dolmuş. "
-                    "Kota 00:00 UTC'de yenilenir."
-                ) from exc
+                print(
+                    "Cloudflare görsel kotası dolu; yerel editoryal "
+                    "köprü kullanılacak."
+                )
+                break
             time.sleep(min(8, 2 * attempt))
 
     # Second pass: use the critic's reason to rewrite only this scene prompt.
@@ -2799,15 +3045,16 @@ def generate_scene_image(
             target.unlink(missing_ok=True)
             print(f"QUALITY RECOVERY failed ({model}): {exc}")
 
-    # Do not throw away the entire video for a usable but imperfect image.
+    # Accept a technically usable non-semantic candidate.
     if (
         best_file.exists()
-        and best_score >= 55
-        and not _fatal_candidate_reason(best_reason, best_score)
+        and best_score >= 38
+        and not _technical_candidate_failure(best_reason, best_score)
+        and "semantic_mismatch" not in best_reason.lower()
     ):
         shutil.copyfile(best_file, target)
         print(
-            f"QUALITY RECOVERY fallback accepted: scene={scene['scene_id']}, "
+            f"FAIL-SOFT IMAGE ACCEPTED: scene={scene['scene_id']}, "
             f"score={best_score}"
         )
         return {
@@ -2815,95 +3062,33 @@ def generate_scene_image(
             "model": best_model,
             "seed": best_seed,
             "review_score": best_score,
-            "review": f"En iyi kullanılabilir aday: {best_reason}",
+            "review": "En iyi teknik aday: " + best_reason,
             "quality_fallback": True,
-            "needs_manual_review": best_score < 52,
+            "needs_manual_review": True,
             "file": target.name,
         }
 
+    # No external image/reviewer failure may destroy a long production.
     detail = (
         f"best_score={best_score}; best_reason={best_reason}; "
         f"last_error={last_error}"
     )
-    raise RuntimeError(
-        f"Sahne {scene['scene_id']} için kullanılabilir görsel üretilemedi: "
-        f"{detail}"
-    )
+    make_local_visual_bridge(topic, scene, target, detail)
+    return {
+        "scene_id": scene["scene_id"],
+        "model": "local-editorial-bridge",
+        "seed": 0,
+        "review_score": max(0, best_score),
+        "review": (
+            "Dış görsel üretimi güvenli sonuç vermedi; "
+            "yerel editoryal köprü kullanıldı. " + detail
+        ),
+        "quality_fallback": True,
+        "local_visual_bridge": True,
+        "needs_manual_review": True,
+        "file": target.name,
+    }
 
-
-
-def generate_thumbnail_background(
-    topic: str,
-    payload: dict[str, Any],
-    target: Path,
-) -> dict[str, Any]:
-    prompt = (
-        f"{payload['thumbnail_prompt'].strip()}\n\n"
-        f"VIDEO VISUAL IDENTITY:\n{payload['visual_identity'].strip()}\n\n"
-        f"MASTER STYLE:\n{STYLE_BIBLE}\n"
-        "YouTube thumbnail background, main focal subject on the right third, "
-        "dark clean negative space on the left third for typography."
-    )
-    negative = (
-        f"{GLOBAL_NEGATIVE}, "
-        f"{str(payload.get('thumbnail_negative_prompt', '')).strip()}, "
-        "words, title, typography"
-    )
-
-    last_error: Exception | None = None
-    models = cloudflare_model_chain()
-    max_attempts = min(4, len(models))
-    for attempt, model in enumerate(models[:max_attempts], start=1):
-        seed = deterministic_seed(topic, 999, attempt)
-        try:
-            print(f"Kapak arka planı: model={model}, deneme={attempt}/{max_attempts}")
-            cloudflare_image_request(prompt, negative, seed, target, model)
-            return {"model": model, "seed": seed, "file": target.name}
-        except Exception as exc:
-            last_error = exc
-            target.unlink(missing_ok=True)
-            print(f"Kapak arka planı başarısız ({model}): {exc}")
-            time.sleep(min(12, 3 * attempt))
-
-    raise RuntimeError(f"Kapak arka planı üretilemedi: {last_error}")
-
-def review_thumbnail_candidate(
-    client: genai.Client,
-    image_path: Path,
-    title_text: str,
-    topic: str,
-    visual_identity: str,
-) -> tuple[int, str]:
-    data = image_path.read_bytes()
-    prompt = f"""
-Yalnızca JSON üret:
-{{
-  "score": 0,
-  "reason": "Kısa açıklama"
-}}
-
-Bu görsel aşağıdaki YouTube tarih videosunun kapak arka planı adayıdır.
-KONU: {topic}
-BAŞLIK METNİ: {title_text}
-GÖRSEL KİMLİK: {visual_identity}
-
-Puanlama kriterleri:
-- Konuyu ve doğru tarihsel dönemi belirgin biçimde çağrıştırıyor mu?
-- Başka medeniyetlere ait jenerik bir yapı gibi görünmekten kaçınıyor mu?
-- Premium, sinematik ve mobil ekranda güçlü mü?
-- Sağ tarafta tek güçlü ana odak, sol tarafta temiz ve koyu başlık alanı var mı?
-- Yazı, logo, filigran, kolaj, aşırı kalabalık veya dönem dışı unsur var mı?
-- Videonun mavi-siyah ay ışığı ve kısık amber meşale paletiyle uyumlu mu?
-
-0-100 arasında puan ver. 72 altı zayıf kabul edilir.
-"""
-    part = types.Part.from_bytes(data=data, mime_type="image/jpeg")
-    try:
-        payload, _ = generate_json_with_parts(client, prompt, part)
-        return int(payload.get("score", 0)), str(payload.get("reason", ""))
-    except Exception as exc:
-        print("Kapak değerlendirmesi atlandı:", exc)
-        return 65, "Kapak değerlendirmesi atlandı."
 
 
 def generate_thumbnail_candidates(
@@ -3379,7 +3564,16 @@ def _local_visual_beat(
         "beat_type": "literal_story_beat",
         "narration_text": narration_text,
         "narration_idea": excerpt,
-        "visual_goal": f"Anlatılan olayı doğrudan göster: {excerpt}",
+        "visual_goal": f"Anlatılan olayı veya somut sonucunu göster: {excerpt}",
+        "visual_contract": excerpt,
+        "representation_mode": (
+            "concrete_consequence"
+            if sum(
+                marker in narration_text.lower()
+                for marker in ABSTRACT_VISUAL_MARKERS
+            ) >= 2
+            else "literal"
+        ),
         "must_show": [excerpt],
         "must_not_show": [
             "unrelated generic camp",
@@ -3449,6 +3643,8 @@ Yalnızca geçerli JSON üret:
     {{
       "beat_id": 1,
       "visual_goal": "Türkçe ve somut görsel hedef",
+      "visual_contract": "Tek somut olay veya sonuç",
+      "representation_mode": "literal veya concrete_consequence",
       "must_show": ["Ekranda kesin bulunması gereken somut unsurlar"],
       "must_not_show": ["Bu anlatım parçasıyla çelişen unsurlar"],
       "sync_keywords": ["Anlatımdaki kişi, yer, nesne ve eylemler"],
@@ -3475,8 +3671,13 @@ KURALLAR:
 - Tam {len(beats)} beat üret ve beat_id değerlerini değiştirme.
 - narration_text alanını yeniden yazma veya özetleme.
 - Her görsel yalnızca kendi narration_text parçasında anlatılan ana olayı gösterir.
-- Anlatım bir kişi, yer, araç, savaş, karar veya sonuçtan söz ediyorsa o unsur
-  ekranda açıkça görünmelidir.
+- Anlatım somutsa representation_mode=literal kullan ve adı geçen kişi, yer,
+  nesne veya eylemi doğrudan göster.
+- Anlatım yönetim, ekonomi, güvenlik, sonuç veya toplumsal etki gibi soyutsa
+  representation_mode=concrete_consequence kullan.
+- Soyut anlatımda gözle görülebilir dönemsel sonucu seç: yönetim toplantısı,
+  liman ticareti, tahıl dağıtımı, muhafız düzeni veya yeniden inşa.
+- visual_contract yalnızca bu tek somut sonucu tanımlasın.
 - Soyut sembol, rastgele ordugâh veya yalnızca güzel atmosfer kullanma.
 - "Harita" deniyorsa harita; "fırtına" deniyorsa fırtına; "mağara" deniyorsa
   mağara; "liman" deniyorsa liman görünmelidir.
@@ -3510,7 +3711,7 @@ KURALLAR:
             if not item:
                 continue
             for key in (
-                "visual_goal", "must_show", "must_not_show",
+                "visual_goal", "visual_contract", "representation_mode", "must_show", "must_not_show",
                 "sync_keywords", "image_prompt", "negative_prompt",
                 "ambient_profile",
             ):
@@ -3530,6 +3731,15 @@ KURALLAR:
         profile = str(beat.get("ambient_profile", "exterior_wind"))
         if profile not in ALLOWED_AMBIENT_PROFILES:
             beat["ambient_profile"] = "exterior_wind"
+        mode = str(beat.get("representation_mode", "")).strip().lower()
+        if mode not in {"literal", "concrete_consequence", "editorial_bridge"}:
+            beat["representation_mode"] = (
+                "concrete_consequence"
+                if _is_abstract_visual_beat(beat)
+                else "literal"
+            )
+        if not str(beat.get("visual_contract", "")).strip():
+            beat["visual_contract"] = _scene_visual_contract(beat)
         beat["transition"] = "cut"
         beat["transition_duration"] = 0.20
 
@@ -4533,7 +4743,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V9.txt").write_text(
+    (OUTPUT / "HATA-V9-1.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -4618,9 +4828,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V9 — SENTENCE VISUAL LOCK ACTIVE")
+    print("UYKU VE TARİH V9.1 — FAIL-SOFT VISUAL LOCK ACTIVE")
     print("Konu:", topic)
-    print("VISUAL LOCK: final narration → literal beats → audio-aligned cuts")
+    print("FAIL-SOFT VISUAL LOCK: concrete contracts → audio-aligned cuts → local bridge fallback")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -4719,7 +4929,26 @@ def main() -> None:
     for scene in payload["scenes"]:
         scene_id = int(scene["scene_id"])
         raw = raw_dir / f"scene_{scene_id:02d}.jpg"
-        info = generate_scene_image(client, topic, payload, scene, raw)
+        try:
+            info = generate_scene_image(
+                client, topic, payload, scene, raw
+            )
+        except Exception as exc:
+            print(
+                f"EMERGENCY VISUAL FALLBACK: scene={scene_id}; error={exc}"
+            )
+            make_local_visual_bridge(topic, scene, raw, str(exc))
+            info = {
+                "scene_id": scene_id,
+                "model": "local-emergency-bridge",
+                "seed": 0,
+                "review_score": 0,
+                "review": str(exc),
+                "quality_fallback": True,
+                "local_visual_bridge": True,
+                "emergency_fallback": True,
+                "file": raw.name,
+            }
         frame = frame_dir / f"frame_{scene_id:02d}.jpg"
         clean_video_frame(raw, frame)
         frames.append(frame)
@@ -4732,12 +4961,30 @@ def main() -> None:
     )
 
     thumb_dir = WORK / "thumbnail-candidates"
-    selected_thumb_background, thumb_info = generate_thumbnail_candidates(
-        client,
-        topic,
-        payload,
-        thumb_dir,
-    )
+    try:
+        (
+            selected_thumb_background,
+            thumb_info,
+        ) = generate_thumbnail_candidates(
+            client,
+            topic,
+            payload,
+            thumb_dir,
+        )
+    except Exception as exc:
+        print(
+            "THUMBNAIL FAIL-SOFT: ilk video karesi kullanılıyor: "
+            f"{exc}"
+        )
+        selected_thumb_background = frames[0]
+        thumb_info = {
+            "model": "first-scene-fallback",
+            "review_score": 0,
+            "review_reason": str(exc),
+            "quality_fallback": True,
+            "selected_file": frames[0].name,
+        }
+
     make_thumbnail(
         selected_thumb_background,
         str(payload["thumbnail_text"]),
@@ -4770,7 +5017,7 @@ def main() -> None:
         )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v9-sentence-visual-lock.mp4"
+    video = OUTPUT / "uyku-tarih-v9-1-failsoft-visual-lock.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -4826,6 +5073,13 @@ def main() -> None:
             "same_image_zoom_disabled": True,
             "visual_prompt_regenerated_after_final_narration": True,
             "critic_guided_image_recovery": True,
+            "abstract_visual_contracts": True,
+            "concrete_consequence_review": True,
+            "single_image_failure_never_aborts": True,
+            "local_editorial_bridge_fallback": True,
+            "cloudflare_quota_visual_fallback": True,
+            "thumbnail_first_frame_fallback": True,
+            "late_stage_visual_hard_failure": False,
             "finite_audio_padding": True,
             "zero_pause_direct_copy": True,
             "ffmpeg_timeout_seconds": 900,
@@ -4903,8 +5157,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V9 Sentence Visual Lock yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce uyku-tarih-v9-sentence-visual-lock.mp4 dosyasını izle.\n"
+            "V9.1 Fail-Soft Visual Lock yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce uyku-tarih-v9-1-failsoft-visual-lock.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -4913,7 +5167,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V9 SENTENCE VISUAL LOCK TAMAMLANDI")
+    print("V9.1 FAIL-SOFT VISUAL LOCK TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
