@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 24
-USER_AGENT = "UykuTarihTopicToVideo/9.3"
+USER_AGENT = "UykuTarihTopicToVideo/9.4"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Charon"
 
@@ -47,7 +47,7 @@ cyan, vivid orange, green casts and radically different color temperatures.
 Realistic skin and anatomy, immersive 16:9 composition, no fantasy spectacle.
 The visual must look like a frame from one cohesive historical film. No text,
 no letters, no numbers, no captions, no logos, no watermarks, no borders,
-no collage and no museum display. Every visible surface must be free of writing, glyphs and letter-like markings.
+no collage and no museum display. Every visible surface must be free of writing, glyphs and letter-like markings. The result should feel editorial and premium: clear subject readability, crisp textures, strong but realistic detail, clean exposure and rich, controlled color. Avoid washed-out, foggy or muddy frames unless the narration explicitly requires that atmosphere.
 """.strip()
 
 GLOBAL_NEGATIVE = """
@@ -57,6 +57,15 @@ modern clothing, modern technology, electricity, neon, fantasy armor,
 fantasy castle, science fiction, cartoon, anime, illustration, oversaturated,
 plastic skin, deformed face, malformed hands, extra fingers, extra limbs,
 duplicate people, blurry, low resolution, fake writing, pseudo alphabet, glyphs, runes, inscriptions, signs, labels, map text, tablet markings
+""".strip()
+
+
+
+QUALITY_BIBLE = """
+Premium historical documentary still. Rich but realistic color, clear midtones,
+readable faces, crisp textures, stronger subject separation and a cleaner,
+more editorial finish. Do not look flat, hazy, muddy or excessively desaturated
+unless the narration itself explicitly requires fog, ash, smoke or darkness.
 """.strip()
 
 
@@ -2300,6 +2309,40 @@ def _model_order_for_scene(scene: dict[str, Any]) -> list[str]:
     ]))[:2]
 
 
+def _scene_sync_checklist(scene: dict[str, Any]) -> list[str]:
+    result: list[str] = []
+
+    def add(value: Any) -> None:
+        clean = re.sub(r"\s+", " ", str(value)).strip()
+        if not clean:
+            return
+        if clean.lower() not in {item.lower() for item in result}:
+            result.append(clean)
+
+    add(scene.get("visual_contract", ""))
+    for item in scene.get("must_show", []):
+        add(item)
+    for item in scene.get("sync_keywords", []):
+        add(item)
+
+    if not result:
+        add(scene.get("narration_text", ""))
+    return result[:8]
+
+
+def _story_lock_rule(scene: dict[str, Any]) -> str:
+    mode = str(scene.get("representation_mode", "literal")).strip().lower()
+    if mode == "concrete_consequence":
+        return (
+            "Story lock: show one concrete historical consequence named by the "
+            "visual contract. Do not fall back to generic atmosphere."
+        )
+    return (
+        "Story lock: show the exact narrated moment. Keep the main subject, "
+        "the main action and the named setting visibly present in one coherent frame."
+    )
+
+
 def combined_prompt(payload: dict[str, Any], scene: dict[str, Any]) -> str:
     world = _world_bible_text(payload)
     must_show = scene.get("must_show", [])
@@ -2308,23 +2351,34 @@ def combined_prompt(payload: dict[str, Any], scene: dict[str, Any]) -> str:
         str(scene.get("narration_text", "")),
         430,
     )
+    contract = _compact_text(
+        str(scene.get("visual_contract", "")),
+        260,
+    )
+    sync_items = _scene_sync_checklist(scene)
     return _fit_prompt([
         _zero_text_prompt(scene),
         str(scene.get("image_prompt", "")),
         f"Exact narration being illustrated: {narration}",
+        f"Primary visual contract: {contract}",
+        "Scene synchronization checklist: "
+        + _compact_text(json.dumps(sync_items, ensure_ascii=False), 300),
+        _story_lock_rule(scene),
+        "If the narration names a person, object, action and place, keep them in "
+        "the same frame. Avoid empty wide shots, vague atmosphere, random camps "
+        "or generic landscapes when a concrete event is named.",
+        QUALITY_BIBLE,
         "Mandatory visible elements: "
-        + _compact_text(json.dumps(must_show, ensure_ascii=False), 260),
+        + _compact_text(json.dumps(must_show, ensure_ascii=False), 240),
         "Do not show these contradictions: "
-        + _compact_text(json.dumps(must_not_show, ensure_ascii=False), 220),
-        "Literal synchronization rule: depict the concrete subject and action "
-        "named in this narration beat. Never replace it with a generic camp, "
-        "generic landscape or symbolic atmosphere.",
+        + _compact_text(json.dumps(must_not_show, ensure_ascii=False), 180),
         f"Strict historical continuity: {world}",
         f"Visual identity: {payload.get('visual_identity', '')}",
         "Photorealistic premium historical documentary, one coherent 16:9 film "
         "frame, no text, no collage.",
         "FINAL CHECK: zero letters, zero numbers, zero fake language, zero "
-        "glyph-like marks anywhere in the pixels.",
+        "glyph-like marks anywhere in the pixels. The subject must be visually clear "
+        "and narratively specific.",
     ])
 
 
@@ -3290,8 +3344,8 @@ def sanitize_external_generated_image(
     # text-like.
     crop_left = round(image.width * 0.018)
     crop_right = round(image.width * 0.982)
-    crop_top_ratio = 0.075 if top_score >= 0.20 else 0.028
-    crop_bottom_ratio = 0.80 if bottom_score >= 0.20 else 0.885
+    crop_top_ratio = 0.055 if top_score >= 0.21 else (0.026 if top_score >= 0.14 else 0.010)
+    crop_bottom_ratio = 0.84 if bottom_score >= 0.21 else (0.925 if bottom_score >= 0.14 else 0.955)
 
     crop_top = round(image.height * crop_top_ratio)
     crop_bottom = round(image.height * crop_bottom_ratio)
@@ -3339,35 +3393,39 @@ def clean_video_frame(source: Path, target: Path) -> None:
         centering=(0.5, 0.5),
     )
 
-    # Match every scene to a common night-documentary exposure.
+    # Recover cleaner exposure and stronger readability than the muted V9.3 grade.
+    frame = ImageOps.autocontrast(frame, cutoff=0.2)
+
     gray = ImageOps.grayscale(frame)
     mean_luma = sum(ImageStat.Stat(gray).mean) / 1.0
-    target_luma = 72.0
-    exposure_gain = max(0.78, min(1.22, target_luma / max(1.0, mean_luma)))
+    target_luma = 96.0
+    exposure_gain = max(0.96, min(1.34, target_luma / max(1.0, mean_luma)))
     frame = ImageEnhance.Brightness(frame).enhance(exposure_gain)
-    frame = ImageEnhance.Color(frame).enhance(0.78)
-    frame = ImageEnhance.Contrast(frame).enhance(1.07)
+    frame = ImageEnhance.Color(frame).enhance(1.04)
+    frame = ImageEnhance.Contrast(frame).enhance(1.11)
+    frame = ImageEnhance.Sharpness(frame).enhance(1.14)
 
-    # Fixed blue-shadow / amber-highlight grade. This is static, not animated.
     luminance = ImageOps.grayscale(frame)
     grade = ImageOps.colorize(
         luminance,
-        black=(13, 22, 36),
-        mid=(91, 88, 91),
-        white=(216, 190, 151),
+        black=(12, 18, 28),
+        mid=(112, 109, 105),
+        white=(232, 212, 180),
     ).convert("RGB")
-    frame = Image.blend(frame, grade, 0.30)
+    frame = Image.blend(frame, grade, 0.10)
 
-    # Fixed vignette and subtle matte. No per-frame grain or animated noise.
+    detail = frame.filter(ImageFilter.UnsharpMask(radius=1.4, percent=100, threshold=3))
+    frame = Image.blend(frame, detail, 0.38)
+
     overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    draw.rectangle((0, 0, WIDTH, HEIGHT), fill=(7, 9, 13, 20))
-    for inset, alpha in ((0, 38), (55, 25), (120, 14)):
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill=(6, 8, 12, 6))
+    for inset, alpha in ((0, 18), (80, 11), (150, 6)):
         draw.rounded_rectangle(
             (inset, inset, WIDTH - inset, HEIGHT - inset),
             radius=70,
             outline=(0, 0, 0, alpha),
-            width=90,
+            width=58,
         )
 
     frame = Image.alpha_composite(frame.convert("RGBA"), overlay).convert("RGB")
@@ -3716,6 +3774,7 @@ def _local_visual_beat(
             else "literal"
         ),
         "must_show": [excerpt],
+        "sync_keywords": [excerpt],
         "must_not_show": [
             "unrelated generic camp",
             "symbolic substitute instead of the named event",
@@ -3726,7 +3785,10 @@ def _local_visual_beat(
             f"this exact narration beat: {narration_text}. "
             f"Topic context: {topic}. Show the concrete people, action, place, "
             f"object or consequence named in the narration, not a generic "
-            f"historical atmosphere. One single coherent 16:9 scene."
+            f"historical atmosphere. Keep the main subject visually clear, with "
+            f"the action and setting readable in the same frame. Use a crisp, "
+            f"detailed, rich but realistic cinematic look. One single coherent "
+            f"16:9 scene."
         ),
         "negative_prompt": (
             "unrelated scene, generic army camp when another event is named, "
@@ -3738,7 +3800,6 @@ def _local_visual_beat(
         "ambient_profile": "exterior_wind",
         "importance": "normal",
         "continuity_bridge": "Exact next passage of the same narration.",
-        "sync_keywords": [],
     }
 
 
@@ -3826,6 +3887,9 @@ KURALLAR:
 - Aynı kompozisyonu veya aynı ana görseli tekrar etme.
 - Her beat farklı kamera konumu değil, gerçekten farklı bir tarihsel an olsun.
 - image_prompt tek bir tutarlı sahne tarif etsin; kolaj ve split screen olmasın.
+- image_prompt ve must_show alanları, beat içindeki ana kişi/nesne/eylem/yer bilgisini
+  açıkça taşısın; generic atmosfer ya da uzak boş manzara önermesin.
+- sync_keywords alanı kısa ve somut olsun; ana özne, ana eylem ve ana mekânı içersin.
 - Dönem, coğrafya, kıyafet, mimari ve araçlar tarihsel bağlama uygun olsun.
 - ambient_profile yalnızca şu değerlerden biri olsun:
   {sorted(ALLOWED_AMBIENT_PROFILES)}
@@ -3881,6 +3945,10 @@ KURALLAR:
             )
         if not str(beat.get("visual_contract", "")).strip():
             beat["visual_contract"] = _scene_visual_contract(beat)
+        if not beat.get("sync_keywords"):
+            beat["sync_keywords"] = _scene_sync_checklist(beat)[:4]
+        if not beat.get("must_show"):
+            beat["must_show"] = _scene_sync_checklist(beat)[:3]
         beat["transition"] = "cut"
         beat["transition_duration"] = 0.20
 
@@ -4886,7 +4954,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V9-3.txt").write_text(
+    (OUTPUT / "HATA-V9-4.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -4971,9 +5039,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V9.3 — ZERO TEXT FRAMES ACTIVE")
+    print("UYKU VE TARİH V9.4 — STORY LOCKED RICH FRAMES ACTIVE")
     print("Konu:", topic)
-    print("ZERO TEXT FRAMES: no glyphs → safe crop → fast render")
+    print("STORY LOCKED RICH FRAMES: exact narrated beat → richer grade → safe final")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -5147,7 +5215,7 @@ def main() -> None:
         )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v9-3-zero-text-frames.mp4"
+    video = OUTPUT / "uyku-tarih-v9-4-story-locked-rich-frames.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -5225,6 +5293,11 @@ def main() -> None:
             "external_caption_band_sanitizer": True,
             "text_risk_model_routing": True,
             "intentional_local_turkish_cards_preserved": True,
+            "story_lock_prompting": True,
+            "visual_contract_enforced_in_prompt": True,
+            "sync_keyword_checklist_in_prompt": True,
+            "richer_frame_grade": True,
+            "less_destructive_text_crop": True,
                 "finite_audio_padding": True,
                 "zero_pause_direct_copy": True,
                 "ffmpeg_timeout_seconds": 900,
@@ -5302,8 +5375,8 @@ def main() -> None:
 
         (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
             (
-                "V9.3 Zero Text Frames yalnızca konu girdisiyle üretildi.\n\n"
-                "Önce uyku-tarih-v9-3-zero-text-frames.mp4 dosyasını izle.\n"
+                "V9.4 Story Locked Rich Frames yalnızca konu girdisiyle üretildi.\n\n"
+                "Önce uyku-tarih-v9-4-story-locked-rich-frames.mp4 dosyasını izle.\n"
                 "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
                 "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
                 "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -5327,7 +5400,7 @@ def main() -> None:
             pass
 
     print("=" * 72)
-    print("V9.3 ZERO TEXT FRAMES TAMAMLANDI")
+    print("V9.4 STORY LOCKED RICH FRAMES TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
