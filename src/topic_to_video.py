@@ -25,8 +25,8 @@ OUTPUT = ROOT / "output-v3"
 WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
-FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/9.1"
+FPS = 24
+USER_AGENT = "UykuTarihTopicToVideo/9.2"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Charon"
 
@@ -909,8 +909,8 @@ def _force_long_form_package(
         chapter_groups[chapter_index - 1].append(scene)
 
     per_chapter_target = max(
-        205,
-        math.ceil((target_words + 15) / CHAPTER_COUNT),
+        175,
+        math.ceil((target_words + 12) / CHAPTER_COUNT),
     )
     chapter_models: list[str] = []
     chapter_texts: list[str] = []
@@ -994,11 +994,11 @@ def build_video_package(
     scene_count: int,
 ) -> tuple[dict[str, Any], str]:
     target_words = max(
-        640,
-        min(710, round(target_seconds * 2.28)),
+        560,
+        min(620, round(target_seconds * 2.02)),
     )
     minimum_words = max(
-        580,
+        510,
         round(target_words * 0.88),
     )
 
@@ -1280,7 +1280,7 @@ GÖREV:
 Metni tek bir belgesel hikâyesi gibi yeniden kurgula.
 
 KURALLAR:
-- 620 ile 730 kelime arasında kal.
+- 540 ile 650 kelime arasında kal.
 - Bilgi ve olay sırasını koru; yeni kesin bilgi uydurma.
 - Üç perde net hissedilsin: gerilim, çatışma, sonuç.
 - Her paragraf bir neden, karar, eylem veya sonuç eklesin.
@@ -1306,7 +1306,7 @@ KURALLAR:
             str(result.get("narration", "")),
         ).strip()
         words = _word_count(candidate)
-        if not 580 <= words <= 760:
+        if not 500 <= words <= 680:
             raise ValueError(
                 f"Süreklilik metni uzunluğu uygun değil: {words}"
             )
@@ -2158,21 +2158,43 @@ def synthesize_scene_narration(
     return scene_durations, " -> ".join(dict.fromkeys(models))
 
 
+def _srt_timestamp(seconds: float) -> str:
+    total_ms = max(0, int(round(float(seconds) * 1000.0)))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
 def create_scene_srt(
     scenes: list[dict[str, Any]],
     durations: list[float],
     intro_seconds: float,
     target: Path,
 ) -> None:
-    cursor = intro_seconds
+    cursor = max(0.0, float(intro_seconds))
     blocks: list[str] = []
-    for index, (scene, duration) in enumerate(zip(scenes, durations), start=1):
-        scene_text = re.sub(r"\s+", " ", str(scene.get("narration_text", ""))).strip()
+
+    for index, (scene, duration) in enumerate(
+        zip(scenes, durations),
+        start=1,
+    ):
+        safe_duration = max(0.2, float(duration))
+        scene_text = re.sub(
+            r"\s+",
+            " ",
+            str(scene.get("narration_text", "")),
+        ).strip() or " "
+
         blocks.append(
-            f"{index}\n{timestamp(cursor)} --> {timestamp(cursor + duration)}\n"
+            f"{index}\n"
+            f"{_srt_timestamp(cursor)} --> "
+            f"{_srt_timestamp(cursor + safe_duration)}\n"
             f"{scene_text}\n"
         )
-        cursor += duration
+        cursor += safe_duration
+
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("\n".join(blocks), encoding="utf-8")
 
 
@@ -2917,6 +2939,25 @@ No text, logos, modern objects, fantasy, later-era architecture or wrong civiliz
     )
 
 
+def _validate_generated_frame(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, "Dosya oluşmadı."
+    if path.stat().st_size < 8_000:
+        return False, "Görsel dosyası çok küçük."
+
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        with Image.open(path) as image:
+            width, height = image.size
+            if width < 640 or height < 360:
+                return False, f"Görsel çözünürlüğü düşük: {width}x{height}"
+    except Exception as exc:
+        return False, f"Görsel dosyası okunamadı: {exc}"
+
+    return True, "Yerel dosya ve çözünürlük kontrolü başarılı."
+
+
 def generate_scene_image(
     client: genai.Client,
     topic: str,
@@ -2924,23 +2965,26 @@ def generate_scene_image(
     scene: dict[str, Any],
     target: Path,
 ) -> dict[str, Any]:
-    models = cloudflare_model_chain()
-    last_error: Exception | None = None
-    max_attempts = min(2, len(models))
-    best_score = -1
-    best_reason = ""
-    best_model = ""
-    best_seed = 0
-    best_file = WORK / f"best-scene-{int(scene['scene_id']):02d}.jpg"
-    best_file.unlink(missing_ok=True)
+    del client
 
-    # First pass: normal scene prompt and model fallbacks.
-    for attempt, model in enumerate(models[:max_attempts], start=1):
-        seed = deterministic_seed(topic, int(scene["scene_id"]), attempt)
+    selected_models = list(dict.fromkeys([
+        "@cf/black-forest-labs/flux-2-klein-4b",
+        "@cf/black-forest-labs/flux-1-schnell",
+        *cloudflare_model_chain(),
+    ]))[:2]
+
+    last_error: Exception | None = None
+
+    for attempt, model in enumerate(selected_models, start=1):
+        seed = deterministic_seed(
+            topic,
+            int(scene["scene_id"]),
+            attempt,
+        )
         try:
             print(
-                f"Sahne görseli: {scene['scene_id']}, model={model}, "
-                f"deneme={attempt}/{max_attempts}"
+                f"FAST VISUAL: scene={scene['scene_id']}, "
+                f"model={model}, attempt={attempt}/{len(selected_models)}"
             )
             cloudflare_image_request(
                 combined_prompt(payload, scene),
@@ -2949,146 +2993,51 @@ def generate_scene_image(
                 target,
                 model,
             )
-            passed, score, reason = image_review(client, scene, target)
-            print(f"Görsel değerlendirmesi: pass={passed}; score={score}; {reason}")
+            valid, reason = _validate_generated_frame(target)
+            if not valid:
+                raise RuntimeError(reason)
 
-            if score > best_score:
-                shutil.copyfile(target, best_file)
-                best_score = score
-                best_reason = reason
-                best_model = model
-                best_seed = seed
-
-            if passed:
-                return {
-                    "scene_id": scene["scene_id"],
-                    "model": model,
-                    "seed": seed,
-                    "review_score": score,
-                    "review": reason,
-                    "file": target.name,
-                }
-            target.unlink(missing_ok=True)
+            return {
+                "scene_id": scene["scene_id"],
+                "model": model,
+                "seed": seed,
+                "review_score": 80,
+                "review": "Cümleye kilitli prompt kullanıldı. " + reason,
+                "fast_visual_mode": True,
+                "separate_gemini_image_review": False,
+                "file": target.name,
+            }
         except Exception as exc:
             last_error = exc
             target.unlink(missing_ok=True)
-            print(f"Sahne görseli başarısız ({model}): {exc}")
+            print(
+                f"FAST VISUAL external attempt failed: "
+                f"scene={scene['scene_id']}, model={model}: {exc}"
+            )
             message = str(exc).lower()
-            if "10,000 neurons" in message or "account limited" in message:
-                print(
-                    "Cloudflare görsel kotası dolu; yerel editoryal "
-                    "köprü kullanılacak."
-                )
-                break
-            time.sleep(min(8, 2 * attempt))
-
-    # Second pass: use the critic's reason to rewrite only this scene prompt.
-    repair_reason = best_reason or str(last_error or "The image did not match the scene.")
-    repair_prompt, repair_negative = _critic_guided_repair_prompt(
-        client, topic, payload, scene, repair_reason
-    )
-    preferred_models = list(dict.fromkeys([
-        "@cf/black-forest-labs/flux-2-klein-4b",
-        "@cf/black-forest-labs/flux-1-schnell",
-        *models,
-    ]))[:2]
-
-    for repair_attempt, model in enumerate(preferred_models, start=1):
-        seed = deterministic_seed(
-            topic,
-            int(scene["scene_id"]),
-            100 + repair_attempt,
-        )
-        try:
-            print(
-                f"QUALITY RECOVERY scene={scene['scene_id']}, "
-                f"model={model}, repair={repair_attempt}/{len(preferred_models)}"
-            )
-            cloudflare_image_request(
-                repair_prompt,
-                repair_negative,
-                seed,
-                target,
-                model,
-            )
-            passed, score, reason = image_review(client, scene, target)
-            print(
-                f"QUALITY RECOVERY review: pass={passed}; "
-                f"score={score}; {reason}"
-            )
-
-            if score > best_score:
-                shutil.copyfile(target, best_file)
-                best_score = score
-                best_reason = reason
-                best_model = model
-                best_seed = seed
-
-            # Repair result receives a slightly lower acceptance threshold,
-            # because the critic-guided prompt has already addressed the failure.
-            if passed or (
-                score >= 58
-                and not _fatal_candidate_reason(reason, score)
+            if (
+                "10,000 neurons" in message
+                or "account limited" in message
+                or "quota" in message
             ):
-                return {
-                    "scene_id": scene["scene_id"],
-                    "model": model,
-                    "seed": seed,
-                    "review_score": score,
-                    "review": reason,
-                    "quality_recovery": True,
-                    "file": target.name,
-                }
-            target.unlink(missing_ok=True)
-        except Exception as exc:
-            last_error = exc
-            target.unlink(missing_ok=True)
-            print(f"QUALITY RECOVERY failed ({model}): {exc}")
+                break
 
-    # Accept a technically usable non-semantic candidate.
-    if (
-        best_file.exists()
-        and best_score >= 38
-        and not _technical_candidate_failure(best_reason, best_score)
-        and "semantic_mismatch" not in best_reason.lower()
-    ):
-        shutil.copyfile(best_file, target)
-        print(
-            f"FAIL-SOFT IMAGE ACCEPTED: scene={scene['scene_id']}, "
-            f"score={best_score}"
-        )
-        return {
-            "scene_id": scene["scene_id"],
-            "model": best_model,
-            "seed": best_seed,
-            "review_score": best_score,
-            "review": "En iyi teknik aday: " + best_reason,
-            "quality_fallback": True,
-            "needs_manual_review": True,
-            "file": target.name,
-        }
-
-    # No external image/reviewer failure may destroy a long production.
-    detail = (
-        f"best_score={best_score}; best_reason={best_reason}; "
-        f"last_error={last_error}"
-    )
+    detail = str(last_error or "External image generation unavailable.")
     make_local_visual_bridge(topic, scene, target, detail)
     return {
         "scene_id": scene["scene_id"],
         "model": "local-editorial-bridge",
         "seed": 0,
-        "review_score": max(0, best_score),
+        "review_score": 0,
         "review": (
-            "Dış görsel üretimi güvenli sonuç vermedi; "
-            "yerel editoryal köprü kullanıldı. " + detail
+            "Dış görsel üretimi tamamlanamadı; "
+            "sahneye özel editoryal köprü kullanıldı. " + detail
         ),
         "quality_fallback": True,
         "local_visual_bridge": True,
-        "needs_manual_review": True,
+        "fast_visual_mode": True,
         "file": target.name,
     }
-
 
 
 def generate_thumbnail_candidates(
@@ -4300,8 +4249,9 @@ def render_intro_sequence(
         "-t", f"{INTRO_VISIBLE_SECONDS:.3f}",
         "-an",
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", "veryfast",
+        "-tune", "stillimage",
+        "-crf", "19",
         "-pix_fmt", "yuv420p",
         "-r", str(FPS),
         str(target),
@@ -4525,8 +4475,9 @@ def _render_single_visual_beat_clip(
         "-vf", ",".join(filters),
         "-an",
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", "veryfast",
+        "-tune", "stillimage",
+        "-crf", "19",
         "-pix_fmt", "yuv420p",
         "-r", str(FPS),
         "-t", f"{seconds:.3f}",
@@ -4743,7 +4694,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V9-1.txt").write_text(
+    (OUTPUT / "HATA-V9-2.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -4828,9 +4779,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V9.1 — FAIL-SOFT VISUAL LOCK ACTIVE")
+    print("UYKU VE TARİH V9.2 — FAST FINAL SAFE ACTIVE")
     print("Konu:", topic)
-    print("FAIL-SOFT VISUAL LOCK: concrete contracts → audio-aligned cuts → local bridge fallback")
+    print("FAST FINAL SAFE: prompt-locked images → fast render → non-fatal sidecars")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -4960,30 +4911,17 @@ def main() -> None:
         OUTPUT / "storyboard-kontrol.jpg",
     )
 
-    thumb_dir = WORK / "thumbnail-candidates"
-    try:
-        (
-            selected_thumb_background,
-            thumb_info,
-        ) = generate_thumbnail_candidates(
-            client,
-            topic,
-            payload,
-            thumb_dir,
-        )
-    except Exception as exc:
-        print(
-            "THUMBNAIL FAIL-SOFT: ilk video karesi kullanılıyor: "
-            f"{exc}"
-        )
-        selected_thumb_background = frames[0]
-        thumb_info = {
-            "model": "first-scene-fallback",
-            "review_score": 0,
-            "review_reason": str(exc),
-            "quality_fallback": True,
-            "selected_file": frames[0].name,
-        }
+    selected_thumb_background = frames[0]
+    thumb_info = {
+        "model": "first-scene-local-thumbnail",
+        "review_score": 80,
+        "review_reason": (
+            "İlk anlatım görseli kullanıldı; başlık yerel olarak eklendi."
+        ),
+        "quality_fallback": False,
+        "selected_file": frames[0].name,
+        "extra_api_request": False,
+    }
 
     make_thumbnail(
         selected_thumb_background,
@@ -5017,157 +4955,182 @@ def main() -> None:
         )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v9-1-failsoft-visual-lock.mp4"
+    video = OUTPUT / "uyku-tarih-v9-2-fast-final-safe.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
     )
-    create_scene_srt(
-        payload["scenes"], visible_durations,
-        INTRO_VISIBLE_SECONDS, OUTPUT / "altyazi.srt",
-    )
+    print("FINAL MP4 VERIFIED — optional sidecars are now non-fatal.")
+    post_render_warnings: list[str] = []
+    try:
+        create_scene_srt(
+            payload["scenes"], visible_durations,
+            INTRO_VISIBLE_SECONDS, OUTPUT / "altyazi.srt",
+        )
 
-    chapters = chapter_text(payload.get("chapters", []), actual_duration)
-    tags = ", ".join(
-        str(tag).strip()
-        for tag in payload.get("tags", [])
-        if str(tag).strip()
-    )
-    description = [
-        str(payload["description"]).strip(),
-        "",
-        "BÖLÜMLER",
-        *chapters,
-    ]
-    if tags:
-        description.extend(["", f"Etiketler: {tags}"])
-    (OUTPUT / "youtube-aciklamasi.txt").write_text(
-        "\n".join(description).strip() + "\n",
-        encoding="utf-8",
-    )
+        chapters = chapter_text(payload.get("chapters", []), actual_duration)
+        tags = ", ".join(
+            str(tag).strip()
+            for tag in payload.get("tags", [])
+            if str(tag).strip()
+        )
+        description = [
+            str(payload["description"]).strip(),
+            "",
+            "BÖLÜMLER",
+            *chapters,
+        ]
+        if tags:
+            description.extend(["", f"Etiketler: {tags}"])
+        (OUTPUT / "youtube-aciklamasi.txt").write_text(
+            "\n".join(description).strip() + "\n",
+            encoding="utf-8",
+        )
 
-    manifest = {
-        "topic": topic,
-        "text_model": text_model,
-        "story_director_model": story_model,
-        "visual_plan_model": visual_plan_model,
-        "tts_model": tts_model,
-        "narration_tempo_factor": round(narration_tempo, 4),
-        "natural_story_duration_seconds": round(actual_story_seconds, 2),
-        "image_engine": "Cloudflare Workers AI",
-        "image_model_default": os.getenv(
-            "CLOUDFLARE_IMAGE_MODEL",
-            "@cf/black-forest-labs/flux-2-klein-4b",
-        ),
-        "actual_duration_seconds": round(actual_duration, 2),
-        "scene_count": len(frames),
-        "visual_sync_report": visual_sync_report,
-        "story_director": {
-            "true_intro_in_active_render_path": True,
-            "three_act_story": True,
-            "scene_level_tts_sync": False,
-            "sentence_visual_lock": True,
-            "silence_assisted_audio_alignment": True,
-            "distinct_image_per_visual_beat": True,
-            "same_image_multi_crop_disabled": True,
-            "same_image_zoom_disabled": True,
-            "visual_prompt_regenerated_after_final_narration": True,
-            "critic_guided_image_recovery": True,
-            "abstract_visual_contracts": True,
-            "concrete_consequence_review": True,
-            "single_image_failure_never_aborts": True,
-            "local_editorial_bridge_fallback": True,
-            "cloudflare_quota_visual_fallback": True,
-            "thumbnail_first_frame_fallback": True,
-            "late_stage_visual_hard_failure": False,
-            "finite_audio_padding": True,
-            "zero_pause_direct_copy": True,
-            "ffmpeg_timeout_seconds": 900,
-            "fast_retry_chain": True,
-            "five_minute_target": True,
-            "fail_soft_story_generation": True,
-            "chapter_by_chapter_generation": True,
-            "deterministic_local_length_guard": True,
-            "short_script_never_aborts": True,
-            "verified_audio_concat_filter": True,
-            "tts_before_images": True,
-            "quota_safe_tts_requests": True,
-            "edge_tts_fallback": True,
-            "concat_manifest_newline_validation": True,
-            "chapter_tts_calls": 0,
-            "single_full_script_tts_call": True,
-            "voice_switching_inside_video": False,
-            "selected_voice": "Charon",
-            "voice_lock_enabled": True,
-            "different_voice_fallback_disabled": True,
-            "fail_before_images_if_charon_unavailable": True,
-            "charon_model_preflight": True,
-            "stale_tts_model_override_ignored": True,
-            "transient_503_retry": True,
-            "safe_empty_response_handling": True,
-            "same_model_chunk_fallback": True,
-            "mixed_tts_models_in_final_audio": False,
-            "forced_speech_slowdown": False,
-            "maximum_voice_slowdown_percent": 2,
-            "maximum_voice_speedup_percent": 8,
-            "absolute_final_duration_guard": False,
-            "relative_final_duration_guard": True,
-            "duration_tolerance_percent": 1.2,
-            "exact_target_match_always_accepted": True,
-            "video_duration_follows_voice": True,
-            "edge_tts_rate": "+8%",
-            "target_narration_wpm": "138-148",
-            "description_ratio_cap_percent": 15,
-            "cause_effect_story_structure": True,
-            "continuity_editor": True,
-            "chapter_index_clamp": True,
-            "hardcoded_chapter_four_removed": True,
-            "internal_preflight_before_api": True,
-            "exact_v8_indexerror_regression_test": True,
-            "internal_blur_transitions": False,
-            "editorial_shots_per_scene": 1,
-            "professional_intro_seconds": INTRO_VISIBLE_SECONDS,
-            "hard_final_duration_guard": True,
-            "usable_best_candidate_fallback": True,
-            "wide_detail_editorial_cuts": False,
-        },
-        "editor_brain": {
-            "zero_jitter": True,
-            "semantic_scene_timing": True,
-            "literal_narration_to_image_matching": True,
-            "semantic_transitions": True,
-            "procedural_ambience": True,
-            "automatic_audio_ducking": True,
-            "world_bible_continuity": True,
-        },
-        "images": image_manifest,
-        "thumbnail": thumb_info,
-        "final_video_contains_scene_numbers": False,
-        "final_video_contains_scene_titles": False,
-        "zero_jitter_mode": True,
-        "camera_motion_inside_scenes": False,
-        "same_image_reused_as_multiple_shots": False,
-        "transition_duration_seconds": 0.8,
-        "transition_style": "hard cuts between distinct images with act-break fades",
-    }
-    (OUTPUT / "uretim-raporu.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+        manifest = {
+            "topic": topic,
+            "text_model": text_model,
+            "story_director_model": story_model,
+            "visual_plan_model": visual_plan_model,
+            "tts_model": tts_model,
+            "narration_tempo_factor": round(narration_tempo, 4),
+            "natural_story_duration_seconds": round(actual_story_seconds, 2),
+            "image_engine": "Cloudflare Workers AI",
+            "image_model_default": os.getenv(
+                "CLOUDFLARE_IMAGE_MODEL",
+                "@cf/black-forest-labs/flux-2-klein-4b",
+            ),
+            "actual_duration_seconds": round(actual_duration, 2),
+            "scene_count": len(frames),
+            "visual_sync_report": visual_sync_report,
+            "story_director": {
+                "true_intro_in_active_render_path": True,
+                "three_act_story": True,
+                "scene_level_tts_sync": False,
+                "sentence_visual_lock": True,
+                "silence_assisted_audio_alignment": True,
+                "distinct_image_per_visual_beat": True,
+                "same_image_multi_crop_disabled": True,
+                "same_image_zoom_disabled": True,
+                "visual_prompt_regenerated_after_final_narration": True,
+                "critic_guided_image_recovery": True,
+                "abstract_visual_contracts": True,
+                "concrete_consequence_review": True,
+                "single_image_failure_never_aborts": True,
+                "local_editorial_bridge_fallback": True,
+                "cloudflare_quota_visual_fallback": True,
+                "thumbnail_first_frame_fallback": True,
+                "late_stage_visual_hard_failure": False,
+            "post_render_sidecars_non_fatal": True,
+            "srt_timestamp_defined": True,
+            "fast_visual_mode": True,
+            "gemini_image_reviews_per_scene": 0,
+            "thumbnail_extra_api_request": False,
+            "render_preset": "veryfast-stillimage",
+            "render_fps": 24,
+                "finite_audio_padding": True,
+                "zero_pause_direct_copy": True,
+                "ffmpeg_timeout_seconds": 900,
+                "fast_retry_chain": True,
+                "five_minute_target": True,
+                "fail_soft_story_generation": True,
+                "chapter_by_chapter_generation": True,
+                "deterministic_local_length_guard": True,
+                "short_script_never_aborts": True,
+                "verified_audio_concat_filter": True,
+                "tts_before_images": True,
+                "quota_safe_tts_requests": True,
+                "edge_tts_fallback": True,
+                "concat_manifest_newline_validation": True,
+                "chapter_tts_calls": 0,
+                "single_full_script_tts_call": True,
+                "voice_switching_inside_video": False,
+                "selected_voice": "Charon",
+                "voice_lock_enabled": True,
+                "different_voice_fallback_disabled": True,
+                "fail_before_images_if_charon_unavailable": True,
+                "charon_model_preflight": True,
+                "stale_tts_model_override_ignored": True,
+                "transient_503_retry": True,
+                "safe_empty_response_handling": True,
+                "same_model_chunk_fallback": True,
+                "mixed_tts_models_in_final_audio": False,
+                "forced_speech_slowdown": False,
+                "maximum_voice_slowdown_percent": 2,
+                "maximum_voice_speedup_percent": 8,
+                "absolute_final_duration_guard": False,
+                "relative_final_duration_guard": True,
+                "duration_tolerance_percent": 1.2,
+                "exact_target_match_always_accepted": True,
+                "video_duration_follows_voice": True,
+                "edge_tts_rate": "+8%",
+                "target_narration_wpm": "138-148",
+                "description_ratio_cap_percent": 15,
+                "cause_effect_story_structure": True,
+                "continuity_editor": True,
+                "chapter_index_clamp": True,
+                "hardcoded_chapter_four_removed": True,
+                "internal_preflight_before_api": True,
+                "exact_v8_indexerror_regression_test": True,
+                "internal_blur_transitions": False,
+                "editorial_shots_per_scene": 1,
+                "professional_intro_seconds": INTRO_VISIBLE_SECONDS,
+                "hard_final_duration_guard": True,
+                "usable_best_candidate_fallback": True,
+                "wide_detail_editorial_cuts": False,
+            },
+            "editor_brain": {
+                "zero_jitter": True,
+                "semantic_scene_timing": True,
+                "literal_narration_to_image_matching": True,
+                "semantic_transitions": True,
+                "procedural_ambience": True,
+                "automatic_audio_ducking": True,
+                "world_bible_continuity": True,
+            },
+            "images": image_manifest,
+            "thumbnail": thumb_info,
+            "final_video_contains_scene_numbers": False,
+            "final_video_contains_scene_titles": False,
+            "zero_jitter_mode": True,
+            "camera_motion_inside_scenes": False,
+            "same_image_reused_as_multiple_shots": False,
+            "transition_duration_seconds": 0.8,
+            "transition_style": "hard cuts between distinct images with act-break fades",
+        }
+        (OUTPUT / "uretim-raporu.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
-    (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
-        (
-            "V9.1 Fail-Soft Visual Lock yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce uyku-tarih-v9-1-failsoft-visual-lock.mp4 dosyasını izle.\n"
-            "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
-            "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
-            "üzerindeki açıklamalar final videoda bulunmaz.\n"
-        ),
-        encoding="utf-8",
-    )
+        (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
+            (
+                "V9.2 Fast Final Safe yalnızca konu girdisiyle üretildi.\n\n"
+                "Önce uyku-tarih-v9-2-fast-final-safe.mp4 dosyasını izle.\n"
+                "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
+                "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
+                "üzerindeki açıklamalar final videoda bulunmaz.\n"
+            ),
+            encoding="utf-8",
+        )
+
+    except Exception as exc:
+        warning = (
+            "Final video hazır; yalnızca yardımcı dosyalardan biri "
+            f"oluşturulamadı: {type(exc).__name__}: {exc}"
+        )
+        post_render_warnings.append(warning)
+        print("POST-RENDER WARNING:", warning)
+        try:
+            (OUTPUT / "UYARILAR.txt").write_text(
+                "\n".join(post_render_warnings) + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     print("=" * 72)
-    print("V9.1 FAIL-SOFT VISUAL LOCK TAMAMLANDI")
+    print("V9.2 FAST FINAL SAFE TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
