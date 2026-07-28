@@ -26,7 +26,7 @@ WORK = ROOT / "work-v3"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-USER_AGENT = "UykuTarihTopicToVideo/8.1"
+USER_AGENT = "UykuTarihTopicToVideo/8.2"
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 VOICE_NAME = "Schedar"
 
@@ -82,8 +82,8 @@ SCENE_PAUSE_SECONDS = 0.18
 DEFAULT_TARGET_SECONDS = 300
 DEFAULT_SCENE_COUNT = 12
 CHAPTER_COUNT = 3
-MIN_FINAL_VIDEO_SECONDS = 285
-MAX_FINAL_VIDEO_SECONDS = 315
+MIN_FINAL_VIDEO_SECONDS = 260
+MAX_FINAL_VIDEO_SECONDS = 330
 
 TRANSITIONS = [
     "fade",
@@ -908,8 +908,8 @@ def _force_long_form_package(
         chapter_groups[chapter_index - 1].append(scene)
 
     per_chapter_target = max(
-        150,
-        math.ceil((target_words + 20) / CHAPTER_COUNT),
+        205,
+        math.ceil((target_words + 15) / CHAPTER_COUNT),
     )
     chapter_models: list[str] = []
     chapter_texts: list[str] = []
@@ -993,12 +993,12 @@ def build_video_package(
     scene_count: int,
 ) -> tuple[dict[str, Any], str]:
     target_words = max(
-        500,
-        min(560, round(target_seconds * 1.82)),
+        640,
+        min(710, round(target_seconds * 2.28)),
     )
     minimum_words = max(
-        430,
-        round(target_words * 0.82),
+        580,
+        round(target_words * 0.88),
     )
 
     prompt = f"""
@@ -1279,7 +1279,7 @@ GÖREV:
 Metni tek bir belgesel hikâyesi gibi yeniden kurgula.
 
 KURALLAR:
-- 480 ile 590 kelime arasında kal.
+- 620 ile 730 kelime arasında kal.
 - Bilgi ve olay sırasını koru; yeni kesin bilgi uydurma.
 - Üç perde net hissedilsin: gerilim, çatışma, sonuç.
 - Her paragraf bir neden, karar, eylem veya sonuç eklesin.
@@ -1305,7 +1305,7 @@ KURALLAR:
             str(result.get("narration", "")),
         ).strip()
         words = _word_count(candidate)
-        if not 430 <= words <= 650:
+        if not 580 <= words <= 760:
             raise ValueError(
                 f"Süreklilik metni uzunluğu uygun değil: {words}"
             )
@@ -1406,7 +1406,7 @@ This is chapter {chapter_index} of {chapter_count}; it must sound like one
 continuous five-minute story, not a fresh introduction.
 
 Calm, grounded, warm and intimate. Standard Turkey Turkish.
-Late-night historical documentary. Slow but conversational.
+Late-night historical documentary. Natural documentary pace.
 Natural pauses, clear articulation and gentle sentence endings.
 No trailer voice, no advertisement, no newsreader tone.
 Do not add, remove or paraphrase words. No music or effects.
@@ -1467,9 +1467,9 @@ def synthesize_edge_tts(
             communicator = edge_tts.Communicate(
                 narration,
                 voice_name,
-                rate="-8%",
-                pitch="-3Hz",
-                volume="-2%",
+                rate="+8%",
+                pitch="-1Hz",
+                volume="+0%",
             )
             await communicator.save(str(mp3_target))
             return voice_name
@@ -1492,9 +1492,9 @@ def synthesize_edge_tts(
             communicator = edge_tts.Communicate(
                 narration,
                 selected,
-                rate="-8%",
-                pitch="-3Hz",
-                volume="-2%",
+                rate="+8%",
+                pitch="-1Hz",
+                volume="+0%",
             )
             await communicator.save(str(mp3_target))
             return selected
@@ -1725,6 +1725,38 @@ def fit_audio_duration(
             "Ses hedef süreye getirilemedi: "
             f"{final_duration:.2f}s / {target_seconds:.2f}s"
         )
+
+
+def prepare_natural_narration(
+    source: Path,
+    target: Path,
+    preferred_seconds: float,
+) -> tuple[float, float]:
+    """Preserve natural speech: max 2% slower, max 8% faster."""
+    preferred_seconds = max(1.0, float(preferred_seconds))
+    current = ffprobe_duration(source)
+    if current <= 0:
+        raise RuntimeError("Seslendirme süresi okunamadı.")
+    ideal_factor = current / preferred_seconds
+    tempo_factor = max(0.98, min(1.08, ideal_factor))
+    target.unlink(missing_ok=True)
+    if abs(tempo_factor - 1.0) < 0.006:
+        shutil.copy2(source, target)
+    else:
+        run([
+            "ffmpeg", "-y", "-i", str(source),
+            "-af", f"atempo={tempo_factor:.6f},aresample=48000,asetpts=N/SR/TB",
+            "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", str(target),
+        ])
+    actual = ffprobe_duration(target)
+    if actual <= 0:
+        raise RuntimeError("Doğal hızdaki seslendirme oluşturulamadı.")
+    print(
+        "NATURAL VOICE TIMING: "
+        f"raw={current:.2f}s, tempo={tempo_factor:.3f}, "
+        f"final={actual:.2f}s, preferred={preferred_seconds:.2f}s"
+    )
+    return actual, tempo_factor
 
 
 def _allocate_exact_duration(
@@ -2828,9 +2860,12 @@ Mature Turkish male documentary narrator. Calm, grounded, warm and natural.
 Standard Turkey Turkish pronunciation. Close studio microphone.
 
 PERFORMANCE:
-Late-night historical documentary for relaxed listening.
-Slow but conversational. Stable low energy. Gentle sentence endings.
-Natural short pauses. Clear articulation without theatrical emphasis.
+Premium historical documentary for relaxed listening.
+Natural conversational documentary pace, approximately 138–148 words per minute.
+Warm and controlled, but never sleepy, dragged out or lethargic.
+Use short natural pauses only where punctuation requires them.
+Keep sentences moving forward with clear cause-and-effect emphasis.
+Clear articulation without theatrical emphasis.
 Never sound like an advertisement, trailer, newsreader or stage actor.
 Do not whisper. Do not add or remove words. No music or sound effects.
 
@@ -3924,7 +3959,7 @@ def chapter_text(chapters: list[str], duration: float) -> list[str]:
 
 def failure_file(exc: BaseException) -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT / "HATA-V8-1.txt").write_text(
+    (OUTPUT / "HATA-V8-2.txt").write_text(
         f"{type(exc).__name__}: {exc}\n",
         encoding="utf-8",
     )
@@ -4009,9 +4044,9 @@ def main() -> None:
     client = genai.Client(api_key=gemini_key)
 
     print("=" * 72)
-    print("UYKU VE TARİH V8.1 — GUARDED NARRATIVE CUT ACTIVE")
+    print("UYKU VE TARİH V8.2 — NATURAL VOICE CUT ACTIVE")
     print("Konu:", topic)
-    print("GUARDED CUT: preflight → story → one voice → render")
+    print("NATURAL VOICE: full script → one narrator → no forced slowdown")
     print("=" * 72)
 
     payload, text_model = build_video_package(
@@ -4055,13 +4090,13 @@ def main() -> None:
         raw_audio,
     )
     normalize_audio(raw_audio, normalized_audio)
-    fit_audio_duration(
+    actual_story_seconds, narration_tempo = prepare_natural_narration(
         normalized_audio,
         narration_audio,
         story_seconds,
     )
     visible_durations = _allocate_exact_duration(
-        story_seconds,
+        actual_story_seconds,
         [
             max(
                 1,
@@ -4126,14 +4161,17 @@ def main() -> None:
     final_audio_raw = WORK / "final-audio-raw.wav"
     final_audio = OUTPUT / "ses-tasarim.wav"
     concat_audio_files([intro_audio, story_audio], final_audio_raw)
-    fit_audio_duration(
-        final_audio_raw,
-        final_audio,
-        target_seconds,
-    )
+    shutil.copy2(final_audio_raw, final_audio)
+    expected_total_seconds = INTRO_VISIBLE_SECONDS + actual_story_seconds
+    final_audio_seconds = ffprobe_duration(final_audio)
+    if abs(final_audio_seconds - expected_total_seconds) > 1.2:
+        raise RuntimeError(
+            "Final doğal ses süresi kontrolünü geçemedi: "
+            f"{final_audio_seconds:.2f}s / {expected_total_seconds:.2f}s"
+        )
 
     print("AŞAMA 4/4: Final video render ediliyor.")
-    video = OUTPUT / "uyku-tarih-v8-1-guarded-cut.mp4"
+    video = OUTPUT / "uyku-tarih-v8-2-natural-voice.mp4"
     actual_duration = render_video(
         frames, payload["scenes"], final_audio, video,
         visible_durations, transitions, transition_durations,
@@ -4167,6 +4205,8 @@ def main() -> None:
         "text_model": text_model,
         "story_director_model": story_model,
         "tts_model": tts_model,
+        "narration_tempo_factor": round(narration_tempo, 4),
+        "natural_story_duration_seconds": round(actual_story_seconds, 2),
         "image_engine": "Cloudflare Workers AI",
         "image_model_default": os.getenv(
             "CLOUDFLARE_IMAGE_MODEL",
@@ -4196,6 +4236,12 @@ def main() -> None:
             "chapter_tts_calls": 0,
             "single_full_script_tts_call": True,
             "voice_switching_inside_video": False,
+            "forced_speech_slowdown": False,
+            "maximum_voice_slowdown_percent": 2,
+            "maximum_voice_speedup_percent": 8,
+            "video_duration_follows_voice": True,
+            "edge_tts_rate": "+8%",
+            "target_narration_wpm": "138-148",
             "description_ratio_cap_percent": 15,
             "cause_effect_story_structure": True,
             "continuity_editor": True,
@@ -4234,8 +4280,8 @@ def main() -> None:
 
     (OUTPUT / "ONCE-BUNU-OKU.txt").write_text(
         (
-            "V8.1 Guarded Narrative Cut yalnızca konu girdisiyle üretildi.\n\n"
-            "Önce uyku-tarih-v8-1-guarded-cut.mp4 dosyasını izle.\n"
+            "V8.2 Natural Voice Cut yalnızca konu girdisiyle üretildi.\n\n"
+            "Önce uyku-tarih-v8-2-natural-voice.mp4 dosyasını izle.\n"
             "kapak.jpg dosyasını mobil boyutta kontrol et.\n"
             "storyboard-kontrol.jpg yalnızca kalite kontrol dosyasıdır; "
             "üzerindeki açıklamalar final videoda bulunmaz.\n"
@@ -4244,7 +4290,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("V8.1 GUARDED NARRATIVE CUT TAMAMLANDI")
+    print("V8.2 NATURAL VOICE CUT TAMAMLANDI")
     print("Video:", video)
     print("=" * 72)
 
