@@ -24,7 +24,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from google import genai
 from google.genai import types
 
-VERSION = "10.4.0"
+VERSION = "10.5.0"
 ROOT = Path(__file__).resolve().parents[1]
 PROJECTS = ROOT / "projects"
 FPS = 24
@@ -43,6 +43,33 @@ CHARON_CHUNK_TARGET_WORDS = max(
     int(os.getenv("CHARON_CHUNK_TARGET_WORDS", "520")),
 )
 CHARON_ONLY = True
+
+CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
+CLOUDFLARE_IMAGE_MODEL = os.getenv(
+    "CLOUDFLARE_IMAGE_MODEL",
+    "@cf/black-forest-labs/flux-2-klein-4b",
+).strip()
+CLOUDFLARE_FALLBACK_IMAGE_MODEL = os.getenv(
+    "CLOUDFLARE_FALLBACK_IMAGE_MODEL",
+    "@cf/black-forest-labs/flux-1-schnell",
+).strip()
+AI_IMAGE_PROMPT_LIMIT = 1320
+AI_IMAGE_NEGATIVE_LIMIT = 360
+AI_VISUAL_STYLE = """
+Photorealistic cinematic historical reconstruction for a premium documentary.
+The exact narrated event must be visible in one coherent 16:9 frame. Rich but
+realistic color, clear exposure, crisp period materials, believable people,
+accurate architecture, strong subject separation, natural skin, detailed stone,
+wood, fabric and metal. The result should look like a frame from a serious
+historical film, not an illustration, museum photo, generic landscape or game.
+""".strip()
+AI_VISUAL_NEGATIVE = """
+text, letters, numbers, captions, subtitles, logo, watermark, fake alphabet,
+glyphs, labels, signs, banners with writing, collage, split screen, infographic,
+museum display, modern clothing, modern technology, electricity, cars, fantasy,
+science fiction, cartoon, anime, oversaturated, washed out, foggy unless asked,
+blurry, low detail, deformed face, malformed hands, extra fingers, duplicate people
+""".strip()
 
 RESEARCH_QUESTION_WORDS = {
     "nasıl", "nasil", "nedir", "kimdir", "nerede", "ne", "neden",
@@ -1354,6 +1381,344 @@ def candidate_tokens(value: str) -> set[str]:
     return tokens
 
 
+class CloudflareVisualQuotaPause(RuntimeError):
+    pass
+
+
+class CloudflareVisualUnavailable(RuntimeError):
+    pass
+
+
+def _compact_ai_text(value: Any, limit: int) -> str:
+    clean = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(1, limit - 1)].rstrip(" ,.;:-") + "…"
+
+
+def cloudflare_credentials() -> tuple[str, str]:
+    account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+    if not account_id:
+        raise CloudflareVisualUnavailable(
+            "CLOUDFLARE_ACCOUNT_ID GitHub secret'i bulunamadı."
+        )
+    if not token:
+        raise CloudflareVisualUnavailable(
+            "CLOUDFLARE_API_TOKEN GitHub secret'i bulunamadı."
+        )
+    return account_id, token
+
+
+def cloudflare_visual_credentials_ready() -> None:
+    cloudflare_credentials()
+    log(
+        "AI VISUAL LOCK: Cloudflare kimlik bilgileri hazır; "
+        f"ana model={CLOUDFLARE_IMAGE_MODEL}"
+    )
+
+
+def _cloudflare_quota_error_message(message: str) -> bool:
+    normalized = str(message).lower()
+    return any(marker in normalized for marker in (
+        "used up your daily free allocation",
+        "10,000 neurons",
+        "daily free allocation",
+        "account limited",
+        "workers paid plan",
+        "quota",
+        "http 429",
+    ))
+
+
+def _cloudflare_error(response: requests.Response) -> RuntimeError:
+    try:
+        payload = response.json()
+        errors = payload.get("errors") or []
+        detail = "; ".join(
+            str(item.get("message") or item.get("code") or item)
+            for item in errors
+            if isinstance(item, dict)
+        )
+        if not detail:
+            detail = str(payload)[:1000]
+    except Exception:
+        detail = response.text[:1000] if response.text else "Yanıt gövdesi boş."
+    message = f"Cloudflare Workers AI HTTP {response.status_code}: {detail}"
+    if response.status_code == 429 or _cloudflare_quota_error_message(message):
+        return CloudflareVisualQuotaPause(message)
+    return CloudflareVisualUnavailable(message)
+
+
+def _decode_cloudflare_image(response: requests.Response) -> bytes:
+    content_type = response.headers.get("content-type", "").lower()
+    if content_type.startswith("image/"):
+        return response.content
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise CloudflareVisualUnavailable(
+            f"Cloudflare görsel yerine çözülemeyen yanıt döndürdü: {content_type}"
+        ) from exc
+    if payload.get("success") is False:
+        raise CloudflareVisualUnavailable(
+            f"Cloudflare API hatası: {payload.get('errors') or payload}"
+        )
+    result = payload.get("result", payload)
+    encoded = None
+    if isinstance(result, dict):
+        encoded = result.get("image") or result.get("b64_json") or result.get("base64")
+    elif isinstance(result, str):
+        encoded = result
+    if not encoded:
+        raise CloudflareVisualUnavailable(
+            f"Cloudflare geçerli görsel döndürmedi: {str(payload)[:800]}"
+        )
+    if isinstance(encoded, str) and encoded.startswith("data:image"):
+        encoded = encoded.split(",", 1)[-1]
+    try:
+        return base64.b64decode(encoded)
+    except Exception as exc:
+        raise CloudflareVisualUnavailable(
+            "Cloudflare görsel base64 verisi çözülemedi."
+        ) from exc
+
+
+def _save_ai_image(raw_bytes: bytes, target: Path) -> None:
+    temp = target.with_suffix(".download")
+    temp.parent.mkdir(parents=True, exist_ok=True)
+    temp.write_bytes(raw_bytes)
+    try:
+        with Image.open(temp) as raw:
+            image = ImageOps.exif_transpose(raw).convert("RGB")
+            if image.width < 700 or image.height < 390:
+                raise CloudflareVisualUnavailable(
+                    f"Üretilen görsel çözünürlüğü düşük: {image.width}x{image.height}"
+                )
+            image.save(target, "JPEG", quality=95, optimize=True)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def ai_visual_prompt(
+    topic: str,
+    chapter_title: str,
+    beat: dict[str, Any],
+) -> str:
+    excerpt = _compact_ai_text(beat.get("narration_excerpt", ""), 380)
+    contract = _compact_ai_text(beat.get("visual_contract", ""), 280)
+    must_show = _compact_ai_text(
+        ", ".join(str(item) for item in beat.get("must_show", [])),
+        230,
+    )
+    prompt = (
+        f"{AI_VISUAL_STYLE} "
+        f"Main historical topic: {topic}. "
+        f"Chapter context: {chapter_title}. "
+        f"Exact visual contract: {contract}. "
+        f"Narration at this moment: {excerpt}. "
+        f"Mandatory visible elements: {must_show}. "
+        "Show the named main subject, action and location together and clearly. "
+        "Do not replace the event with a generic army camp, empty landscape, "
+        "symbolic object or unrelated architecture. No written text anywhere."
+    )
+    return _compact_ai_text(prompt, AI_IMAGE_PROMPT_LIMIT)
+
+
+def ai_visual_negative(beat: dict[str, Any]) -> str:
+    extra = _compact_ai_text(beat.get("negative_prompt", ""), 100)
+    return _compact_ai_text(
+        f"{AI_VISUAL_NEGATIVE}, {extra}" if extra else AI_VISUAL_NEGATIVE,
+        AI_IMAGE_NEGATIVE_LIMIT,
+    )
+
+
+def deterministic_ai_seed(topic: str, chapter_index: int, beat_id: int) -> int:
+    digest = hashlib.sha256(
+        f"{topic}|chapter={chapter_index}|beat={beat_id}".encode("utf-8")
+    ).hexdigest()
+    return int(digest[:8], 16) % 2_000_000_000
+
+
+def _cloudflare_request_body(
+    model: str,
+    prompt: str,
+    negative: str,
+    seed: int,
+) -> tuple[dict[str, str], dict[str, Any] | None]:
+    final_prompt = _compact_ai_text(
+        f"{prompt}. Avoid: {negative}. Landscape 16:9, no typography.",
+        AI_IMAGE_PROMPT_LIMIT,
+    )
+    if "flux-2-klein" in model or "flux-2-dev" in model:
+        return {
+            "prompt": final_prompt,
+            "width": "1344",
+            "height": "768",
+            "guidance": "4.5",
+            "seed": str(seed),
+        }, None
+    if "flux-1-schnell" in model:
+        return {}, {
+            "prompt": final_prompt,
+            "seed": seed,
+            "steps": 8,
+        }
+    return {}, {
+        "prompt": final_prompt,
+        "negative_prompt": negative,
+        "width": 1024,
+        "height": 576,
+        "num_steps": 20,
+        "guidance": 7.0,
+        "seed": seed,
+    }
+
+
+def cloudflare_generate_image(
+    prompt: str,
+    negative: str,
+    seed: int,
+    target: Path,
+    model: str,
+) -> None:
+    account_id, token = cloudflare_credentials()
+    endpoint = f"{CLOUDFLARE_API_BASE}/{account_id}/ai/run/{model}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": f"UykuTarihV10/{VERSION}",
+        "Accept": "application/json, image/*",
+    }
+
+    form_data, json_body = _cloudflare_request_body(
+        model,
+        prompt,
+        negative,
+        seed,
+    )
+
+    last_error: Exception | None = None
+    for attempt, delay in enumerate((0, 8), start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            if form_data:
+                response = requests.post(
+                    endpoint,
+                    data=form_data,
+                    headers=headers,
+                    timeout=(20, 180),
+                )
+            else:
+                response = requests.post(
+                    endpoint,
+                    json=json_body,
+                    headers={**headers, "Content-Type": "application/json"},
+                    timeout=(20, 180),
+                )
+            if not response.ok:
+                raise _cloudflare_error(response)
+            _save_ai_image(
+                _decode_cloudflare_image(response),
+                target,
+            )
+            return
+        except CloudflareVisualQuotaPause:
+            raise
+        except Exception as exc:
+            last_error = exc
+            target.unlink(missing_ok=True)
+            log(
+                f"Cloudflare görsel denemesi başarısız: "
+                f"model={model}, deneme={attempt}/2, hata={exc}"
+            )
+    raise CloudflareVisualUnavailable(
+        f"Cloudflare görsel üretimi iki denemede tamamlanamadı: {last_error}"
+    )
+
+
+def generate_ai_visual_for_beat(
+    ctx: ProjectContext,
+    chapter_dir: Path,
+    chapter_title: str,
+    chapter_index: int,
+    beat: dict[str, Any],
+    target: Path,
+) -> dict[str, Any]:
+    beat_id = int(beat["beat_id"])
+    prompt = ai_visual_prompt(ctx.topic, chapter_title, beat)
+    negative = ai_visual_negative(beat)
+    seed = deterministic_ai_seed(ctx.topic, chapter_index, beat_id)
+    models = list(dict.fromkeys(
+        model
+        for model in (
+            CLOUDFLARE_IMAGE_MODEL,
+            CLOUDFLARE_FALLBACK_IMAGE_MODEL,
+        )
+        if model
+    ))
+    last_error: Exception | None = None
+
+    for model in models:
+        try:
+            log(
+                f"AI VISUAL: bölüm={chapter_index}, beat={beat_id}, model={model}"
+            )
+            raw = chapter_dir / "assets" / f"beat_{beat_id:02d}-ai.jpg"
+            cloudflare_generate_image(
+                prompt,
+                negative,
+                seed,
+                raw,
+                model,
+            )
+            process_frame(raw, target)
+            return {
+                **beat,
+                "frame": str(target.relative_to(ctx.root)),
+                "source_type": "cloudflare_workers_ai",
+                "ai_model": model,
+                "ai_seed": seed,
+                "ai_prompt": prompt,
+                "visual_contract": beat.get("visual_contract", ""),
+            }
+        except CloudflareVisualQuotaPause:
+            raise
+        except Exception as exc:
+            last_error = exc
+            log(
+                f"AI VISUAL model fallback: beat={beat_id}, model={model}, hata={exc}"
+            )
+
+    raise CloudflareVisualUnavailable(
+        f"Beat {beat_id} için AI görsel üretilemedi: {last_error}"
+    )
+
+
+def assets_manifest_complete(
+    manifest: Any,
+    chapter_script: dict[str, Any],
+    ctx: ProjectContext,
+) -> bool:
+    if not isinstance(manifest, list):
+        return False
+    beats = chapter_script.get("visual_beats", [])
+    if len(manifest) != len(beats):
+        return False
+    ids = {int(item.get("beat_id", 0)) for item in manifest}
+    expected = {int(item.get("beat_id", 0)) for item in beats}
+    if ids != expected:
+        return False
+    for item in manifest:
+        frame = item.get("frame")
+        if not frame:
+            return False
+        path = ctx.root / str(frame)
+        if not path.exists() or path.stat().st_size < 20_000:
+            return False
+    return True
+
+
 def commons_candidates(session: requests.Session, query: str, limit: int = 12) -> list[dict[str, Any]]:
     response = session.get(
         COMMONS_API,
@@ -1899,86 +2264,144 @@ def collect_chapter_assets(
     chapter_script: dict[str, Any],
     used_ids: set[int],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    del session, used_ids
     assets_dir = chapter_dir / "assets"
     frames_dir = chapter_dir / "frames"
     assets_dir.mkdir(parents=True, exist_ok=True)
     frames_dir.mkdir(parents=True, exist_ok=True)
-    manifest: list[dict[str, Any]] = []
-    credits: list[dict[str, Any]] = []
-    local_graphics = 0
-    missing = 0
 
-    for beat in chapter_script["visual_beats"]:
+    manifest_file = chapter_dir / "assets-manifest.json"
+    credits_file = chapter_dir / "credits.json"
+    previous_manifest = read_json(manifest_file, [])
+    previous_by_id = {
+        int(item.get("beat_id", 0)): item
+        for item in previous_manifest
+        if isinstance(item, dict)
+    }
+    manifest: list[dict[str, Any]] = []
+    credits: list[dict[str, Any]] = read_json(credits_file, [])
+    credits_by_beat = {
+        int(item.get("beat_id", 0)): item
+        for item in credits
+        if isinstance(item, dict)
+    }
+
+    chapter_title = str(chapter_script.get("chapter_title", ""))
+    chapter_index_match = re.search(r"(\d+)$", chapter_dir.name)
+    chapter_index = int(chapter_index_match.group(1)) if chapter_index_match else 1
+    beats = chapter_script.get("visual_beats", [])
+
+    for beat in beats:
         beat_id = int(beat["beat_id"])
         frame = frames_dir / f"beat_{beat_id:02d}.jpg"
+        old = previous_by_id.get(beat_id, {})
+
         if frame.exists() and frame.stat().st_size > 20_000:
-            manifest.append({**beat, "frame": str(frame.relative_to(ctx.root)), "checkpoint": True})
+            record = {
+                **beat,
+                **old,
+                "beat_id": beat_id,
+                "frame": str(frame.relative_to(ctx.root)),
+                "checkpoint": True,
+            }
+            manifest.append(record)
+            log(
+                f"AI görsel checkpoint kullanıldı: "
+                f"bölüm={chapter_index}, beat={beat_id}/{len(beats)}"
+            )
             continue
 
         asset_type = str(beat.get("asset_type", "painting")).lower()
-        if asset_type in {"map", "timeline", "diagram"} and local_graphics < 2:
-            make_local_graphic(beat, chapter_script.get("chapter_title", ""), frame)
-            local_graphics += 1
-            manifest.append({**beat, "frame": str(frame.relative_to(ctx.root)), "source_type": "local_graphic"})
-            continue
-
-        asset = select_commons_asset(session, ctx.topic, beat, used_ids)
-        if asset is None:
-            missing += 1
-            manifest.append({
+        if asset_type in {"map", "timeline", "diagram"}:
+            make_local_graphic(
+                beat,
+                chapter_title,
+                frame,
+            )
+            record = {
                 **beat,
-                "missing": True,
-                "error": (
-                    "Anlatımla yeterince eşleşen Wikimedia görseli bulunamadı. "
-                    "Yerel bilgi kartı kullanılmadı."
-                ),
-            })
-            continue
+                "frame": str(frame.relative_to(ctx.root)),
+                "source_type": "local_map_or_timeline",
+            }
+            manifest.append(record)
+        else:
+            try:
+                record = generate_ai_visual_for_beat(
+                    ctx,
+                    chapter_dir,
+                    chapter_title,
+                    chapter_index,
+                    beat,
+                    frame,
+                )
+                manifest.append(record)
+                credits_by_beat[beat_id] = {
+                    "beat_id": beat_id,
+                    "title": f"AI reconstruction — {beat.get('visual_contract', '')}",
+                    "artist": "Cloudflare Workers AI",
+                    "license": "AI-generated for this project",
+                    "license_url": "",
+                    "source_page": "",
+                    "credit": record.get("ai_model", ""),
+                }
+            except CloudflareVisualQuotaPause as exc:
+                write_json(manifest_file, manifest)
+                write_json(
+                    credits_file,
+                    [credits_by_beat[key] for key in sorted(credits_by_beat)],
+                )
+                if manifest:
+                    make_chapter_storyboard(
+                        ctx,
+                        chapter_dir,
+                        manifest,
+                        chapter_title,
+                    )
+                raise ControlledStop(
+                    "Cloudflare ücretsiz AI görsel kotası doldu. "
+                    f"Tamamlanan kaliteli görseller korundu: {len(manifest)}/{len(beats)}. "
+                    f"Sıradaki beat: {beat_id}. Aynı project_slug ile kota "
+                    "yenilendikten sonra tekrar çalıştırın; eksik görselden "
+                    f"devam edilecek. Teknik hata: {exc}"
+                ) from exc
+            except CloudflareVisualUnavailable as exc:
+                write_json(manifest_file, manifest)
+                write_json(
+                    credits_file,
+                    [credits_by_beat[key] for key in sorted(credits_by_beat)],
+                )
+                if manifest:
+                    make_chapter_storyboard(
+                        ctx,
+                        chapter_dir,
+                        manifest,
+                        chapter_title,
+                    )
+                raise ControlledStop(
+                    "AI görsel servisi geçici olarak kullanılamadı. "
+                    f"Tamamlanan görseller korundu: {len(manifest)}/{len(beats)}. "
+                    f"Sıradaki beat: {beat_id}. Yerel bilgi kartı veya alakasız "
+                    f"Wikimedia görseli kullanılmadı. Teknik hata: {exc}"
+                ) from exc
 
-        raw = assets_dir / f"beat_{beat_id:02d}{Path(asset['url'].split('?', 1)[0]).suffix.lower()}"
-        try:
-            download_asset(session, asset, raw)
-            process_frame(raw, frame)
-        except Exception as exc:
-            log(f"Commons görseli indirilemedi, beat={beat_id}: {exc}")
-            missing += 1
-            manifest.append({**beat, "missing": True, "error": str(exc)})
-            continue
+        write_json(manifest_file, manifest)
+        write_json(
+            credits_file,
+            [credits_by_beat[key] for key in sorted(credits_by_beat)],
+        )
+        # Keep a visible checkpoint storyboard during a long chapter.
+        if len(manifest) in {3, 6, 9, len(beats)}:
+            make_chapter_storyboard(
+                ctx,
+                chapter_dir,
+                manifest,
+                chapter_title,
+            )
 
-        used_ids.add(int(asset["pageid"]))
-        record = {
-            **beat,
-            "frame": str(frame.relative_to(ctx.root)),
-            "source_type": "wikimedia_commons",
-            "asset": asset,
-        }
-        manifest.append(record)
-        credits.append({
-            "beat_id": beat_id,
-            "title": asset.get("title", ""),
-            "artist": asset.get("artist", ""),
-            "license": asset.get("license", ""),
-            "license_url": asset.get("license_url", ""),
-            "source_page": asset.get("description_url", ""),
-            "credit": asset.get("credit", ""),
-        })
-
-    missing_count = sum(1 for item in manifest if item.get("missing"))
-    if missing_count > 0:
-        report = chapter_dir / "ASSET_GAPS.txt"
-        lines = [
-            "Bütün sahnelerde gerçek ve anlatımla eşleşen görsel zorunludur. TTS ve render başlatılmadı.",
-            f"Eksik beat: {missing_count}/{len(manifest)}",
-            "",
-        ]
-        for item in manifest:
-            if item.get("missing"):
-                lines.append(f"Beat {item['beat_id']}: {item.get('visual_contract', '')}")
-        report.write_text("\n".join(lines), encoding="utf-8")
-        raise ControlledStop(report.read_text(encoding="utf-8"))
-
-    write_json(chapter_dir / "assets-manifest.json", manifest)
-    write_json(chapter_dir / "credits.json", credits)
+    credits = [credits_by_beat[key] for key in sorted(credits_by_beat)]
+    write_json(manifest_file, manifest)
+    write_json(credits_file, credits)
+    (chapter_dir / "ASSET_GAPS.txt").unlink(missing_ok=True)
     return manifest, credits
 
 
@@ -2566,7 +2989,8 @@ def build_credits(ctx: ProjectContext, plan: dict[str, Any], all_credits: list[d
     lines = [
         plan.get("video_description", ""),
         "",
-        "GÖRSEL KAYNAKLARI VE LİSANSLAR",
+        "GÖRSEL ÜRETİMİ VE KAYNAKLAR",
+        "Bu videodaki tarihsel canlandırma kareleri yapay zekâ ile üretildi.",
         "",
     ]
     for index, item in enumerate(all_credits, start=1):
@@ -2670,18 +3094,22 @@ def main() -> None:
     session = requests_session()
 
     log("=" * 72)
-    log(f"UYKU VE TARİH V10.4 SEMANTIC STORYBOARD CORE {VERSION}")
+    log(f"UYKU VE TARİH V10.5 AI VISUAL ROLLBACK CORE {VERSION}")
     log(f"Proje: {ctx.slug} | mod={ctx.mode} | hedef={ctx.target_minutes} dk")
     log("Checkpoint/resume aktif. Tamamlanan dosyalar yeniden üretilmez.")
     log("Resilient script: bölüm metni segmentlere ayrılır ve her segment kaydedilir.")
     log("TTS kilidi: yalnızca Charon; farklı ses ve fallback kapalı.")
-    log("Görsel kilidi: konu dışı Commons sonuçları ve hayvan/modern alakasız kareler reddedilir.")
+    log("Görsel motoru geri alındı: V9 tarzı doğrudan AI tarih sahneleri kullanılacak.")
+    log("Wikimedia ve yerel bilgi kartı boşluk doldurmak için kullanılmayacak.")
     log("Storyboard ve final ses doğrulaması zorunlu.")
     log(f"Charon parça hedefi: yaklaşık {CHARON_CHUNK_TARGET_WORDS} kelime.")
     log(f"Araştırma çekirdek sorgusu: {core_research_query(ctx.topic)}")
     log("=" * 72)
 
     try:
+        if args.stage in {"all", "assets", "tts", "render"}:
+            cloudflare_visual_credentials_ready()
+
         research_file = ctx.root / "research.json"
         research = read_json(research_file)
         research_rebuilt = False
@@ -2804,7 +3232,7 @@ def main() -> None:
             manifest_file = chapter_dir / "assets-manifest.json"
             manifest = read_json(manifest_file)
             credits = read_json(chapter_dir / "credits.json", [])
-            if manifest is None:
+            if not assets_manifest_complete(manifest, script, ctx):
                 manifest, credits = collect_chapter_assets(
                     session,
                     ctx,
@@ -2812,7 +3240,6 @@ def main() -> None:
                     script,
                     used_ids,
                 )
-                write_json(ctx.root / "used-commons-pageids.json", sorted(used_ids))
             all_credits.extend(credits)
             storyboard_file = make_chapter_storyboard(
                 ctx,
