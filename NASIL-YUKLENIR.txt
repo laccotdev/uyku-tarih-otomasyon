@@ -1,56 +1,26 @@
-UYKU VE TARİH V10.5 — AI VISUAL ROLLBACK CORE
+UYKU VE TARİH V10.6 — NO TEXT + NATURAL CHARON
 
-NEDEN V10.4 ÇIKTI ÜRETMEDİ?
+Bu sürüm:
+- Final videoda harita, timeline, şema ve bilgi kartlarını kapatır.
+- Her sahneyi Cloudflare AI tarih canlandırması olarak üretir.
+- Görselleri Türkçe/İngilizce Tesseract OCR ile kontrol eder.
+- Yazı, sayı, altyazı veya sahte alfabe algılanırsa kareyi reddedip yeniden üretir.
+- Üç denemede yazısız kare gelmezse kötü kareyle video oluşturmaz.
+- Görsel promptunu anlatımdaki kişi + eylem + mekâna kilitler.
+- Yalnızca Charon kullanır.
+- Charon sesini perdeyi değiştirmeden 0.94 tempoya getirir.
+- Eski hızlı ses ve eski yazılı görsel checkpointlerini geçersiz sayar.
 
-V10.4 bütün 12 sahne için Wikimedia Commons'ta birebir görsel zorunlu tuttu.
-İki özel olay için görsel bulunamadı:
-- Gemilerin karadan Haliç'e indirilmesi
-- Şahi toplarının surları dövmesi
+GitHub'a yüklenecek dosyalar:
+src/v10_longform.py
+requirements-v10.txt
+.github/workflows/v10-longform.yml
+config/providers.example.json
 
-Bu yüzden video, storyboard ve ses hiç başlamadan durdu. Bu aşırı sert karar geri alındı.
-
-V10.5'TE GERİ DÖNEN YAPI
-
-- Görseller yeniden eski başarılı sistemdeki gibi Cloudflare AI ile üretilir.
-- Her prompt doğrudan narration_excerpt + visual_contract + must_show alanlarından gelir.
-- Ana özne, eylem ve mekân aynı karede görünmek zorundadır.
-- Wikimedia alakasız görselleri final videoda kullanılmaz.
-- Yerel bilgi kartları boşluk doldurmak için kullanılmaz.
-- Görseller soluklaştırılmaz; yalnız hafif kalite düzeltmesi uygulanır.
-- Her 3 görselde bir kısmi storyboard kaydedilir.
-- Kota dolarsa tamamlanan görseller ve storyboard korunur.
-- Aynı project_slug ile sonraki gün ilk eksik görselden devam eder.
-- Bütün görseller tamamlanmadan Charon kotası kullanılmaz.
-- Charon-only, ses checkpointi, stereo AAC ve ses doğrulaması korunur.
-
-YÜKLENECEK DOSYALAR
-
-1. src/v10_longform.py
-2. .github/workflows/v10-longform.yml
-3. config/providers.example.json
-
-GITHUB SECRETS
-
-Aşağıdaki üç secret bulunmalı:
-- GEMINI_API_KEY
-- CLOUDFLARE_ACCOUNT_ID
-- CLOUDFLARE_API_TOKEN
-
-YENİ PİLOT
-
-Önceki V10.4 cache'i kullanılmamalı.
-
+Yeni pilot:
 topic: İstanbul'un fethi nasıl gerçekleşti?
-project_slug: istanbulun-fethi-v105
+project_slug: istanbulun-fethi-v106
 mode: pilot
 stage: all
 chapter: 0
 runner: ubuntu-latest
-
-DOĞRU LOG
-
-UYKU VE TARİH V10.5 AI VISUAL ROLLBACK CORE 10.5.0
-AI VISUAL LOCK: Cloudflare kimlik bilgileri hazır
-AI VISUAL: bölüm=1, beat=1, model=@cf/black-forest-labs/flux-2-klein-4b
-STORYBOARD READY
-TTS PROVIDER LOCK: yalnızca Gemini Charon kullanılacak
