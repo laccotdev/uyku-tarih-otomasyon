@@ -1,4 +1,4 @@
-name: Uyku ve Tarih V10 - Longform Core
+name: Uyku ve Tarih V10.3 - Charon Only Core
 
 on:
   workflow_dispatch:
