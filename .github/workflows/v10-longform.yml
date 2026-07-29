@@ -1,4 +1,4 @@
-name: Uyku ve Tarih V10.4 - Semantic Storyboard Core
+name: Uyku ve Tarih V10.5 - AI Visual Rollback Core
 
 on:
   workflow_dispatch:
@@ -100,6 +100,8 @@ jobs:
       - name: V10 ajanini calistir
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           python src/v10_longform.py \
             --topic "${{ inputs.topic }}" \
@@ -130,5 +132,7 @@ jobs:
             projects/${{ inputs.project_slug }}/story-plan.json
             projects/${{ inputs.project_slug }}/research.json
             projects/${{ inputs.project_slug }}/chapters/*/ASSET_GAPS.txt
+            projects/${{ inputs.project_slug }}/chapters/*/assets-manifest.json
+            projects/${{ inputs.project_slug }}/chapters/*/storyboard.jpg
           if-no-files-found: warn
           retention-days: 7
