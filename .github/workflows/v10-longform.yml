@@ -1,4 +1,4 @@
-name: Uyku ve Tarih V10.3 - Charon Only Core
+name: Uyku ve Tarih V10.4 - Semantic Storyboard Core
 
 on:
   workflow_dispatch:
