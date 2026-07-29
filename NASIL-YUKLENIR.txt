@@ -1,42 +1,69 @@
-UYKU VE TARİH V10.3 — CHARON ONLY CHECKPOINT
+UYKU VE TARİH V10.4 — SEMANTIC STORYBOARD + AUDIO
 
-KARAR
+MEVCUT PİLOTTA TESPİT EDİLENLER
 
-- Tek anlatıcı: Charon
-- Piper: kaldırıldı
-- Diğer bütün sesler: kaldırıldı
-- Otomatik farklı ses fallback'i: kapalı
-- Bir videonun hiçbir bölümünde farklı ses kullanılamaz
+- MP4 içinde AAC ses kanalı vardı.
+- Ortalama ses seviyesi yaklaşık -16 dB, tepe seviyesi yaklaşık -2 dB idi.
+- Bazı oynatıcılarda mono AAC/stream-copy nedeniyle ses problemi yaşanabiliyor.
+- Storyboard dosyası hiç üretilmemişti.
+- Commons eşleşme eşiği çok düşüktü; kertenkele ve konu dışı modern fotoğraflar
+  yüksek çözünürlük avantajıyla seçilebiliyordu.
+- Görsel bulunamayınca yerel bilgi kartı final videoya girebiliyordu.
 
-ÜCRETSİZ KOTA DAVRANIŞI
+V10.4 DÜZELTMELERİ
 
-Bir saatlik video için Charon sesi yaklaşık 520 kelimelik parçalara ayrılır.
-Her başarılı Charon parçası proje checkpointine kaydedilir.
+1. SEMANTİK WIKIMEDIA FİLTRESİ
+- Aday görselin hem bölüm beat'iyle hem de ana konuyla gerçek kelime örtüşmesi gerekir.
+- Yalnız yüksek çözünürlük puan kazandırmaz.
+- Kertenkele, sürüngen, hayvan, bitki, spor, otomobil, havaalanı ve benzeri
+  konu dışı kategoriler otomatik reddedilir.
+- Çıplak "topic" sorgusu kaldırıldı; beat'e özel sorgular kullanılır.
+- Minimum semantik eşleşme puanı 62.
+- Yerel bilgi kartı boşluk doldurmak için kullanılmaz.
+- Her beat için gerçek ve eşleşen görsel zorunludur.
 
-Kota dolarsa:
-- Workflow kontrollü biçimde durur.
-- Kırmızı teknik hata yerine DEVAM_ETME_RAPORU.txt oluşur.
-- Tamamlanan Charon sesleri silinmez.
-- Aynı project_slug ve bölümle yeniden çalıştırınca ilk eksik parçadan devam eder.
-- Baştan seslendirme yapılmaz.
-- Piper veya başka bir ses devreye girmez.
+2. STORYBOARD GERİ GELDİ
+Her bölüm için:
+deliverables/storyboard-chapter-01.jpg
+
+Tam video için:
+deliverables/storyboard-index.jpg
+
+Storyboard üzerinde:
+- sahne numarası
+- görsel sözleşmesi
+- semantik eşleşme puanı
+bulunur.
+
+3. SES UYUMLULUĞU
+- Bölüm ve final sesleri AAC-LC, 48 kHz, stereo, 192 kbps olarak paketlenir.
+- Final videoda ses stream'i zorunlu olarak doğrulanır.
+- Ortalama ve tepe ses seviyesi ölçülür.
+- Sessiz/çok düşük sesli final başarı sayılmaz.
+- 30 saniyelik ayrı Charon ses ön izlemesi üretilir:
+  deliverables/charon-audio-preview-30s.mp3
+- Teknik rapor:
+  deliverables/audio-quality-report.json
+
+4. ESKİ RAPOR TEMİZLİĞİ
+Başarılı final oluştuğunda eski DEVAM_ETME_RAPORU.txt otomatik silinir.
 
 YÜKLENECEK DOSYALAR
 
 1. src/v10_longform.py
-2. requirements-v10.txt
-3. .github/workflows/v10-longform.yml
-4. config/providers.example.json
+2. .github/workflows/v10-longform.yml
 
-Dördünü mevcut dosyaların üzerine yükle.
+Diğer dosyaları değiştirme.
 
-PİLOT ÇALIŞTIRMA
+YENİ PİLOT İÇİN ÖNEMLİ
+
+Önceki kötü görseller checkpointte kayıtlı olduğu için farklı bir project_slug kullan:
 
 topic:
 İstanbul'un fethi nasıl gerçekleşti?
 
 project_slug:
-istanbulun-fethi
+istanbulun-fethi-v104
 
 mode:
 pilot
@@ -49,23 +76,3 @@ chapter:
 
 runner:
 ubuntu-latest
-
-Artık tts_provider alanı yoktur. Sistem daima Charon kullanır.
-
-DOĞRU LOG
-
-UYKU VE TARİH V10.3 CHARON ONLY LONGFORM CORE 10.3.0
-TTS kilidi: yalnızca Charon; farklı ses ve fallback kapalı.
-TTS PROVIDER LOCK: yalnızca Gemini Charon kullanılacak.
-Charon TTS parçası: 1/...
-
-Kota dolarsa:
-
-CONTROLLED PAUSE: Charon ücretsiz günlük TTS kotası doldu.
-Tamamlanan Charon parçaları korundu...
-Sıradaki parça: ...
-
-Sonraki çalışmada:
-
-Charon checkpoint kullanıldı: 1/...
-Charon TTS parçası: 2/...
