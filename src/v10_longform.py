@@ -24,7 +24,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from google import genai
 from google.genai import types
 
-VERSION = "10.3.0"
+VERSION = "10.4.0"
 ROOT = Path(__file__).resolve().parents[1]
 PROJECTS = ROOT / "projects"
 FPS = 24
@@ -51,6 +51,21 @@ RESEARCH_QUESTION_WORDS = {
     "what", "how", "why", "when", "where", "who", "was", "were",
     "happened", "history", "explained",
 }
+
+VISUAL_REJECT_TERMS = {
+    "lizard", "iguana", "reptile", "snake", "serpent", "gecko",
+    "kertenkele", "sürüngen", "surungen", "animal", "wildlife",
+    "bird", "fish", "insect", "butterfly", "spider", "flower",
+    "plant", "fungus", "fossil", "mineral", "zoo", "aquarium",
+    "sports", "football", "car", "automobile", "aircraft", "airport",
+    "hotel", "restaurant", "shopping mall", "modern apartment",
+}
+VISUAL_GENERIC_TERMS = {
+    "history", "historical", "old", "ancient", "photo", "image",
+    "tarih", "tarihi", "eski", "antik", "görsel", "fotograf",
+}
+VISUAL_MIN_SCORE = 62.0
+
 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 WIKI_API = {
@@ -1394,34 +1409,170 @@ def commons_candidates(session: requests.Session, query: str, limit: int = 12) -
     return result
 
 
-def score_candidate(candidate: dict[str, Any], query: str, beat: dict[str, Any], used_ids: set[int]) -> float:
-    haystack = " ".join([
-        candidate.get("title", ""),
-        candidate.get("description", ""),
-        candidate.get("credit", ""),
+def _visual_text(candidate: dict[str, Any]) -> str:
+    return " ".join([
+        str(candidate.get("title", "")),
+        str(candidate.get("description", "")),
+        str(candidate.get("credit", "")),
+        str(candidate.get("artist", "")),
     ])
-    target = " ".join([
+
+
+def _meaningful_visual_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in candidate_tokens(value)
+        if token not in VISUAL_GENERIC_TERMS
+    }
+
+
+def candidate_is_forbidden(
+    candidate: dict[str, Any],
+    beat: dict[str, Any],
+) -> bool:
+    candidate_text = slugify(_visual_text(candidate)).replace("-", " ")
+    beat_text = slugify(" ".join([
+        str(beat.get("narration_excerpt", "")),
+        str(beat.get("visual_contract", "")),
+        " ".join(str(item) for item in beat.get("must_show", [])),
+        " ".join(str(item) for item in beat.get("sync_keywords", [])),
+    ])).replace("-", " ")
+
+    for term in VISUAL_REJECT_TERMS:
+        normalized = slugify(term).replace("-", " ")
+        if normalized in candidate_text and normalized not in beat_text:
+            return True
+
+    title = str(candidate.get("title", "")).lower()
+    if any(
+        term in title
+        for term in (
+            "logo", "coat of arms", "flag", "stamp", "currency",
+            "banknote", "poster", "book cover", "album cover",
+        )
+    ):
+        return True
+    return False
+
+
+def score_candidate(
+    candidate: dict[str, Any],
+    query: str,
+    beat: dict[str, Any],
+    used_ids: set[int],
+    topic: str = "",
+) -> float:
+    if candidate.get("pageid") in used_ids:
+        return -999.0
+    if candidate_is_forbidden(candidate, beat):
+        return -999.0
+
+    haystack = _visual_text(candidate)
+    candidate_set = _meaningful_visual_tokens(haystack)
+    title_set = _meaningful_visual_tokens(
+        str(candidate.get("title", ""))
+    )
+    topic_set = _meaningful_visual_tokens(
+        core_research_query(topic)
+    )
+    beat_set = _meaningful_visual_tokens(" ".join([
         query,
-        beat.get("visual_contract", ""),
-        " ".join(beat.get("must_show", [])),
-    ])
-    overlap = len(candidate_tokens(haystack) & candidate_tokens(target))
-    score = overlap * 8.0
+        str(beat.get("visual_contract", "")),
+        " ".join(str(item) for item in beat.get("must_show", [])),
+        " ".join(str(item) for item in beat.get("sync_keywords", [])),
+    ]))
+
+    beat_overlap = len(candidate_set & beat_set)
+    title_beat_overlap = len(title_set & beat_set)
+    topic_overlap = len(candidate_set & topic_set)
+    title_topic_overlap = len(title_set & topic_set)
+
+    # A high-resolution but unrelated image must never win.
+    if beat_overlap < 1:
+        return -999.0
+    if topic_set and topic_overlap < 1 and beat_overlap < 2:
+        return -999.0
+
+    score = (
+        beat_overlap * 18.0
+        + title_beat_overlap * 15.0
+        + topic_overlap * 11.0
+        + title_topic_overlap * 12.0
+    )
+
+    normalized_query = slugify(query)
+    normalized_title = slugify(
+        str(candidate.get("title", ""))
+    )
+    normalized_description = slugify(
+        str(candidate.get("description", ""))
+    )
+    if normalized_query and normalized_query in normalized_title:
+        score += 45
+    elif normalized_query and normalized_query in normalized_description:
+        score += 25
+
     width = int(candidate.get("width") or 0)
     height = int(candidate.get("height") or 0)
     if width >= 1400 and height >= 800:
         score += 8
     if width >= height:
         score += 4
+
+    expected_type = str(
+        beat.get("asset_type", "painting")
+    ).lower()
+    type_text = (_visual_text(candidate)).lower()
+    type_markers = {
+        "painting": ("painting", "miniature", "engraving", "illustration", "tableau"),
+        "photo": ("photo", "photograph"),
+        "architecture": ("wall", "fortress", "castle", "mosque", "church", "gate", "tower"),
+        "artifact": ("museum", "artifact", "object", "cannon", "chain", "coin"),
+    }
+    if any(
+        marker in type_text
+        for marker in type_markers.get(expected_type, ())
+    ):
+        score += 10
+
     license_name = str(candidate.get("license", "")).lower()
     if "public domain" in license_name or "cc0" in license_name:
         score += 5
-    if candidate.get("pageid") in used_ids:
-        score -= 100
-    title = candidate.get("title", "").lower()
-    if any(term in title for term in ("logo", "coat of arms", "flag", "stamp", "text")):
-        score -= 12
     return score
+
+
+def _commons_query_variants(
+    topic: str,
+    beat: dict[str, Any],
+) -> list[str]:
+    topic_core = core_research_query(topic)
+    contract = re.sub(
+        r"\s+",
+        " ",
+        str(beat.get("visual_contract", "")),
+    ).strip()
+    query_en = re.sub(
+        r"\s+",
+        " ",
+        str(beat.get("query_en", "")),
+    ).strip()
+    query_tr = re.sub(
+        r"\s+",
+        " ",
+        str(beat.get("query_tr", "")),
+    ).strip()
+
+    variants = [
+        query_en,
+        query_tr,
+        f"{topic_core} {query_en}".strip(),
+        f"{topic_core} {query_tr}".strip(),
+        f"{topic_core} {contract}".strip(),
+        contract,
+    ]
+    return list(dict.fromkeys(
+        value for value in variants if len(value) >= 4
+    ))
 
 
 def select_commons_asset(
@@ -1430,31 +1581,49 @@ def select_commons_asset(
     beat: dict[str, Any],
     used_ids: set[int],
 ) -> dict[str, Any] | None:
-    queries = [
-        str(beat.get("query_en", "")).strip(),
-        str(beat.get("query_tr", "")).strip(),
-        f'{topic} {beat.get("visual_contract", "")}',
-        topic,
-    ]
-    best: tuple[float, dict[str, Any]] | None = None
-    for query in queries:
-        if not query:
-            continue
+    best: tuple[float, dict[str, Any], str] | None = None
+
+    for query in _commons_query_variants(topic, beat):
         try:
-            candidates = commons_candidates(session, query, limit=12)
+            candidates = commons_candidates(
+                session,
+                query,
+                limit=18,
+            )
         except Exception as exc:
             log(f"Commons araması başarısız ({query}): {exc}")
             continue
+
         for candidate in candidates:
-            score = score_candidate(candidate, query, beat, used_ids)
+            score = score_candidate(
+                candidate,
+                query,
+                beat,
+                used_ids,
+                topic,
+            )
             if best is None or score > best[0]:
-                best = (score, candidate)
-        if best and best[0] >= 22:
+                best = (score, candidate, query)
+
+        if best and best[0] >= 92:
             break
-    if not best or best[0] < 8:
+
+    if not best or best[0] < VISUAL_MIN_SCORE:
         return None
+
     selected = dict(best[1])
     selected["match_score"] = round(best[0], 2)
+    selected["matched_query"] = best[2]
+    selected["match_tokens"] = sorted(
+        _meaningful_visual_tokens(
+            _visual_text(selected)
+        )
+        & _meaningful_visual_tokens(" ".join([
+            best[2],
+            str(beat.get("visual_contract", "")),
+            " ".join(str(item) for item in beat.get("must_show", [])),
+        ]))
+    )
     return selected
 
 
@@ -1522,6 +1691,198 @@ def make_local_graphic(beat: dict[str, Any], chapter_title: str, target: Path) -
     image.save(target, "JPEG", quality=95, optimize=True)
 
 
+def _wrap_text_lines(
+    draw: ImageDraw.ImageDraw,
+    value: str,
+    used_font: ImageFont.FreeTypeFont,
+    max_width: int,
+    max_lines: int,
+) -> list[str]:
+    words = re.sub(r"\s+", " ", str(value)).strip().split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        bbox = draw.textbbox((0, 0), candidate, font=used_font)
+        if bbox[2] <= max_width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+            if len(lines) >= max_lines:
+                break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    if len(lines) == max_lines and words:
+        lines[-1] = lines[-1][:75].rstrip() + "…"
+    return lines
+
+
+def make_chapter_storyboard(
+    ctx: ProjectContext,
+    chapter_dir: Path,
+    manifest: list[dict[str, Any]],
+    chapter_title: str,
+) -> Path:
+    valid_items = [
+        item
+        for item in manifest
+        if item.get("frame") and not item.get("missing")
+    ]
+    if not valid_items:
+        raise ControlledStop(
+            "Storyboard oluşturulamadı: kullanılabilir görsel yok."
+        )
+
+    columns = 3
+    rows = math.ceil(len(valid_items) / columns)
+    cell_w = 640
+    image_h = 360
+    caption_h = 150
+    header_h = 110
+    sheet = Image.new(
+        "RGB",
+        (cell_w * columns, header_h + rows * (image_h + caption_h)),
+        (14, 18, 25),
+    )
+    draw = ImageDraw.Draw(sheet)
+    draw.text(
+        (32, 24),
+        f"UYKU VE TARİH · STORYBOARD · {chapter_title}",
+        font=font(34, True),
+        fill=(243, 236, 222),
+    )
+    draw.text(
+        (32, 70),
+        f"{len(valid_items)} gerçek görsel · V10.4 semantik kontrol",
+        font=font(22),
+        fill=(177, 165, 145),
+    )
+
+    for index, item in enumerate(valid_items):
+        col = index % columns
+        row = index // columns
+        x = col * cell_w
+        y = header_h + row * (image_h + caption_h)
+
+        frame_path = ctx.root / str(item["frame"])
+        with Image.open(frame_path) as raw:
+            frame = ImageOps.fit(
+                ImageOps.exif_transpose(raw).convert("RGB"),
+                (cell_w, image_h),
+                method=Image.Resampling.LANCZOS,
+            )
+        sheet.paste(frame, (x, y))
+
+        draw.rectangle(
+            (x, y + image_h, x + cell_w, y + image_h + caption_h),
+            fill=(22, 25, 31),
+        )
+        beat_id = int(item.get("beat_id", index + 1))
+        score = (
+            item.get("asset", {}).get("match_score")
+            if isinstance(item.get("asset"), dict)
+            else None
+        )
+        label = f"SAHNE {beat_id:02d}"
+        if score is not None:
+            label += f" · EŞLEŞME {score}"
+        draw.text(
+            (x + 18, y + image_h + 12),
+            label,
+            font=font(20, True),
+            fill=(213, 176, 105),
+        )
+        contract = str(
+            item.get("visual_contract")
+            or item.get("narration_excerpt")
+            or ""
+        )
+        lines = _wrap_text_lines(
+            draw,
+            contract,
+            font(21),
+            cell_w - 36,
+            3,
+        )
+        for line_index, line in enumerate(lines):
+            draw.text(
+                (x + 18, y + image_h + 43 + line_index * 27),
+                line,
+                font=font(21),
+                fill=(235, 230, 220),
+            )
+
+    target = chapter_dir / "storyboard.jpg"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(target, "JPEG", quality=94, optimize=True)
+
+    ctx.deliverables.mkdir(parents=True, exist_ok=True)
+    deliverable = ctx.deliverables / (
+        f"storyboard-{chapter_dir.name}.jpg"
+    )
+    shutil.copyfile(target, deliverable)
+    log(f"STORYBOARD READY: {deliverable}")
+    return deliverable
+
+
+def build_storyboard_index(
+    ctx: ProjectContext,
+    plan: dict[str, Any],
+) -> Path | None:
+    storyboards = sorted(
+        ctx.deliverables.glob("storyboard-chapter-*.jpg")
+    )
+    if not storyboards:
+        return None
+
+    thumb_w, thumb_h = 640, 420
+    rows = math.ceil(len(storyboards) / 2)
+    canvas = Image.new(
+        "RGB",
+        (thumb_w * 2, 100 + rows * thumb_h),
+        (12, 16, 23),
+    )
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (28, 25),
+        "UYKU VE TARİH · STORYBOARD İNDEKSİ",
+        font=font(34, True),
+        fill=(243, 236, 222),
+    )
+
+    for index, path in enumerate(storyboards):
+        with Image.open(path) as raw:
+            thumb = ImageOps.fit(
+                raw.convert("RGB"),
+                (thumb_w, thumb_h - 50),
+                method=Image.Resampling.LANCZOS,
+            )
+        x = (index % 2) * thumb_w
+        y = 100 + (index // 2) * thumb_h
+        canvas.paste(thumb, (x, y))
+        title = (
+            plan.get("chapters", [{}])[index].get("title", "")
+            if index < len(plan.get("chapters", []))
+            else path.stem
+        )
+        draw.rectangle(
+            (x, y + thumb_h - 50, x + thumb_w, y + thumb_h),
+            fill=(22, 25, 31),
+        )
+        draw.text(
+            (x + 14, y + thumb_h - 38),
+            f"BÖLÜM {index + 1}: {str(title)[:55]}",
+            font=font(20, True),
+            fill=(220, 207, 184),
+        )
+
+    target = ctx.deliverables / "storyboard-index.jpg"
+    canvas.save(target, "JPEG", quality=93, optimize=True)
+    return target
+
+
 def download_asset(session: requests.Session, asset: dict[str, Any], target: Path) -> None:
     response = session.get(asset["url"], timeout=60)
     response.raise_for_status()
@@ -1564,12 +1925,14 @@ def collect_chapter_assets(
         asset = select_commons_asset(session, ctx.topic, beat, used_ids)
         if asset is None:
             missing += 1
-            if local_graphics < 2:
-                make_local_graphic(beat, chapter_script.get("chapter_title", ""), frame)
-                local_graphics += 1
-                manifest.append({**beat, "frame": str(frame.relative_to(ctx.root)), "source_type": "local_graphic_gap"})
-                continue
-            manifest.append({**beat, "missing": True})
+            manifest.append({
+                **beat,
+                "missing": True,
+                "error": (
+                    "Anlatımla yeterince eşleşen Wikimedia görseli bulunamadı. "
+                    "Yerel bilgi kartı kullanılmadı."
+                ),
+            })
             continue
 
         raw = assets_dir / f"beat_{beat_id:02d}{Path(asset['url'].split('?', 1)[0]).suffix.lower()}"
@@ -1601,10 +1964,10 @@ def collect_chapter_assets(
         })
 
     missing_count = sum(1 for item in manifest if item.get("missing"))
-    if missing_count > max(1, math.floor(len(manifest) * 0.18)):
+    if missing_count > 0:
         report = chapter_dir / "ASSET_GAPS.txt"
         lines = [
-            "Yeterli gerçek görsel bulunamadı. TTS ve render başlatılmadı.",
+            "Bütün sahnelerde gerçek ve anlatımla eşleşen görsel zorunludur. TTS ve render başlatılmadı.",
             f"Eksik beat: {missing_count}/{len(manifest)}",
             "",
         ]
@@ -2006,6 +2369,117 @@ def allocate_durations(beats: list[dict[str, Any]], total: float, audio: Path) -
     return result
 
 
+def audio_stream_info(path: Path) -> dict[str, Any]:
+    result = run([
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_name,channels,sample_rate,duration",
+        "-of",
+        "json",
+        str(path),
+    ], timeout=60)
+    payload = json.loads(result.stdout or "{}")
+    streams = payload.get("streams", [])
+    if not streams:
+        return {}
+    return streams[0]
+
+
+def audio_volume_info(path: Path) -> dict[str, float]:
+    process = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-i",
+            str(path),
+            "-vn",
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=600,
+    )
+    combined = process.stdout + "\n" + process.stderr
+
+    def parse(label: str, fallback: float) -> float:
+        match = re.search(
+            rf"{re.escape(label)}:\s*(-?[0-9.]+)\s*dB",
+            combined,
+        )
+        return float(match.group(1)) if match else fallback
+
+    return {
+        "mean_volume_db": parse("mean_volume", -99.0),
+        "max_volume_db": parse("max_volume", -99.0),
+    }
+
+
+def verify_final_audio(path: Path) -> dict[str, Any]:
+    stream = audio_stream_info(path)
+    if not stream:
+        raise ControlledStop(
+            "Final videoda ses kanalı bulunamadı."
+        )
+
+    volume = audio_volume_info(path)
+    duration = float(stream.get("duration") or ffprobe_duration(path))
+    if duration < 30:
+        raise ControlledStop(
+            f"Final ses kanalı çok kısa: {duration:.2f}s"
+        )
+    if volume["mean_volume_db"] < -45:
+        raise ControlledStop(
+            "Final ses kanalı teknik olarak mevcut fakat sessiz veya "
+            f"duyulamayacak kadar düşük: {volume['mean_volume_db']:.1f} dB"
+        )
+    if volume["max_volume_db"] < -30:
+        raise ControlledStop(
+            "Final ses tepe seviyesi sessizliğe çok yakın: "
+            f"{volume['max_volume_db']:.1f} dB"
+        )
+
+    report = {
+        "codec": stream.get("codec_name"),
+        "channels": int(stream.get("channels") or 0),
+        "sample_rate": int(stream.get("sample_rate") or 0),
+        "duration": round(duration, 3),
+        **volume,
+        "verified": True,
+    }
+    return report
+
+
+def make_audio_preview(
+    final_video: Path,
+    target: Path,
+    seconds: int = 30,
+) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    run([
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(final_video),
+        "-vn",
+        "-t",
+        str(seconds),
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        str(target),
+    ], timeout=180)
+
+
 def render_still_clip(frame: Path, seconds: float, target: Path) -> None:
     run([
         "ffmpeg", "-y", "-loop", "1", "-framerate", str(FPS),
@@ -2062,8 +2536,11 @@ def render_chapter(ctx: ProjectContext, chapter_dir: Path, script: dict[str, Any
     ], timeout=1200)
     run([
         "ffmpeg", "-y", "-i", str(visual), "-i", str(audio),
-        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-        "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(target),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac", "-profile:a", "aac_low",
+        "-b:a", "192k", "-ar", "48000", "-ac", "2",
+        "-shortest", "-movflags", "+faststart", str(target),
     ], timeout=1200)
     return target
 
@@ -2075,7 +2552,11 @@ def combine_chapters(ctx: ProjectContext, chapter_files: list[Path]) -> Path:
     write_concat_manifest(chapter_files, manifest)
     run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(manifest),
-        "-c", "copy", "-movflags", "+faststart", str(target),
+        "-map", "0:v:0", "-map", "0:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac", "-profile:a", "aac_low",
+        "-b:a", "192k", "-ar", "48000", "-ac", "2",
+        "-movflags", "+faststart", str(target),
     ], timeout=3600)
     return target
 
@@ -2189,11 +2670,13 @@ def main() -> None:
     session = requests_session()
 
     log("=" * 72)
-    log(f"UYKU VE TARİH V10.3 CHARON ONLY LONGFORM CORE {VERSION}")
+    log(f"UYKU VE TARİH V10.4 SEMANTIC STORYBOARD CORE {VERSION}")
     log(f"Proje: {ctx.slug} | mod={ctx.mode} | hedef={ctx.target_minutes} dk")
     log("Checkpoint/resume aktif. Tamamlanan dosyalar yeniden üretilmez.")
     log("Resilient script: bölüm metni segmentlere ayrılır ve her segment kaydedilir.")
     log("TTS kilidi: yalnızca Charon; farklı ses ve fallback kapalı.")
+    log("Görsel kilidi: konu dışı Commons sonuçları ve hayvan/modern alakasız kareler reddedilir.")
+    log("Storyboard ve final ses doğrulaması zorunlu.")
     log(f"Charon parça hedefi: yaklaşık {CHARON_CHUNK_TARGET_WORDS} kelime.")
     log(f"Araştırma çekirdek sorgusu: {core_research_query(ctx.topic)}")
     log("=" * 72)
@@ -2331,7 +2814,16 @@ def main() -> None:
                 )
                 write_json(ctx.root / "used-commons-pageids.json", sorted(used_ids))
             all_credits.extend(credits)
+            storyboard_file = make_chapter_storyboard(
+                ctx,
+                chapter_dir,
+                manifest,
+                str(script.get("chapter_title", chapter.get("title", ""))),
+            )
             chapter_state["assets"] = "ready"
+            chapter_state["storyboard"] = str(
+                storyboard_file.relative_to(ctx.root)
+            )
             save_state(ctx, st)
             if args.stage == "assets":
                 continue
@@ -2369,11 +2861,26 @@ def main() -> None:
 
         final = combine_chapters(ctx, chapter_files)
         build_credits(ctx, plan, all_credits, research)
+        build_storyboard_index(ctx, plan)
+        audio_report = verify_final_audio(final)
+        write_json(
+            ctx.deliverables / "audio-quality-report.json",
+            audio_report,
+        )
+        make_audio_preview(
+            final,
+            ctx.deliverables / "charon-audio-preview-30s.mp3",
+        )
         final_seconds = ffprobe_duration(final)
         st["status"] = "complete"
+        st["audio_verified"] = True
+        st["audio_report"] = audio_report
         st["final_video"] = str(final.relative_to(ctx.root))
         st["final_seconds"] = round(final_seconds, 2)
         save_state(ctx, st)
+        (ctx.deliverables / "DEVAM_ETME_RAPORU.txt").unlink(
+            missing_ok=True
+        )
         log("=" * 72)
         log(f"V10 LONGFORM COMPLETE: {final}")
         log(f"Süre: {final_seconds / 60:.2f} dakika")
