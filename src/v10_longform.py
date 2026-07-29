@@ -21,10 +21,12 @@ from urllib.parse import quote
 
 import requests
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat
+import pytesseract
+from pytesseract import Output as TesseractOutput
 from google import genai
 from google.genai import types
 
-VERSION = "10.5.0"
+VERSION = "10.6.0"
 ROOT = Path(__file__).resolve().parents[1]
 PROJECTS = ROOT / "projects"
 FPS = 24
@@ -42,6 +44,10 @@ CHARON_CHUNK_TARGET_WORDS = max(
     360,
     int(os.getenv("CHARON_CHUNK_TARGET_WORDS", "520")),
 )
+CHARON_TEMPO = max(
+    0.90,
+    min(1.0, float(os.getenv("CHARON_TEMPO", "0.94"))),
+)
 CHARON_ONLY = True
 
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
@@ -54,21 +60,34 @@ CLOUDFLARE_FALLBACK_IMAGE_MODEL = os.getenv(
     "@cf/black-forest-labs/flux-1-schnell",
 ).strip()
 AI_IMAGE_PROMPT_LIMIT = 1320
-AI_IMAGE_NEGATIVE_LIMIT = 360
+AI_IMAGE_NEGATIVE_LIMIT = 520
+OCR_MIN_CONFIDENCE = 48.0
+OCR_MIN_TOTAL_CHARS = 5
+AI_VISUAL_MAX_ATTEMPTS = 3
 AI_VISUAL_STYLE = """
 Photorealistic cinematic historical reconstruction for a premium documentary.
-The exact narrated event must be visible in one coherent 16:9 frame. Rich but
-realistic color, clear exposure, crisp period materials, believable people,
-accurate architecture, strong subject separation, natural skin, detailed stone,
-wood, fabric and metal. The result should look like a frame from a serious
-historical film, not an illustration, museum photo, generic landscape or game.
+The exact narrated event must be visible in one coherent 16:9 frame. The main
+person or group, the main action, and the named location must appear together.
+Rich but realistic color, clear exposure, crisp period materials, believable
+people, accurate architecture, strong subject separation, natural skin, detailed
+stone, wood, fabric and metal. The result must look like a serious historical
+film frame, never an infographic, title card, chronology card, poster, museum
+display, generic landscape or game.
+ABSOLUTE PIXEL RULE: no visible writing anywhere. No readable or unreadable text,
+no fake language, no pseudo-alphabet, no letters, no numbers, no inscriptions,
+no captions, no subtitles, no labels, no signs, no banners, no carved writing,
+no map labels, no document text and no decorative glyph-like marks. Any document,
+wall, shield, banner, map, parchment or tablet must be completely blank.
 """.strip()
 AI_VISUAL_NEGATIVE = """
-text, letters, numbers, captions, subtitles, logo, watermark, fake alphabet,
-glyphs, labels, signs, banners with writing, collage, split screen, infographic,
-museum display, modern clothing, modern technology, electricity, cars, fantasy,
-science fiction, cartoon, anime, oversaturated, washed out, foggy unless asked,
-blurry, low detail, deformed face, malformed hands, extra fingers, duplicate people
+text, words, letters, numbers, typography, captions, subtitles, lower third,
+title, title card, chronology, timeline card, quote, logo, watermark, fake alphabet,
+pseudo alphabet, fake language, glyphs, runes, labels, signs, signage, written
+banners, inscriptions, carved writing, map labels, document text, scroll text,
+tablet text, poster, infographic, interface, collage, split screen, museum display,
+modern clothing, modern technology, electricity, cars, fantasy, science fiction,
+cartoon, anime, oversaturated, washed out, blurry, low detail, deformed face,
+malformed hands, extra fingers, duplicate people
 """.strip()
 
 RESEARCH_QUESTION_WORDS = {
@@ -982,15 +1001,9 @@ def visual_beats_prompt(
     narration: str,
     beat_count: int,
 ) -> str:
-    chunks = split_by_word_weight(
-        narration,
-        beat_count,
-    )
+    chunks = split_by_word_weight(narration, beat_count)
     numbered = [
-        {
-            "beat_id": index,
-            "narration_excerpt": chunk,
-        }
+        {"beat_id": index, "narration_excerpt": chunk}
         for index, chunk in enumerate(chunks, start=1)
     ]
     return f"""
@@ -1000,13 +1013,11 @@ Yalnızca geçerli JSON üret:
     {{
       "beat_id": 1,
       "narration_excerpt": "verilen parçayı aynen veya çok yakın biçimde kullan",
-      "visual_contract": "karede görünmesi gereken somut olay",
-      "must_show": ["ana özne", "ana eylem", "mekân veya nesne"],
-      "query_tr": "Wikimedia Commons Türkçe arama sorgusu",
-      "query_en": "Wikimedia Commons English search query",
-      "asset_type": "painting|photo|architecture|artifact|timeline|map",
-      "local_graphic_title": "yalnız timeline/map ise Türkçe başlık",
-      "local_graphic_points": ["yalnız timeline/map ise 2-4 kısa nokta"]
+      "visual_contract": "tek karede görünmesi gereken somut tarihsel olay",
+      "must_show": ["ana özne", "ana eylem", "ana mekân veya nesne"],
+      "sync_keywords": ["özel kişi", "somut eylem", "somut mekân"],
+      "asset_type": "ai_reconstruction",
+      "negative_prompt": "kesinlikle görünmemesi gereken unsurlar"
     }}
   ]
 }}
@@ -1022,13 +1033,14 @@ NİHAİ ANLATIM PARÇALARI:
 
 KURALLAR:
 - Tam {beat_count} visual_beats üret.
-- Her beat_id verilen anlatım parçasıyla aynı sırada ve aynı olayda kalsın.
-- Görsel, anlatıcının o anda söylediği kişi, eylem, nesne ve mekânı doğrudan
-  desteklemeli; genel veya alakasız tarih atmosferi önermemeli.
-- query_tr ve query_en soyut değil; Wikimedia Commons'ta aranabilecek özel isim,
-  yapı, şehir, tablo, gravür, eser veya arkeolojik nesne içersin.
-- En fazla 2 adet map/timeline beat kullan.
-- Aynı görsel sorgusunu art arda tekrar etme.
+- Her asset_type kesinlikle ai_reconstruction olsun.
+- Harita, zaman çizelgesi, şema, bilgi kartı veya başlık kartı önerme.
+- Görsel sözleşmesi tek bir çekilebilir tarihsel anı tarif etsin.
+- Ana özne, ana eylem ve ana mekân aynı karede bulunmalı.
+- Genel kamp, boş manzara, rastgele asker kalabalığı veya sembolik nesne kullanma.
+- Görselin içinde hiçbir yazı, harf, sayı, altyazı, tabela, yazıt veya sahte
+  alfabe bulunmamalı. Belgeler, sancaklar, duvarlar ve haritalar boş olmalı.
+- Aynı kompozisyonu art arda tekrar etme.
 """
 
 
@@ -1061,9 +1073,9 @@ def _fallback_visual_beats(
                 f'{chapter.get("title", "")} '
                 "historical painting engraving"
             ).strip(),
-            "asset_type": "painting",
-            "local_graphic_title": "",
-            "local_graphic_points": [],
+            "asset_type": "ai_reconstruction",
+            "sync_keywords": [],
+            "negative_prompt": "text, letters, numbers, timeline, title card, infographic",
         })
     return result
 
@@ -1500,17 +1512,107 @@ def _save_ai_image(raw_bytes: bytes, target: Path) -> None:
         temp.unlink(missing_ok=True)
 
 
+def assert_text_guard_ready() -> None:
+    if shutil.which("tesseract") is None:
+        raise ProviderUnavailable(
+            "Görsellerde yazı kontrolü için Tesseract bulunamadı."
+        )
+
+
+def visible_text_report(path: Path) -> dict[str, Any]:
+    assert_text_guard_ready()
+    with Image.open(path) as raw:
+        image = ImageOps.exif_transpose(raw).convert("RGB")
+    if image.width > 1600:
+        new_h = max(1, round(image.height * 1600 / image.width))
+        image = image.resize((1600, new_h), Image.Resampling.LANCZOS)
+    gray = ImageOps.autocontrast(ImageOps.grayscale(image))
+    try:
+        data = pytesseract.image_to_data(
+            gray,
+            lang="eng+tur",
+            config="--psm 11",
+            output_type=TesseractOutput.DICT,
+        )
+    except pytesseract.TesseractError:
+        data = pytesseract.image_to_data(
+            gray,
+            lang="eng",
+            config="--psm 11",
+            output_type=TesseractOutput.DICT,
+        )
+    tokens = []
+    total_chars = 0
+    for raw_text, raw_conf in zip(data.get("text", []), data.get("conf", [])):
+        clean = re.sub(
+            r"[^0-9A-Za-zÇĞİÖŞÜçğıöşü]+",
+            "",
+            str(raw_text),
+        )
+        try:
+            confidence = float(raw_conf)
+        except (TypeError, ValueError):
+            confidence = -1.0
+        letters = sum(ch.isalpha() for ch in clean)
+        digits = sum(ch.isdigit() for ch in clean)
+        if (
+            confidence >= OCR_MIN_CONFIDENCE
+            and (letters >= 3 or digits >= 2)
+        ):
+            tokens.append({
+                "text": clean,
+                "confidence": round(confidence, 1),
+            })
+            total_chars += len(clean)
+    passed = total_chars < OCR_MIN_TOTAL_CHARS and len(tokens) < 2
+    return {
+        "passed": passed,
+        "tokens": tokens[:12],
+        "total_chars": total_chars,
+        "engine": "tesseract-eng-tur",
+    }
+
+
+def postprocess_charon_audio(raw_file: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    run([
+        "ffmpeg", "-y", "-i", str(raw_file),
+        "-af",
+        (
+            f"atempo={CHARON_TEMPO:.3f},"
+            "highpass=f=65,lowpass=f=10500,"
+            "loudnorm=I=-17:TP=-2:LRA=7"
+        ),
+        "-ar", "48000", "-ac", "1",
+        "-c:a", "pcm_s16le",
+        str(target),
+    ], timeout=300)
+
+
 def ai_visual_prompt(
     topic: str,
     chapter_title: str,
     beat: dict[str, Any],
+    *,
+    repair_reason: str = "",
 ) -> str:
-    excerpt = _compact_ai_text(beat.get("narration_excerpt", ""), 380)
-    contract = _compact_ai_text(beat.get("visual_contract", ""), 280)
+    excerpt = _compact_ai_text(beat.get("narration_excerpt", ""), 390)
+    contract = _compact_ai_text(beat.get("visual_contract", ""), 300)
     must_show = _compact_ai_text(
         ", ".join(str(item) for item in beat.get("must_show", [])),
-        230,
+        240,
     )
+    sync_keywords = _compact_ai_text(
+        ", ".join(str(item) for item in beat.get("sync_keywords", [])),
+        180,
+    )
+    repair = ""
+    if repair_reason:
+        repair = (
+            " Previous candidate rejected. Required correction: "
+            f"{repair_reason}. Recompose without any writing."
+        )
     prompt = (
         f"{AI_VISUAL_STYLE} "
         f"Main historical topic: {topic}. "
@@ -1518,9 +1620,13 @@ def ai_visual_prompt(
         f"Exact visual contract: {contract}. "
         f"Narration at this moment: {excerpt}. "
         f"Mandatory visible elements: {must_show}. "
-        "Show the named main subject, action and location together and clearly. "
-        "Do not replace the event with a generic army camp, empty landscape, "
-        "symbolic object or unrelated architecture. No written text anywhere."
+        f"Synchronization anchors: {sync_keywords}. "
+        "Translate narration into people, action, architecture and physical objects. "
+        "Never render narration, names, dates or quotations as typography. "
+        "Show the named subject, action and location together. "
+        "Do not use a generic camp, empty landscape, symbolic object, chronology "
+        "graphic, infographic, title card or unrelated architecture. "
+        f"No written marks anywhere in the pixels.{repair}"
     )
     return _compact_ai_text(prompt, AI_IMAGE_PROMPT_LIMIT)
 
@@ -1646,52 +1752,99 @@ def generate_ai_visual_for_beat(
     target: Path,
 ) -> dict[str, Any]:
     beat_id = int(beat["beat_id"])
-    prompt = ai_visual_prompt(ctx.topic, chapter_title, beat)
     negative = ai_visual_negative(beat)
-    seed = deterministic_ai_seed(ctx.topic, chapter_index, beat_id)
-    models = list(dict.fromkeys(
-        model
-        for model in (
+    base_seed = deterministic_ai_seed(ctx.topic, chapter_index, beat_id)
+    models = [
+        model for model in (
             CLOUDFLARE_IMAGE_MODEL,
             CLOUDFLARE_FALLBACK_IMAGE_MODEL,
-        )
-        if model
-    ))
-    last_error: Exception | None = None
+            CLOUDFLARE_IMAGE_MODEL,
+        ) if model
+    ]
+    last_error = None
+    repair_reason = ""
 
-    for model in models:
+    for attempt_index in range(1, AI_VISUAL_MAX_ATTEMPTS + 1):
+        model = models[(attempt_index - 1) % len(models)]
+        seed = (base_seed + (attempt_index - 1) * 104729) % 2_000_000_000
+        raw = chapter_dir / "assets" / (
+            f"beat_{beat_id:02d}-candidate-{attempt_index}.jpg"
+        )
+        raw.unlink(missing_ok=True)
         try:
+            prompt = ai_visual_prompt(
+                ctx.topic,
+                chapter_title,
+                beat,
+                repair_reason=repair_reason,
+            )
             log(
-                f"AI VISUAL: bölüm={chapter_index}, beat={beat_id}, model={model}"
+                f"AI VISUAL: bölüm={chapter_index}, beat={beat_id}, "
+                f"deneme={attempt_index}/{AI_VISUAL_MAX_ATTEMPTS}, model={model}"
             )
-            raw = chapter_dir / "assets" / f"beat_{beat_id:02d}-ai.jpg"
-            cloudflare_generate_image(
-                prompt,
-                negative,
-                seed,
-                raw,
-                model,
-            )
+            cloudflare_generate_image(prompt, negative, seed, raw, model)
+            raw_check = visible_text_report(raw)
+            if not raw_check["passed"]:
+                repair_reason = (
+                    "visible text/fake alphabet detected: "
+                    + ", ".join(
+                        token["text"] for token in raw_check["tokens"][:6]
+                    )
+                )
+                log(
+                    f"ZERO-TEXT REJECT: beat={beat_id}, "
+                    f"tokens={raw_check['tokens']}"
+                )
+                raw.unlink(missing_ok=True)
+                continue
+
             process_frame(raw, target)
+            final_check = visible_text_report(target)
+            if not final_check["passed"]:
+                repair_reason = (
+                    "visible text remained after processing: "
+                    + ", ".join(
+                        token["text"] for token in final_check["tokens"][:6]
+                    )
+                )
+                log(
+                    f"ZERO-TEXT REJECT AFTER PROCESS: beat={beat_id}, "
+                    f"tokens={final_check['tokens']}"
+                )
+                raw.unlink(missing_ok=True)
+                target.unlink(missing_ok=True)
+                continue
+
+            raw.unlink(missing_ok=True)
             return {
                 **beat,
+                "asset_type": "ai_reconstruction",
                 "frame": str(target.relative_to(ctx.root)),
                 "source_type": "cloudflare_workers_ai",
                 "ai_model": model,
                 "ai_seed": seed,
                 "ai_prompt": prompt,
                 "visual_contract": beat.get("visual_contract", ""),
+                "visual_version": VERSION,
+                "text_guard": final_check,
+                "text_free": True,
+                "story_locked": True,
             }
         except CloudflareVisualQuotaPause:
             raise
         except Exception as exc:
             last_error = exc
+            raw.unlink(missing_ok=True)
+            target.unlink(missing_ok=True)
             log(
-                f"AI VISUAL model fallback: beat={beat_id}, model={model}, hata={exc}"
+                f"AI VISUAL denemesi başarısız: beat={beat_id}, "
+                f"model={model}, hata={exc}"
             )
 
+    detail = repair_reason or str(last_error or "unknown visual error")
     raise CloudflareVisualUnavailable(
-        f"Beat {beat_id} için AI görsel üretilemedi: {last_error}"
+        f"Beat {beat_id} için yazısız tarihsel görsel üretilemedi. "
+        f"Kötü kare videoya alınmadı. Son neden: {detail}"
     )
 
 
@@ -1710,6 +1863,15 @@ def assets_manifest_complete(
     if ids != expected:
         return False
     for item in manifest:
+        if item.get("visual_version") != VERSION:
+            return False
+        if item.get("source_type") != "cloudflare_workers_ai":
+            return False
+        if item.get("text_free") is not True:
+            return False
+        text_guard = item.get("text_guard")
+        if not isinstance(text_guard, dict) or not text_guard.get("passed"):
+            return False
         frame = item.get("frame")
         if not frame:
             return False
@@ -2120,7 +2282,7 @@ def make_chapter_storyboard(
     )
     draw.text(
         (32, 70),
-        f"{len(valid_items)} gerçek görsel · V10.4 semantik kontrol",
+        f"{len(valid_items)} gerçek görsel · V10.6 yazısız AI kontrolü",
         font=font(22),
         fill=(177, 165, 145),
     )
@@ -2265,6 +2427,8 @@ def collect_chapter_assets(
     used_ids: set[int],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     del session, used_ids
+    assert_text_guard_ready()
+
     assets_dir = chapter_dir / "assets"
     frames_dir = chapter_dir / "frames"
     assets_dir.mkdir(parents=True, exist_ok=True)
@@ -2279,7 +2443,7 @@ def collect_chapter_assets(
         if isinstance(item, dict)
     }
     manifest: list[dict[str, Any]] = []
-    credits: list[dict[str, Any]] = read_json(credits_file, [])
+    credits = read_json(credits_file, [])
     credits_by_beat = {
         int(item.get("beat_id", 0)): item
         for item in credits
@@ -2287,118 +2451,110 @@ def collect_chapter_assets(
     }
 
     chapter_title = str(chapter_script.get("chapter_title", ""))
-    chapter_index_match = re.search(r"(\d+)$", chapter_dir.name)
-    chapter_index = int(chapter_index_match.group(1)) if chapter_index_match else 1
+    match = re.search(r"(\d+)$", chapter_dir.name)
+    chapter_index = int(match.group(1)) if match else 1
     beats = chapter_script.get("visual_beats", [])
 
     for beat in beats:
         beat_id = int(beat["beat_id"])
+        beat["asset_type"] = "ai_reconstruction"
+        beat["local_graphic_title"] = ""
+        beat["local_graphic_points"] = []
         frame = frames_dir / f"beat_{beat_id:02d}.jpg"
         old = previous_by_id.get(beat_id, {})
 
-        if frame.exists() and frame.stat().st_size > 20_000:
+        valid_checkpoint = (
+            frame.exists()
+            and frame.stat().st_size > 20_000
+            and old.get("visual_version") == VERSION
+            and old.get("source_type") == "cloudflare_workers_ai"
+            and old.get("text_free") is True
+            and isinstance(old.get("text_guard"), dict)
+            and old.get("text_guard", {}).get("passed") is True
+        )
+        if valid_checkpoint:
             record = {
                 **beat,
                 **old,
+                "asset_type": "ai_reconstruction",
                 "beat_id": beat_id,
                 "frame": str(frame.relative_to(ctx.root)),
                 "checkpoint": True,
             }
             manifest.append(record)
             log(
-                f"AI görsel checkpoint kullanıldı: "
+                f"Yazısız AI görsel checkpoint kullanıldı: "
                 f"bölüm={chapter_index}, beat={beat_id}/{len(beats)}"
             )
             continue
 
-        asset_type = str(beat.get("asset_type", "painting")).lower()
-        if asset_type in {"map", "timeline", "diagram"}:
-            make_local_graphic(
-                beat,
+        frame.unlink(missing_ok=True)
+        try:
+            record = generate_ai_visual_for_beat(
+                ctx,
+                chapter_dir,
                 chapter_title,
+                chapter_index,
+                beat,
                 frame,
             )
-            record = {
-                **beat,
-                "frame": str(frame.relative_to(ctx.root)),
-                "source_type": "local_map_or_timeline",
-            }
             manifest.append(record)
-        else:
-            try:
-                record = generate_ai_visual_for_beat(
-                    ctx,
-                    chapter_dir,
-                    chapter_title,
-                    chapter_index,
-                    beat,
-                    frame,
+            credits_by_beat[beat_id] = {
+                "beat_id": beat_id,
+                "title": f"AI reconstruction — {beat.get('visual_contract', '')}",
+                "artist": "Cloudflare Workers AI",
+                "license": "AI-generated for this project",
+                "license_url": "",
+                "source_page": "",
+                "credit": record.get("ai_model", ""),
+            }
+        except CloudflareVisualQuotaPause as exc:
+            write_json(manifest_file, manifest)
+            write_json(
+                credits_file,
+                [credits_by_beat[key] for key in sorted(credits_by_beat)],
+            )
+            if manifest:
+                make_chapter_storyboard(
+                    ctx, chapter_dir, manifest, chapter_title
                 )
-                manifest.append(record)
-                credits_by_beat[beat_id] = {
-                    "beat_id": beat_id,
-                    "title": f"AI reconstruction — {beat.get('visual_contract', '')}",
-                    "artist": "Cloudflare Workers AI",
-                    "license": "AI-generated for this project",
-                    "license_url": "",
-                    "source_page": "",
-                    "credit": record.get("ai_model", ""),
-                }
-            except CloudflareVisualQuotaPause as exc:
-                write_json(manifest_file, manifest)
-                write_json(
-                    credits_file,
-                    [credits_by_beat[key] for key in sorted(credits_by_beat)],
+            raise ControlledStop(
+                "Cloudflare ücretsiz AI görsel kotası doldu. "
+                f"Tamamlanan yazısız görseller korundu: {len(manifest)}/{len(beats)}. "
+                f"Sıradaki beat: {beat_id}. Aynı project_slug ile kota "
+                f"yenilendikten sonra devam edilecek. Teknik hata: {exc}"
+            ) from exc
+        except CloudflareVisualUnavailable as exc:
+            write_json(manifest_file, manifest)
+            write_json(
+                credits_file,
+                [credits_by_beat[key] for key in sorted(credits_by_beat)],
+            )
+            if manifest:
+                make_chapter_storyboard(
+                    ctx, chapter_dir, manifest, chapter_title
                 )
-                if manifest:
-                    make_chapter_storyboard(
-                        ctx,
-                        chapter_dir,
-                        manifest,
-                        chapter_title,
-                    )
-                raise ControlledStop(
-                    "Cloudflare ücretsiz AI görsel kotası doldu. "
-                    f"Tamamlanan kaliteli görseller korundu: {len(manifest)}/{len(beats)}. "
-                    f"Sıradaki beat: {beat_id}. Aynı project_slug ile kota "
-                    "yenilendikten sonra tekrar çalıştırın; eksik görselden "
-                    f"devam edilecek. Teknik hata: {exc}"
-                ) from exc
-            except CloudflareVisualUnavailable as exc:
-                write_json(manifest_file, manifest)
-                write_json(
-                    credits_file,
-                    [credits_by_beat[key] for key in sorted(credits_by_beat)],
-                )
-                if manifest:
-                    make_chapter_storyboard(
-                        ctx,
-                        chapter_dir,
-                        manifest,
-                        chapter_title,
-                    )
-                raise ControlledStop(
-                    "AI görsel servisi geçici olarak kullanılamadı. "
-                    f"Tamamlanan görseller korundu: {len(manifest)}/{len(beats)}. "
-                    f"Sıradaki beat: {beat_id}. Yerel bilgi kartı veya alakasız "
-                    f"Wikimedia görseli kullanılmadı. Teknik hata: {exc}"
-                ) from exc
+            raise ControlledStop(
+                "Yazısız ve anlatımla bağlantılı AI görsel üretilemedi. "
+                f"Tamamlanan görseller korundu: {len(manifest)}/{len(beats)}. "
+                f"Sıradaki beat: {beat_id}. Bilgi kartı final videoya eklenmedi. "
+                f"Teknik hata: {exc}"
+            ) from exc
 
         write_json(manifest_file, manifest)
         write_json(
             credits_file,
             [credits_by_beat[key] for key in sorted(credits_by_beat)],
         )
-        # Keep a visible checkpoint storyboard during a long chapter.
         if len(manifest) in {3, 6, 9, len(beats)}:
             make_chapter_storyboard(
-                ctx,
-                chapter_dir,
-                manifest,
-                chapter_title,
+                ctx, chapter_dir, manifest, chapter_title
             )
 
-    credits = [credits_by_beat[key] for key in sorted(credits_by_beat)]
+    credits = [
+        credits_by_beat[key]
+        for key in sorted(credits_by_beat)
+    ]
     write_json(manifest_file, manifest)
     write_json(credits_file, credits)
     (chapter_dir / "ASSET_GAPS.txt").unlink(missing_ok=True)
@@ -2433,15 +2589,20 @@ def extract_audio_pcm(response: Any) -> bytes:
 
 def tts_prompt(text: str) -> str:
     return f"""
-# VOICE
-Use the Charon voice as a mature Turkish historical documentary narrator.
+# VOICE LOCK
+Use only the prebuilt Charon voice. One mature Turkish historical documentary
+narrator from beginning to end. Never imitate another speaker.
 
 # PERFORMANCE
-Natural conversational documentary pace. Warm, credible and controlled.
-Do not sound sleepy, dragged out, theatrical, like a trailer or newsreader.
-Use short punctuation-based pauses. Standard Turkey Turkish pronunciation.
-Read the transcript exactly without adding or removing words.
-No music and no sound effects.
+Calm, measured and natural historical narration in standard Turkey Turkish.
+Aim for an unhurried documentary rhythm, roughly 125–140 spoken words per minute.
+Do not rush names, dates or cause-and-effect sentences. Pause briefly after
+commas and clearly at full stops. Keep paragraphs connected and conversational.
+Sound knowledgeable, serious and human; not sleepy, not dragged out, not
+theatrical, not a trailer, not a commercial and not a newsreader.
+Maintain the same vocal identity, energy and distance throughout.
+Read the transcript exactly. Do not add headings, quotes, explanations,
+sound effects or music.
 
 # TRANSCRIPT
 {text}
@@ -2464,13 +2625,23 @@ def is_gemini_tts_quota_error(
     )
 
 
-def synthesize_charon_chunk(client: genai.Client, text: str, target: Path) -> None:
+def synthesize_charon_chunk(
+    client: genai.Client,
+    text: str,
+    target: Path,
+) -> None:
     last_error: Exception | None = None
+    raw_target = target.with_name(
+        target.stem + "-charon-raw.wav"
+    )
     for attempt, delay in enumerate((0, 25, 70), start=1):
         if delay:
             time.sleep(delay)
         try:
-            log(f"Charon TTS parçası: deneme={attempt}/3")
+            log(
+                f"Charon TTS parçası: deneme={attempt}/3, "
+                f"doğal tempo={CHARON_TEMPO:.2f}"
+            )
             response = client.models.generate_content(
                 model=TTS_MODEL,
                 contents=tts_prompt(text),
@@ -2488,12 +2659,21 @@ def synthesize_charon_chunk(client: genai.Client, text: str, target: Path) -> No
             pcm = extract_audio_pcm(response)
             if len(pcm) < 24_000:
                 raise ValueError("TTS verisi çok kısa.")
-            write_wav(target, pcm)
-            if ffprobe_duration(target) < max(8.0, word_count(text) / 220 * 60 * 0.65):
-                raise ValueError("TTS sesi kesilmiş görünüyor.")
+            write_wav(raw_target, pcm)
+            postprocess_charon_audio(raw_target, target)
+            raw_target.unlink(missing_ok=True)
+            minimum = max(
+                8.0,
+                word_count(text) / 175 * 60 * 0.58,
+            )
+            if ffprobe_duration(target) < minimum:
+                raise ValueError(
+                    "Charon sesi kesilmiş veya gereğinden hızlı görünüyor."
+                )
             return
         except Exception as exc:
             last_error = exc
+            raw_target.unlink(missing_ok=True)
             target.unlink(missing_ok=True)
             log(f"Charon TTS başarısız: {exc}")
             if is_gemini_tts_quota_error(exc):
@@ -2564,6 +2744,21 @@ def synthesize_charon_chapter(
     provider_file = chapter_dir / "tts-provider.json"
     chunks_dir = chapter_dir / "tts-chunks-charon"
     chunks_dir.mkdir(parents=True, exist_ok=True)
+
+    provider_info = read_json(provider_file, {})
+    old_tempo = float(provider_info.get("tempo", 1.0) or 1.0)
+    old_version = str(provider_info.get("version", ""))
+    if old_version != VERSION or abs(old_tempo - CHARON_TEMPO) > 0.001:
+        final.unlink(missing_ok=True)
+        provider_file.unlink(missing_ok=True)
+        shutil.rmtree(chunks_dir, ignore_errors=True)
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+        (chapter_dir / "tts-charon-checkpoint.json").unlink(
+            missing_ok=True
+        )
+        log(
+            "CHARON NATURAL TEMPO GUARD: eski hızlı ses checkpointleri temizlendi."
+        )
 
     # Remove any legacy non-Charon output from previous experimental versions.
     legacy_provider = read_json(
@@ -2703,6 +2898,9 @@ def synthesize_charon_chapter(
             "model": TTS_MODEL,
             "chunk_count": len(files),
             "charon_only": True,
+            "tempo": CHARON_TEMPO,
+            "version": VERSION,
+            "delivery": "natural_historical_documentary",
             "audio_seconds": round(actual, 2),
         },
     )
@@ -3094,7 +3292,7 @@ def main() -> None:
     session = requests_session()
 
     log("=" * 72)
-    log(f"UYKU VE TARİH V10.5 AI VISUAL ROLLBACK CORE {VERSION}")
+    log(f"UYKU VE TARİH V10.6 NO-TEXT NATURAL CHARON CORE {VERSION}")
     log(f"Proje: {ctx.slug} | mod={ctx.mode} | hedef={ctx.target_minutes} dk")
     log("Checkpoint/resume aktif. Tamamlanan dosyalar yeniden üretilmez.")
     log("Resilient script: bölüm metni segmentlere ayrılır ve her segment kaydedilir.")
