@@ -5,11 +5,15 @@
   "tts_fallback": "disabled",
   "charon_chunk_target_words": 520,
   "quota_behavior": "checkpoint_and_resume",
-  "visual_provider": "cloudflare_workers_ai",
+  "visual_provider": "cloudflare_flux_ai",
   "ai_image_fallback": "disabled",
   "youtube_upload": "disabled",
   "visual_model": "@cf/black-forest-labs/flux-2-klein-4b",
   "visual_fallback_model": "@cf/black-forest-labs/flux-1-schnell",
   "visual_quota_behavior": "checkpoint_and_resume",
-  "wikimedia_final_visuals": false
+  "wikimedia_final_visuals": false,
+  "charon_tempo": 0.94,
+  "visual_text_guard": "tesseract_eng_tur",
+  "local_graphic_in_final": false,
+  "timeline_cards_in_final": false
 }
