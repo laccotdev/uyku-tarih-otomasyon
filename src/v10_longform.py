@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import html
+import hashlib
 import json
 import math
 import os
@@ -23,7 +24,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from google import genai
 from google.genai import types
 
-VERSION = "10.1.0"
+VERSION = "10.3.0"
 ROOT = Path(__file__).resolve().parents[1]
 PROJECTS = ROOT / "projects"
 FPS = 24
@@ -36,6 +37,21 @@ TEXT_MODELS = [
     "gemini-2.5-flash",
 ]
 TTS_MODEL = os.getenv("TTS_MODEL", "gemini-2.5-flash-preview-tts").strip()
+
+CHARON_CHUNK_TARGET_WORDS = max(
+    360,
+    int(os.getenv("CHARON_CHUNK_TARGET_WORDS", "520")),
+)
+CHARON_ONLY = True
+
+RESEARCH_QUESTION_WORDS = {
+    "nasıl", "nasil", "nedir", "kimdir", "nerede", "ne", "neden",
+    "niçin", "nicin", "gerçekleşti", "gerceklesti", "oldu",
+    "olmuştur", "olmustur", "anlat", "hakkında", "hakkinda", "tarihi",
+    "what", "how", "why", "when", "where", "who", "was", "were",
+    "happened", "history", "explained",
+}
+
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 WIKI_API = {
     "tr": "https://tr.wikipedia.org/w/api.php",
@@ -265,24 +281,95 @@ def requests_session() -> requests.Session:
     return session
 
 
-def wiki_research(session: requests.Session, query: str, language: str, limit: int = 3) -> list[dict[str, Any]]:
-    endpoint = WIKI_API[language]
-    search_response = session.get(
-        endpoint,
-        params={
-            "action": "query",
-            "list": "search",
-            "srsearch": query,
-            "srnamespace": 0,
-            "srlimit": limit,
-            "format": "json",
-            "formatversion": 2,
-        },
-        timeout=30,
+def research_tokens(value: str) -> set[str]:
+    normalized = slugify(value).replace("-", " ")
+    return {
+        token
+        for token in normalized.split()
+        if (
+            len(token) >= 3
+            and token not in STOPWORDS
+            and token not in RESEARCH_QUESTION_WORDS
+        )
+    }
+
+
+def core_research_query(value: str) -> str:
+    words = re.findall(
+        r"[0-9A-Za-zÇĞİÖŞÜçğıöşü'’\-]+",
+        str(value),
     )
-    search_response.raise_for_status()
-    hits = search_response.json().get("query", {}).get("search", [])
-    pageids = [str(item["pageid"]) for item in hits]
+    kept: list[str] = []
+    for word in words:
+        normalized = slugify(word)
+        if (
+            normalized
+            and normalized not in RESEARCH_QUESTION_WORDS
+            and normalized not in STOPWORDS
+        ):
+            kept.append(word)
+
+    clean = " ".join(kept).strip()
+    return clean or str(value).strip().rstrip("?!. ")
+
+
+def source_relevance_score(
+    source: dict[str, Any],
+    query: str,
+) -> int:
+    query_tokens = research_tokens(query)
+    title_tokens = research_tokens(
+        str(source.get("title", ""))
+    )
+    extract_tokens = research_tokens(
+        str(source.get("extract", ""))[:1800]
+    )
+    if not query_tokens:
+        return 0
+
+    title_overlap = len(query_tokens & title_tokens)
+    extract_overlap = len(query_tokens & extract_tokens)
+    normalized_query = slugify(query)
+    normalized_title = slugify(
+        str(source.get("title", ""))
+    )
+
+    score = title_overlap * 45 + min(30, extract_overlap * 5)
+    if (
+        normalized_query
+        and normalized_query in normalized_title
+    ):
+        score += 80
+    if len(str(source.get("extract", ""))) >= 350:
+        score += 10
+    return score
+
+
+def source_is_relevant(
+    source: dict[str, Any],
+    query: str,
+) -> bool:
+    query_tokens = research_tokens(query)
+    title_tokens = research_tokens(
+        str(source.get("title", ""))
+    )
+    overlap = len(query_tokens & title_tokens)
+
+    if len(query_tokens) >= 2 and overlap < 2:
+        return False
+    if len(query_tokens) == 1 and overlap < 1:
+        return False
+    if len(str(source.get("extract", "")).strip()) < 120:
+        return False
+    return source_relevance_score(source, query) >= 85
+
+
+def _fetch_wiki_pages(
+    session: requests.Session,
+    endpoint: str,
+    pageids: list[str],
+    language: str,
+) -> list[dict[str, Any]]:
     if not pageids:
         return []
     response = session.get(
@@ -292,7 +379,7 @@ def wiki_research(session: requests.Session, query: str, language: str, limit: i
             "pageids": "|".join(pageids),
             "prop": "extracts|info",
             "explaintext": 1,
-            "exchars": 4200,
+            "exchars": 5200,
             "inprop": "url",
             "format": "json",
             "formatversion": 2,
@@ -300,33 +387,194 @@ def wiki_research(session: requests.Session, query: str, language: str, limit: i
         timeout=30,
     )
     response.raise_for_status()
-    pages = response.json().get("query", {}).get("pages", [])
-    result = []
-    for page in pages:
+    result: list[dict[str, Any]] = []
+    for page in response.json().get(
+        "query",
+        {},
+    ).get("pages", []):
         result.append({
             "language": language,
             "title": page.get("title", ""),
             "url": page.get("fullurl", ""),
-            "extract": re.sub(r"\s+", " ", page.get("extract", "")).strip(),
+            "extract": re.sub(
+                r"\s+",
+                " ",
+                page.get("extract", ""),
+            ).strip(),
         })
     return result
 
 
-def research_topic(session: requests.Session, topic: str, extra_queries: list[str]) -> dict[str, Any]:
-    queries = [topic, *extra_queries]
+def wiki_research(
+    session: requests.Session,
+    query: str,
+    language: str,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    endpoint = WIKI_API[language]
+    core_query = core_research_query(query)
+
+    search_variants = [
+        f'intitle:"{core_query}"',
+        f'"{core_query}"',
+        core_query,
+    ]
+    pageids: list[str] = []
+    seen_pageids: set[str] = set()
+
+    for search_query in search_variants:
+        search_response = session.get(
+            endpoint,
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": search_query,
+                "srnamespace": 0,
+                "srlimit": max(5, limit * 3),
+                "format": "json",
+                "formatversion": 2,
+            },
+            timeout=30,
+        )
+        search_response.raise_for_status()
+        hits = search_response.json().get(
+            "query",
+            {},
+        ).get("search", [])
+        for item in hits:
+            pageid = str(item.get("pageid", ""))
+            if pageid and pageid not in seen_pageids:
+                seen_pageids.add(pageid)
+                pageids.append(pageid)
+        if len(pageids) >= limit * 3:
+            break
+
+    candidates = _fetch_wiki_pages(
+        session,
+        endpoint,
+        pageids,
+        language,
+    )
+    candidates.sort(
+        key=lambda source: source_relevance_score(
+            source,
+            core_query,
+        ),
+        reverse=True,
+    )
+    return [
+        source
+        for source in candidates
+        if source_is_relevant(source, core_query)
+    ][:limit]
+
+
+def research_is_usable(
+    research: dict[str, Any] | None,
+    topic: str,
+) -> bool:
+    if not isinstance(research, dict):
+        return False
+    sources = research.get("sources")
+    if not isinstance(sources, list):
+        return False
+    core = core_research_query(topic)
+    return any(
+        source_is_relevant(source, core)
+        for source in sources
+        if isinstance(source, dict)
+    )
+
+
+def research_fingerprint(
+    research: dict[str, Any],
+) -> str:
+    compact = [
+        {
+            "title": source.get("title", ""),
+            "url": source.get("url", ""),
+            "extract": str(source.get("extract", ""))[:1000],
+        }
+        for source in research.get("sources", [])
+    ]
+    raw = json.dumps(
+        compact,
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def research_topic(
+    session: requests.Session,
+    topic: str,
+    extra_queries: list[str],
+) -> dict[str, Any]:
+    core = core_research_query(topic)
+    queries = [
+        core,
+        *[
+            core_research_query(query)
+            for query in extra_queries
+            if str(query).strip()
+        ],
+    ]
+    queries = list(dict.fromkeys(
+        query for query in queries if query
+    ))
+
     sources: list[dict[str, Any]] = []
-    seen = set()
-    for query in queries[:6]:
+    seen: set[str] = set()
+
+    for query in queries[:8]:
         for lang in ("tr", "en"):
             try:
-                for item in wiki_research(session, query, lang, limit=2):
-                    key = item["url"] or f'{lang}:{item["title"]}'
+                for item in wiki_research(
+                    session,
+                    query,
+                    lang,
+                    limit=3,
+                ):
+                    key = (
+                        item.get("url")
+                        or f'{lang}:{item.get("title", "")}'
+                    )
                     if key not in seen:
                         seen.add(key)
+                        item["relevance_score"] = (
+                            source_relevance_score(
+                                item,
+                                query,
+                            )
+                        )
+                        item["matched_query"] = query
                         sources.append(item)
             except Exception as exc:
-                log(f"Wikipedia araştırması atlandı ({lang}/{query}): {exc}")
-    return {"topic": topic, "queries": queries, "sources": sources}
+                log(
+                    "Wikipedia araştırması atlandı "
+                    f"({lang}/{query}): {exc}"
+                )
+
+    sources.sort(
+        key=lambda source: int(
+            source.get("relevance_score", 0)
+        ),
+        reverse=True,
+    )
+
+    result = {
+        "topic": topic,
+        "core_query": core,
+        "queries": queries,
+        "sources": sources[:14],
+        "research_version": VERSION,
+    }
+    if not research_is_usable(result, topic):
+        raise ControlledStop(
+            "Konuya doğrudan bağlı güvenilir Wikipedia kaynağı "
+            f"bulunamadı. Yanlış kaynakla video üretilmedi. Aranan konu: {core}"
+        )
+    return result
 
 
 def story_plan_prompt(topic: str, target_minutes: int, chapter_count: int, research: dict[str, Any]) -> str:
@@ -1414,6 +1662,22 @@ No music and no sound effects.
 """.strip()
 
 
+def is_gemini_tts_quota_error(
+    exc: Exception,
+) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "resource_exhausted",
+            "quota exceeded",
+            "generate_content_free_tier_requests",
+            "generate requests per day",
+            "429",
+        )
+    )
+
+
 def synthesize_charon_chunk(client: genai.Client, text: str, target: Path) -> None:
     last_error: Exception | None = None
     for attempt, delay in enumerate((0, 25, 70), start=1):
@@ -1446,7 +1710,11 @@ def synthesize_charon_chunk(client: genai.Client, text: str, target: Path) -> No
             last_error = exc
             target.unlink(missing_ok=True)
             log(f"Charon TTS başarısız: {exc}")
-    raise ProviderUnavailable(f"Charon TTS kotası veya servisi hazır değil: {last_error}")
+            if is_gemini_tts_quota_error(exc):
+                break
+    raise ProviderUnavailable(
+        f"Charon TTS kotası veya servisi hazır değil: {last_error}"
+    )
 
 
 def concat_audio(files: list[Path], target: Path) -> None:
@@ -1469,21 +1737,231 @@ def concat_audio(files: list[Path], target: Path) -> None:
     run(command, timeout=900)
 
 
-def synthesize_chapter(client: genai.Client, chapter_dir: Path, narration: str) -> Path:
+def _charon_chunk_state(
+    chapter_dir: Path,
+    *,
+    total_chunks: int,
+    completed_chunks: list[int],
+    next_chunk: int,
+    status: str,
+    message: str = "",
+) -> None:
+    write_json(
+        chapter_dir / "tts-charon-checkpoint.json",
+        {
+            "provider": "gemini_charon",
+            "voice": VOICE_NAME,
+            "model": TTS_MODEL,
+            "total_chunks": total_chunks,
+            "completed_chunks": completed_chunks,
+            "next_chunk": next_chunk,
+            "status": status,
+            "message": message,
+            "version": VERSION,
+        },
+    )
+
+
+def synthesize_charon_chapter(
+    client: genai.Client,
+    chapter_dir: Path,
+    narration: str,
+) -> Path:
+    """
+    Charon-only narration with persistent chunk checkpoints.
+
+    Completed Charon chunks are never deleted on quota exhaustion. The next
+    workflow run resumes from the first missing chunk, guaranteeing that no
+    second voice can enter the chapter.
+    """
     final = chapter_dir / "narration.wav"
-    if final.exists() and ffprobe_duration(final) > 120:
-        return final
-    chunks_dir = chapter_dir / "tts-chunks"
+    provider_file = chapter_dir / "tts-provider.json"
+    chunks_dir = chapter_dir / "tts-chunks-charon"
     chunks_dir.mkdir(parents=True, exist_ok=True)
-    chunks = balanced_text_chunks(narration, 210)
+
+    # Remove any legacy non-Charon output from previous experimental versions.
+    legacy_provider = read_json(
+        provider_file,
+        {},
+    ).get("provider")
+    if legacy_provider and legacy_provider != "gemini_charon":
+        log(
+            "CHARON ONLY GUARD: eski farklı-ses çıktısı siliniyor."
+        )
+        final.unlink(missing_ok=True)
+        provider_file.unlink(missing_ok=True)
+    shutil.rmtree(
+        chapter_dir / "tts-chunks-piper",
+        ignore_errors=True,
+    )
+
+    chunks = balanced_text_chunks(
+        narration,
+        CHARON_CHUNK_TARGET_WORDS,
+    )
     files: list[Path] = []
+    completed: list[int] = []
+
     for index, chunk in enumerate(chunks, start=1):
         path = chunks_dir / f"chunk_{index:02d}.wav"
-        if not path.exists() or ffprobe_duration(path) < 8:
-            synthesize_charon_chunk(client, chunk, path)
+
+        if (
+            path.exists()
+            and ffprobe_duration(path) >= 8
+        ):
+            log(
+                f"Charon checkpoint kullanıldı: "
+                f"{index}/{len(chunks)}"
+            )
+            files.append(path)
+            completed.append(index)
+            continue
+
+        path.unlink(missing_ok=True)
+        _charon_chunk_state(
+            chapter_dir,
+            total_chunks=len(chunks),
+            completed_chunks=completed,
+            next_chunk=index,
+            status="generating",
+        )
+        log(
+            f"Charon TTS parçası: {index}/{len(chunks)} "
+            f"(hedef yaklaşık {CHARON_CHUNK_TARGET_WORDS} kelime)"
+        )
+
+        try:
+            synthesize_charon_chunk(
+                client,
+                chunk,
+                path,
+            )
+        except ProviderUnavailable as exc:
+            path.unlink(missing_ok=True)
+            quota = is_gemini_tts_quota_error(exc)
+            status = (
+                "quota_paused"
+                if quota
+                else "provider_paused"
+            )
+            _charon_chunk_state(
+                chapter_dir,
+                total_chunks=len(chunks),
+                completed_chunks=completed,
+                next_chunk=index,
+                status=status,
+                message=str(exc),
+            )
+
+            if quota:
+                raise ControlledStop(
+                    "Charon ücretsiz günlük TTS kotası doldu. "
+                    f"Tamamlanan Charon parçaları korundu: "
+                    f"{len(completed)}/{len(chunks)}. "
+                    f"Sıradaki parça: {index}. "
+                    "Kota yenilendikten sonra aynı project_slug ve aynı "
+                    "bölümle yeniden çalıştırın; yalnızca eksik Charon "
+                    "parçasından devam edilecek. Başka ses kullanılmayacak."
+                ) from exc
+
+            raise ControlledStop(
+                "Charon TTS servisi geçici olarak kullanılamadı. "
+                f"Tamamlanan Charon parçaları korundu: "
+                f"{len(completed)}/{len(chunks)}. "
+                f"Sıradaki parça: {index}. "
+                "Aynı project_slug ile yeniden çalıştırıldığında kaldığı "
+                "yerden devam edilir. Başka ses kullanılmayacak. "
+                f"Teknik hata: {exc}"
+            ) from exc
+
         files.append(path)
+        completed.append(index)
+        _charon_chunk_state(
+            chapter_dir,
+            total_chunks=len(chunks),
+            completed_chunks=completed,
+            next_chunk=index + 1,
+            status="chunk_ready",
+        )
+
     concat_audio(files, final)
+    actual = ffprobe_duration(final)
+    minimum = max(
+        60.0,
+        word_count(narration) / 225 * 60 * 0.65,
+    )
+    if actual < minimum:
+        final.unlink(missing_ok=True)
+        _charon_chunk_state(
+            chapter_dir,
+            total_chunks=len(chunks),
+            completed_chunks=completed,
+            next_chunk=1,
+            status="concat_invalid",
+            message=(
+                f"Birleşik ses kısa: {actual:.2f}s / "
+                f"minimum {minimum:.2f}s"
+            ),
+        )
+        raise ControlledStop(
+            "Birleşik Charon sesi beklenenden kısa göründü. "
+            "Tek tek Charon parçaları korunuyor; final ses sonraki "
+            "çalışmada yeniden birleştirilecek."
+        )
+
+    write_json(
+        provider_file,
+        {
+            "provider": "gemini_charon",
+            "voice": VOICE_NAME,
+            "model": TTS_MODEL,
+            "chunk_count": len(files),
+            "charon_only": True,
+            "audio_seconds": round(actual, 2),
+        },
+    )
+    _charon_chunk_state(
+        chapter_dir,
+        total_chunks=len(chunks),
+        completed_chunks=completed,
+        next_chunk=len(chunks) + 1,
+        status="complete",
+    )
     return final
+
+
+def synthesize_chapter(
+    client: genai.Client,
+    chapter_dir: Path,
+    narration: str,
+) -> tuple[Path, str]:
+    final = chapter_dir / "narration.wav"
+    provider_file = chapter_dir / "tts-provider.json"
+    provider_info = read_json(
+        provider_file,
+        {},
+    )
+
+    if (
+        final.exists()
+        and ffprobe_duration(final) > 120
+        and provider_info.get("provider") == "gemini_charon"
+        and provider_info.get("voice") == VOICE_NAME
+    ):
+        log("Charon final ses checkpointi kullanıldı.")
+        return final, "gemini_charon"
+
+    log(
+        "TTS PROVIDER LOCK: yalnızca Gemini Charon kullanılacak."
+    )
+    return (
+        synthesize_charon_chapter(
+            client,
+            chapter_dir,
+            narration,
+        ),
+        "gemini_charon",
+    )
 
 
 def detect_silence_points(audio: Path) -> list[float]:
@@ -1635,8 +2113,45 @@ def state(ctx: ProjectContext) -> dict[str, Any]:
 
 
 def save_state(ctx: ProjectContext, data: dict[str, Any]) -> None:
+    data["version"] = VERSION
     data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     write_json(ctx.state_file, data)
+
+
+def reset_generated_chapters_for_new_plan(
+    ctx: ProjectContext,
+    st: dict[str, Any],
+    reason: str,
+) -> None:
+    if ctx.chapters_dir.exists():
+        shutil.rmtree(
+            ctx.chapters_dir,
+            ignore_errors=True,
+        )
+    ctx.chapters_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    for filename in (
+        "used-commons-pageids.json",
+        "credits.json",
+    ):
+        (ctx.root / filename).unlink(
+            missing_ok=True,
+        )
+    st["chapters"] = {}
+    st["status"] = "plan_regenerated"
+    write_json(
+        ctx.root / "V10_2_YENIDEN_PLANLAMA.json",
+        {
+            "reason": reason,
+            "version": VERSION,
+            "message": (
+                "Eski konu dışı araştırmaya bağlı üretilen bölüm "
+                "checkpointleri temizlendi."
+            ),
+        },
+    )
 
 
 def create_context(args: argparse.Namespace) -> ProjectContext:
@@ -1674,30 +2189,83 @@ def main() -> None:
     session = requests_session()
 
     log("=" * 72)
-    log(f"UYKU VE TARİH V10.1 RESILIENT LONGFORM CORE {VERSION}")
+    log(f"UYKU VE TARİH V10.3 CHARON ONLY LONGFORM CORE {VERSION}")
     log(f"Proje: {ctx.slug} | mod={ctx.mode} | hedef={ctx.target_minutes} dk")
     log("Checkpoint/resume aktif. Tamamlanan dosyalar yeniden üretilmez.")
     log("Resilient script: bölüm metni segmentlere ayrılır ve her segment kaydedilir.")
+    log("TTS kilidi: yalnızca Charon; farklı ses ve fallback kapalı.")
+    log(f"Charon parça hedefi: yaklaşık {CHARON_CHUNK_TARGET_WORDS} kelime.")
+    log(f"Araştırma çekirdek sorgusu: {core_research_query(ctx.topic)}")
     log("=" * 72)
 
     try:
         research_file = ctx.root / "research.json"
         research = read_json(research_file)
-        if research is None:
-            research = research_topic(session, ctx.topic, [])
-            write_json(research_file, research)
+        research_rebuilt = False
 
+        if not research_is_usable(
+            research,
+            ctx.topic,
+        ):
+            if research is not None:
+                log(
+                    "RESEARCH QUALITY GUARD: eski kaynaklar konu dışı. "
+                    "Tek kelimelik yanlış eşleşmeler reddediliyor."
+                )
+            research = research_topic(
+                session,
+                ctx.topic,
+                [],
+            )
+            write_json(
+                research_file,
+                research,
+            )
+            research_rebuilt = True
+
+        fingerprint = research_fingerprint(
+            research,
+        )
         plan_file = ctx.root / "story-plan.json"
         plan = read_json(plan_file)
-        if plan is None:
+        plan_invalid = (
+            not isinstance(plan, dict)
+            or plan.get("research_fingerprint") != fingerprint
+            or plan.get("generator_version") != VERSION
+        )
+
+        if plan_invalid:
             payload, model = generate_json(
                 client,
-                story_plan_prompt(ctx.topic, ctx.target_minutes, ctx.chapter_count, research),
+                story_plan_prompt(
+                    ctx.topic,
+                    ctx.target_minutes,
+                    ctx.chapter_count,
+                    research,
+                ),
                 max_tokens=9000,
             )
-            plan = validate_plan(payload, ctx.chapter_count)
+            plan = validate_plan(
+                payload,
+                ctx.chapter_count,
+            )
             plan["text_model"] = model
-            write_json(plan_file, plan)
+            plan["research_fingerprint"] = fingerprint
+            plan["generator_version"] = VERSION
+            write_json(
+                plan_file,
+                plan,
+            )
+            reset_generated_chapters_for_new_plan(
+                ctx,
+                st,
+                (
+                    "Araştırma kaynakları düzeltildi."
+                    if research_rebuilt
+                    else "Plan V10.2 araştırma parmak iziyle yenilendi."
+                ),
+            )
+            save_state(ctx, st)
         if args.stage == "plan":
             st["status"] = "plan_ready"
             save_state(ctx, st)
@@ -1718,13 +2286,19 @@ def main() -> None:
 
             chapter_research_file = chapter_dir / "research.json"
             chapter_research = read_json(chapter_research_file)
-            if chapter_research is None:
+            if not research_is_usable(
+                chapter_research,
+                ctx.topic,
+            ):
                 chapter_research = research_topic(
                     session,
                     ctx.topic,
                     list(chapter.get("research_queries", [])),
                 )
-                write_json(chapter_research_file, chapter_research)
+                write_json(
+                    chapter_research_file,
+                    chapter_research,
+                )
 
             script_file = chapter_dir / "script.json"
             script = read_json(script_file)
@@ -1762,8 +2336,13 @@ def main() -> None:
             if args.stage == "assets":
                 continue
 
-            audio = synthesize_chapter(client, chapter_dir, script["narration"])
+            audio, used_tts_provider = synthesize_chapter(
+                client,
+                chapter_dir,
+                script["narration"],
+            )
             chapter_state["tts"] = "ready"
+            chapter_state["tts_provider"] = used_tts_provider
             chapter_state["audio_seconds"] = round(ffprobe_duration(audio), 2)
             save_state(ctx, st)
             if args.stage == "tts":
