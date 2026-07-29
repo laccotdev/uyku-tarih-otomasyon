@@ -1,4 +1,4 @@
-name: Uyku ve Tarih V10.5 - AI Visual Rollback Core
+name: Uyku ve Tarih V10.6 - No Text Natural Charon
 
 on:
   workflow_dispatch:
@@ -81,7 +81,7 @@ jobs:
         if: inputs.runner == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-liberation
+          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-liberation tesseract-ocr tesseract-ocr-eng tesseract-ocr-tur
 
       - name: Python kutuphanelerini kur
         run: |
