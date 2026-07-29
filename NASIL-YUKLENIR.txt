@@ -1,0 +1,71 @@
+UYKU VE TARİH V10.3 — CHARON ONLY CHECKPOINT
+
+KARAR
+
+- Tek anlatıcı: Charon
+- Piper: kaldırıldı
+- Diğer bütün sesler: kaldırıldı
+- Otomatik farklı ses fallback'i: kapalı
+- Bir videonun hiçbir bölümünde farklı ses kullanılamaz
+
+ÜCRETSİZ KOTA DAVRANIŞI
+
+Bir saatlik video için Charon sesi yaklaşık 520 kelimelik parçalara ayrılır.
+Her başarılı Charon parçası proje checkpointine kaydedilir.
+
+Kota dolarsa:
+- Workflow kontrollü biçimde durur.
+- Kırmızı teknik hata yerine DEVAM_ETME_RAPORU.txt oluşur.
+- Tamamlanan Charon sesleri silinmez.
+- Aynı project_slug ve bölümle yeniden çalıştırınca ilk eksik parçadan devam eder.
+- Baştan seslendirme yapılmaz.
+- Piper veya başka bir ses devreye girmez.
+
+YÜKLENECEK DOSYALAR
+
+1. src/v10_longform.py
+2. requirements-v10.txt
+3. .github/workflows/v10-longform.yml
+4. config/providers.example.json
+
+Dördünü mevcut dosyaların üzerine yükle.
+
+PİLOT ÇALIŞTIRMA
+
+topic:
+İstanbul'un fethi nasıl gerçekleşti?
+
+project_slug:
+istanbulun-fethi
+
+mode:
+pilot
+
+stage:
+all
+
+chapter:
+0
+
+runner:
+ubuntu-latest
+
+Artık tts_provider alanı yoktur. Sistem daima Charon kullanır.
+
+DOĞRU LOG
+
+UYKU VE TARİH V10.3 CHARON ONLY LONGFORM CORE 10.3.0
+TTS kilidi: yalnızca Charon; farklı ses ve fallback kapalı.
+TTS PROVIDER LOCK: yalnızca Gemini Charon kullanılacak.
+Charon TTS parçası: 1/...
+
+Kota dolarsa:
+
+CONTROLLED PAUSE: Charon ücretsiz günlük TTS kotası doldu.
+Tamamlanan Charon parçaları korundu...
+Sıradaki parça: ...
+
+Sonraki çalışmada:
+
+Charon checkpoint kullanıldı: 1/...
+Charon TTS parçası: 2/...
