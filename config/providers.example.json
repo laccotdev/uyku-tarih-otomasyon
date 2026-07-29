@@ -1,6 +1,10 @@
 {
   "text_provider": "gemini_free",
   "tts_provider": "gemini_charon",
+  "tts_voice": "Charon",
+  "tts_fallback": "disabled",
+  "charon_chunk_target_words": 520,
+  "quota_behavior": "checkpoint_and_resume",
   "visual_provider": "wikimedia_commons",
   "ai_image_fallback": "disabled",
   "youtube_upload": "disabled"
