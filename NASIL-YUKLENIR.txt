@@ -1,78 +1,56 @@
-UYKU VE TARİH V10.4 — SEMANTIC STORYBOARD + AUDIO
+UYKU VE TARİH V10.5 — AI VISUAL ROLLBACK CORE
 
-MEVCUT PİLOTTA TESPİT EDİLENLER
+NEDEN V10.4 ÇIKTI ÜRETMEDİ?
 
-- MP4 içinde AAC ses kanalı vardı.
-- Ortalama ses seviyesi yaklaşık -16 dB, tepe seviyesi yaklaşık -2 dB idi.
-- Bazı oynatıcılarda mono AAC/stream-copy nedeniyle ses problemi yaşanabiliyor.
-- Storyboard dosyası hiç üretilmemişti.
-- Commons eşleşme eşiği çok düşüktü; kertenkele ve konu dışı modern fotoğraflar
-  yüksek çözünürlük avantajıyla seçilebiliyordu.
-- Görsel bulunamayınca yerel bilgi kartı final videoya girebiliyordu.
+V10.4 bütün 12 sahne için Wikimedia Commons'ta birebir görsel zorunlu tuttu.
+İki özel olay için görsel bulunamadı:
+- Gemilerin karadan Haliç'e indirilmesi
+- Şahi toplarının surları dövmesi
 
-V10.4 DÜZELTMELERİ
+Bu yüzden video, storyboard ve ses hiç başlamadan durdu. Bu aşırı sert karar geri alındı.
 
-1. SEMANTİK WIKIMEDIA FİLTRESİ
-- Aday görselin hem bölüm beat'iyle hem de ana konuyla gerçek kelime örtüşmesi gerekir.
-- Yalnız yüksek çözünürlük puan kazandırmaz.
-- Kertenkele, sürüngen, hayvan, bitki, spor, otomobil, havaalanı ve benzeri
-  konu dışı kategoriler otomatik reddedilir.
-- Çıplak "topic" sorgusu kaldırıldı; beat'e özel sorgular kullanılır.
-- Minimum semantik eşleşme puanı 62.
-- Yerel bilgi kartı boşluk doldurmak için kullanılmaz.
-- Her beat için gerçek ve eşleşen görsel zorunludur.
+V10.5'TE GERİ DÖNEN YAPI
 
-2. STORYBOARD GERİ GELDİ
-Her bölüm için:
-deliverables/storyboard-chapter-01.jpg
-
-Tam video için:
-deliverables/storyboard-index.jpg
-
-Storyboard üzerinde:
-- sahne numarası
-- görsel sözleşmesi
-- semantik eşleşme puanı
-bulunur.
-
-3. SES UYUMLULUĞU
-- Bölüm ve final sesleri AAC-LC, 48 kHz, stereo, 192 kbps olarak paketlenir.
-- Final videoda ses stream'i zorunlu olarak doğrulanır.
-- Ortalama ve tepe ses seviyesi ölçülür.
-- Sessiz/çok düşük sesli final başarı sayılmaz.
-- 30 saniyelik ayrı Charon ses ön izlemesi üretilir:
-  deliverables/charon-audio-preview-30s.mp3
-- Teknik rapor:
-  deliverables/audio-quality-report.json
-
-4. ESKİ RAPOR TEMİZLİĞİ
-Başarılı final oluştuğunda eski DEVAM_ETME_RAPORU.txt otomatik silinir.
+- Görseller yeniden eski başarılı sistemdeki gibi Cloudflare AI ile üretilir.
+- Her prompt doğrudan narration_excerpt + visual_contract + must_show alanlarından gelir.
+- Ana özne, eylem ve mekân aynı karede görünmek zorundadır.
+- Wikimedia alakasız görselleri final videoda kullanılmaz.
+- Yerel bilgi kartları boşluk doldurmak için kullanılmaz.
+- Görseller soluklaştırılmaz; yalnız hafif kalite düzeltmesi uygulanır.
+- Her 3 görselde bir kısmi storyboard kaydedilir.
+- Kota dolarsa tamamlanan görseller ve storyboard korunur.
+- Aynı project_slug ile sonraki gün ilk eksik görselden devam eder.
+- Bütün görseller tamamlanmadan Charon kotası kullanılmaz.
+- Charon-only, ses checkpointi, stereo AAC ve ses doğrulaması korunur.
 
 YÜKLENECEK DOSYALAR
 
 1. src/v10_longform.py
 2. .github/workflows/v10-longform.yml
+3. config/providers.example.json
 
-Diğer dosyaları değiştirme.
+GITHUB SECRETS
 
-YENİ PİLOT İÇİN ÖNEMLİ
+Aşağıdaki üç secret bulunmalı:
+- GEMINI_API_KEY
+- CLOUDFLARE_ACCOUNT_ID
+- CLOUDFLARE_API_TOKEN
 
-Önceki kötü görseller checkpointte kayıtlı olduğu için farklı bir project_slug kullan:
+YENİ PİLOT
 
-topic:
-İstanbul'un fethi nasıl gerçekleşti?
+Önceki V10.4 cache'i kullanılmamalı.
 
-project_slug:
-istanbulun-fethi-v104
+topic: İstanbul'un fethi nasıl gerçekleşti?
+project_slug: istanbulun-fethi-v105
+mode: pilot
+stage: all
+chapter: 0
+runner: ubuntu-latest
 
-mode:
-pilot
+DOĞRU LOG
 
-stage:
-all
-
-chapter:
-0
-
-runner:
-ubuntu-latest
+UYKU VE TARİH V10.5 AI VISUAL ROLLBACK CORE 10.5.0
+AI VISUAL LOCK: Cloudflare kimlik bilgileri hazır
+AI VISUAL: bölüm=1, beat=1, model=@cf/black-forest-labs/flux-2-klein-4b
+STORYBOARD READY
+TTS PROVIDER LOCK: yalnızca Gemini Charon kullanılacak
