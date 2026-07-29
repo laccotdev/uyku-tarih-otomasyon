@@ -5,7 +5,11 @@
   "tts_fallback": "disabled",
   "charon_chunk_target_words": 520,
   "quota_behavior": "checkpoint_and_resume",
-  "visual_provider": "wikimedia_commons",
+  "visual_provider": "cloudflare_workers_ai",
   "ai_image_fallback": "disabled",
-  "youtube_upload": "disabled"
+  "youtube_upload": "disabled",
+  "visual_model": "@cf/black-forest-labs/flux-2-klein-4b",
+  "visual_fallback_model": "@cf/black-forest-labs/flux-1-schnell",
+  "visual_quota_behavior": "checkpoint_and_resume",
+  "wikimedia_final_visuals": false
 }
