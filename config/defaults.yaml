@@ -1,4 +1,4 @@
-version: 11.3.0
+version: 11.3.1
 project:
   data_root: ./data
   chapters: 6
@@ -69,6 +69,10 @@ images:
     '
   quality_mode: production_first
   hard_fail_on_quality: false
+  prompt_max_bytes: 1250
+  fallback_models:
+  - '@cf/bytedance/stable-diffusion-xl-lightning'
+  provider_mode: safe_profiles_with_fallback
 tts:
   chunk_words: 700
   maximum_chunks_per_run: 8
