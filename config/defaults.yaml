@@ -1,28 +1,28 @@
-version: 11.2.0
+version: 11.3.0
 project:
   data_root: ./data
   chapters: 6
   scenes_per_chapter: 18
-  narration_words_per_minute: 132
+  narration_words_per_minute: 118
   default_minutes: 60
   max_wall_minutes: 210
   maximum_cache_gb: 3.8
   duration_profiles:
     '5':
       chapters: 1
-      scenes_per_chapter: 10
+      scenes_per_chapter: 20
       script_parts: 2
     '10':
       chapters: 2
-      scenes_per_chapter: 10
+      scenes_per_chapter: 20
       script_parts: 2
     '30':
       chapters: 4
-      scenes_per_chapter: 15
+      scenes_per_chapter: 22
       script_parts: 3
     '60':
       chapters: 6
-      scenes_per_chapter: 18
+      scenes_per_chapter: 24
       script_parts: 4
 gemini:
   text_models:
@@ -37,7 +37,7 @@ research:
   - tr
   - en
   results_per_query: 5
-  minimum_sources: 4
+  minimum_sources: 2
 images:
   model: '@cf/black-forest-labs/flux-1-schnell'
   steps: 6
@@ -70,20 +70,24 @@ images:
   quality_mode: production_first
   hard_fail_on_quality: false
 tts:
-  chunk_words: 410
+  chunk_words: 700
   maximum_chunks_per_run: 8
-  target_wpm: 132
-  minimum_wpm: 105
-  maximum_wpm: 155
+  target_wpm: 116
+  minimum_wpm: 95
+  maximum_wpm: 138
   output_sample_rate: 48000
-  instruction: 'Yalnızca Charon sesiyle, tek ve değişmeyen olgun bir Türk tarih belgeseli
-    anlatıcısı olarak oku. Doğal, sakin, ölçülü ve güven veren bir tempoda ilerle.
-    Yaklaşık dakikada 125-140 kelime hedefle. İsimleri, tarihleri ve neden-sonuç cümlelerini
-    acele etmeden söyle. Tiyatro, fragman, reklam, haber spikeri veya aşırı uykulu
-    ton kullanma. Metne hiçbir kelime ekleme, hiçbir kelimeyi çıkarma ve başlık okuma.
-
-    '
+  instruction: Yalnızca Charon sesiyle oku. Tek ve değişmeyen, tok göğüs rezonanslı,
+    olgun bir Türk tarih belgeseli anlatıcısı ol. Ses rengi bariton, sakin, güven
+    veren ve otoriter olsun; bağırma veya teatralleşme. Yaklaşık dakikada 110-125
+    kelime ritminde ilerle. Özel isimleri, tarihleri, neden-sonuç cümlelerini ve dönüm
+    noktalarını acele etmeden söyle. Cümle sonlarında doğal kısa duraklar, paragraf
+    geçişlerinde belirgin fakat uzun olmayan nefesler kullan. Haber spikeri, reklam,
+    fragman, podcast sohbeti veya aşırı uykulu ton kullanma. Metne kelime ekleme,
+    kelime çıkarma, başlık okuma veya ses efekti üretme.
   tempo_mode: normalize_and_continue
+  minimum_tempo_factor: 0.92
+  maximum_tempo_factor: 1.06
+  chunk_crossfade_seconds: 0.08
 render:
   width: 1920
   height: 1080
@@ -91,7 +95,14 @@ render:
   crf: 22
   preset: veryfast
   audio_bitrate: 192k
-  subtle_zoom: 1.006
+  subtle_zoom: 1.012
+  transition_seconds: 0.58
+  transitions:
+  - dissolve
+  - fade
+  - smoothleft
+  - dissolve
+  - smoothright
 youtube:
   enabled: false
   privacy_status: private
