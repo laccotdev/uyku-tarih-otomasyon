@@ -24,7 +24,7 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "11.1.1"
+VERSION = "11.1.2"
 
 
 class ControlledPause(RuntimeError):
@@ -489,6 +489,149 @@ def source_context(research: dict[str, Any], limit: int = 18000) -> str:
     return "\n\n".join(text)[:limit]
 
 
+def duration_profile(minutes: int, config: dict[str, Any]) -> dict[str, Any]:
+    profiles = config.get("project", {}).get("duration_profiles", {})
+    selected = profiles.get(str(minutes))
+    if not isinstance(selected, dict):
+        if minutes <= 5:
+            selected = {"chapters": 1, "scenes_per_chapter": 10, "script_parts": 2}
+        elif minutes <= 10:
+            selected = {"chapters": 2, "scenes_per_chapter": 10, "script_parts": 2}
+        elif minutes <= 30:
+            selected = {"chapters": 4, "scenes_per_chapter": 15, "script_parts": 3}
+        else:
+            selected = {"chapters": 6, "scenes_per_chapter": 18, "script_parts": 4}
+
+    wpm = int(config["project"]["narration_words_per_minute"])
+    chapters = max(1, int(selected["chapters"]))
+    scenes = max(4, int(selected["scenes_per_chapter"]))
+    parts = max(1, int(selected["script_parts"]))
+    total_words = max(300, round(minutes * wpm))
+    chapter_words = max(220, round(total_words / chapters))
+    part_words = max(110, round(chapter_words / parts))
+    minimum_part_words = max(85, round(part_words * 0.58))
+    maximum_part_words = max(minimum_part_words + 30, round(part_words * 1.28))
+    return {
+        "minutes": int(minutes),
+        "chapters": chapters,
+        "scenes_per_chapter": scenes,
+        "script_parts": parts,
+        "target_total_words": total_words,
+        "target_chapter_words": chapter_words,
+        "target_part_words": part_words,
+        "minimum_part_words": minimum_part_words,
+        "maximum_part_words": maximum_part_words,
+        "profile_version": VERSION,
+    }
+
+
+def profile_matches(value: Any, expected: dict[str, Any]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    keys = (
+        "minutes", "chapters", "scenes_per_chapter", "script_parts",
+        "target_total_words", "target_chapter_words",
+    )
+    return all(value.get(key) == expected.get(key) for key in keys)
+
+
+def reset_stale_story_structure(root: Path, state: dict[str, Any], reason: str) -> None:
+    (root / "story_bible.json").unlink(missing_ok=True)
+    shutil.rmtree(root / "chapters", ignore_errors=True)
+    state["chapters"] = {}
+    state["structure_reset"] = {
+        "version": VERSION,
+        "reason": reason,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    log(f"ADAPTIVE PROFILE RESET: {reason}")
+
+
+def trim_to_sentence_word_limit(value: str, maximum_words: int) -> str:
+    value = " ".join(str(value).split())
+    if word_count(value) <= maximum_words:
+        return value
+    sentences = split_sentences(value)
+    kept: list[str] = []
+    for sentence in sentences:
+        candidate = " ".join([*kept, sentence])
+        if kept and word_count(candidate) > maximum_words:
+            break
+        kept.append(sentence)
+        if word_count(" ".join(kept)) >= maximum_words:
+            break
+    trimmed = " ".join(kept).strip()
+    return trimmed or " ".join(value.split()[:maximum_words]).strip()
+
+
+def generate_script_part_resilient(
+    topic: str,
+    bible: dict[str, Any],
+    research: dict[str, Any],
+    chapter: dict[str, Any],
+    previous_summary: str,
+    existing_parts: list[str],
+    part_index: int,
+    part_count: int,
+    target_words: int,
+    minimum_words: int,
+    maximum_words: int,
+    gemini: Gemini,
+) -> tuple[str, list[str]]:
+    accumulated = ""
+    models: list[str] = []
+    tail = " ".join(" ".join(existing_parts).split()[-150:])
+
+    for attempt in range(1, 4):
+        if attempt == 1:
+            task = (
+                f"Bu bölümün {part_index}/{part_count}. parçasını "
+                f"{minimum_words}-{maximum_words} Türkçe kelime arasında yaz."
+            )
+            continuation_context = ""
+        else:
+            task = (
+                "Aşağıdaki kısa taslağı tekrar etmeden doğrudan devam ettir ve "
+                f"toplam uzunluğu en az {minimum_words}, tercihen {target_words} "
+                "kelimeye tamamla. Yalnız eklenecek devam metnini yaz."
+            )
+            continuation_context = f"KISA TASLAK:\n{accumulated}\n"
+
+        payload, model = gemini.json(SYSTEM, f'''KONU: {topic}
+HİKÂYE ANAYASASI: {bible}
+BÖLÜM: {chapter}
+ÖNCEKİ BÖLÜM ÖZETİ: {previous_summary}
+ÖNCEKİ PARÇALARIN SONU: {tail}
+{continuation_context}
+KAYNAKLAR:\n{source_context(research, 13000)}
+
+GÖREV: {task}
+Geçerli JSON: {{"text":"yalnız anlatıcının okuyacağı akıcı metin"}}
+Kurallar:
+- Yeni giriş yapma; önceki akıştan devam et.
+- Somut kişi, karar, olay, nesne ve mekân anlat.
+- Kamera komutu, başlık, madde işareti ve kaynak numarası yazma.
+- Aynı cümleyi veya olayı tekrar etme.
+- Nihai parça değilse bölümü erkenden bitirme.''', 0.26)
+        piece = " ".join(str(payload.get("text", "")).split())
+        models.append(model)
+        if piece and not (accumulated and piece in accumulated):
+            accumulated = " ".join(item for item in (accumulated, piece) if item).strip()
+        current_words = word_count(accumulated)
+        log(
+            f"Senaryo parçası kalite kontrolü: bölüm={chapter['index']} "
+            f"parça={part_index}/{part_count} deneme={attempt}/3 "
+            f"kelime={current_words} minimum={minimum_words}"
+        )
+        if current_words >= minimum_words:
+            return trim_to_sentence_word_limit(accumulated, maximum_words), models
+
+    raise QualityGateError(
+        f"Bölüm {chapter['index']} parça {part_index} üç denemede kısa kaldı: "
+        f"{word_count(accumulated)}/{minimum_words} kelime."
+    )
+
+
 def create_story_bible(topic: str, minutes: int, count: int, research: dict[str, Any], gemini: Gemini) -> dict[str, Any]:
     payload, model = gemini.json(SYSTEM, f'''KONU: {topic}
 HEDEF: {minutes} dakika, {count} bölüm
@@ -516,50 +659,98 @@ def chapter_dir(root: Path, index: int) -> Path:
     return path
 
 
-def build_script_checkpoint(root: Path, topic: str, bible: dict[str, Any], research: dict[str, Any], chapter: dict[str, Any], previous_summary: str, target_words: int, gemini: Gemini) -> bool:
+def build_script_checkpoint(
+    root: Path,
+    topic: str,
+    bible: dict[str, Any],
+    research: dict[str, Any],
+    chapter: dict[str, Any],
+    previous_summary: str,
+    target_words: int,
+    part_count: int,
+    profile: dict[str, Any],
+    gemini: Gemini,
+) -> bool:
     directory = chapter_dir(root, int(chapter["index"]))
     final = directory / "script.json"
-    if final.exists():
+    existing_final = read_json(final)
+    if (
+        isinstance(existing_final, dict)
+        and profile_matches(existing_final.get("generation_profile"), profile)
+        and word_count(existing_final.get("narration", "")) >= int(target_words * 0.72)
+    ):
         return True
+    if final.exists():
+        final.unlink(missing_ok=True)
+
     parts_dir = directory / "script_parts"
     parts_dir.mkdir(exist_ok=True)
-    parts = []
-    for i in range(1, 5):
-        saved = read_json(parts_dir / f"{i:02d}.json")
-        if saved:
-            parts.append(saved["text"])
+    parts: list[str] = []
+    for index in range(1, part_count + 1):
+        saved = read_json(parts_dir / f"{index:02d}.json")
+        if (
+            isinstance(saved, dict)
+            and profile_matches(saved.get("generation_profile"), profile)
+            and str(saved.get("text", "")).strip()
+        ):
+            parts.append(str(saved["text"]))
         else:
+            for stale_index in range(index, 9):
+                (parts_dir / f"{stale_index:02d}.json").unlink(missing_ok=True)
             break
-    if len(parts) < 4:
+
+    if len(parts) < part_count:
         part_index = len(parts) + 1
-        target = max(240, round(target_words / 4))
-        tail = " ".join(" ".join(parts).split()[-130:])
-        payload, model = gemini.json(SYSTEM, f'''KONU: {topic}
-HİKÂYE ANAYASASI: {bible}
-BÖLÜM: {chapter}
-ÖNCEKİ BÖLÜM ÖZETİ: {previous_summary}
-YAZILAN SON KISIM: {tail}
-KAYNAKLAR:\n{source_context(research, 13000)}
-Bu bölümün {part_index}/4. parçasını yaklaşık {target} Türkçe kelime yaz.
-Geçerli JSON: {{"text":"yalnız anlatıcının okuyacağı akıcı metin"}}
-Yeni giriş yapma, somut olay anlat, kamera komutu ve başlık yazma.''', 0.28)
-        text = " ".join(str(payload.get("text", "")).split())
-        if word_count(text) < 165:
-            raise QualityGateError(f"Bölüm {chapter['index']} parça {part_index} kısa.")
+        generated, models = generate_script_part_resilient(
+            topic,
+            bible,
+            research,
+            chapter,
+            previous_summary,
+            parts,
+            part_index,
+            part_count,
+            int(profile["target_part_words"]),
+            int(profile["minimum_part_words"]),
+            int(profile["maximum_part_words"]),
+            gemini,
+        )
         write_json(parts_dir / f"{part_index:02d}.json", {
-            "part": part_index, "text": text, "words": word_count(text), "model": model,
+            "part": part_index,
+            "part_count": part_count,
+            "text": generated,
+            "words": word_count(generated),
+            "models": models,
+            "generation_profile": profile,
         })
-        log(f"Senaryo checkpoint: bölüm={chapter['index']} parça={part_index}/4")
+        log(
+            f"Senaryo checkpoint: bölüm={chapter['index']} "
+            f"parça={part_index}/{part_count} kelime={word_count(generated)}"
+        )
         return False
+
     narration = " ".join(parts)
-    if word_count(narration) < int(target_words * 0.75):
-        raise QualityGateError("Bölüm metni hedefin çok altında.")
-    summary, model = gemini.json(SYSTEM, f'''Aşağıdaki bölümün 120-170 kelimelik
+    minimum_chapter = max(180, int(target_words * 0.72))
+    if word_count(narration) < minimum_chapter:
+        raise QualityGateError(
+            f"Bölüm metni hedefin altında: "
+            f"{word_count(narration)}/{minimum_chapter} kelime."
+        )
+    narration = trim_to_sentence_word_limit(
+        narration,
+        max(minimum_chapter, round(target_words * 1.10)),
+    )
+    summary, model = gemini.json(SYSTEM, f'''Aşağıdaki bölümün 90-150 kelimelik
 sonraki bölüm tutarlılık özetini JSON ver: {{"summary":"..."}}\n{narration}''', 0.05)
     write_json(final, {
-        "chapter_index": chapter["index"], "chapter_title": chapter["title"],
-        "narration": narration, "word_count": word_count(narration),
-        "summary": summary["summary"], "summary_model": model,
+        "chapter_index": chapter["index"],
+        "chapter_title": chapter["title"],
+        "narration": narration,
+        "word_count": word_count(narration),
+        "target_words": target_words,
+        "summary": summary["summary"],
+        "summary_model": model,
+        "generation_profile": profile,
     })
     return True
 
@@ -1004,8 +1195,18 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
     state.update({"version": VERSION, "project_id": pid, "topic": topic, "minutes": minutes, "status": "running"})
     write_json(state_file, state)
     gemini = Gemini(config["gemini"])
-    chapters = int(config["project"]["chapters"])
-    scenes_per_chapter = int(config["project"]["scenes_per_chapter"])
+    profile = duration_profile(minutes, config)
+    chapters = int(profile["chapters"])
+    scenes_per_chapter = int(profile["scenes_per_chapter"])
+    script_parts = int(profile["script_parts"])
+    state["generation_profile"] = profile
+    write_json(state_file, state)
+    log(
+        "ADAPTIVE DURATION PROFILE: "
+        f"minutes={minutes}, chapters={chapters}, "
+        f"scenes/chapter={scenes_per_chapter}, script_parts={script_parts}, "
+        f"target_words={profile['target_total_words']}"
+    )
     try:
         research_file = root / "research.json"
         research = read_json(research_file)
@@ -1014,11 +1215,22 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
             write_json(research_file, research); state["research"] = "ready"; write_json(state_file, state)
         bible_file = root / "story_bible.json"
         bible = read_json(bible_file)
+        if bible and not profile_matches(bible.get("generation_profile"), profile):
+            reset_stale_story_structure(
+                root,
+                state,
+                "Önceki sabit 6-bölüm yapısı istenen video süresiyle uyumsuzdu.",
+            )
+            write_json(state_file, state)
+            bible = None
         if not bible:
             bible = create_story_bible(topic, minutes, chapters, research, gemini)
-            write_json(bible_file, bible); state["story_bible"] = "ready"; write_json(state_file, state)
-        target_total = round(minutes * int(config["project"]["narration_words_per_minute"]))
-        target_chapter = round(target_total / chapters)
+            bible["generation_profile"] = profile
+            write_json(bible_file, bible)
+            state["story_bible"] = "ready"
+            write_json(state_file, state)
+        target_total = int(profile["target_total_words"])
+        target_chapter = int(profile["target_chapter_words"])
         image_budget_remaining = int(config["images"]["maximum_images_per_run"])
         tts_budget_remaining = int(config["tts"]["maximum_chunks_per_run"])
         while time.monotonic() - started < max_minutes * 60:
@@ -1030,7 +1242,7 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
                 script_file = chapter_dir(root, index) / "script.json"
                 script = read_json(script_file)
                 if not script:
-                    finished = build_script_checkpoint(root, topic, bible, research, chapter, previous_summary, target_chapter, gemini)
+                    finished = build_script_checkpoint(root, topic, bible, research, chapter, previous_summary, target_chapter, script_parts, profile, gemini)
                     progress = True
                     if finished:
                         script = read_json(script_file); cstate["script"] = "ready"; write_json(state_file, state)
