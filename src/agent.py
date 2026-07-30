@@ -24,7 +24,7 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "11.1.3"
+VERSION = "11.1.4"
 
 
 class ControlledPause(RuntimeError):
@@ -127,13 +127,59 @@ class Gemini:
 
     @staticmethod
     def parse_json(raw: str) -> dict[str, Any]:
-        clean = str(raw).strip()
-        clean = re.sub(r"^```(?:json)?\s*", "", clean)
+        """Parse one usable JSON object even with trailing model output."""
+        clean = str(raw).replace("\ufeff", "").strip()
+        clean = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            clean,
+            flags=re.IGNORECASE,
+        )
         clean = re.sub(r"\s*```$", "", clean)
-        start, end = clean.find("{"), clean.rfind("}")
-        if start < 0 or end < start:
-            raise ValueError("JSON nesnesi bulunamadı.")
-        return json.loads(clean[start:end + 1])
+        if not clean:
+            raise ValueError("Boş JSON yanıtı.")
+
+        try:
+            value = json.loads(clean)
+            if not isinstance(value, dict):
+                raise ValueError("JSON kökü nesne olmalı.")
+            return value
+        except json.JSONDecodeError as strict_error:
+            decoder = json.JSONDecoder()
+            recovered: list[tuple[int, int, dict[str, Any]]] = []
+            for start, char in enumerate(clean):
+                if char != "{":
+                    continue
+                try:
+                    value, consumed = decoder.raw_decode(clean[start:])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    recovered.append((start, consumed, value))
+
+            if recovered:
+                first_start = min(item[0] for item in recovered)
+                choices = [
+                    item for item in recovered if item[0] == first_start
+                ]
+                _, consumed, value = max(
+                    choices,
+                    key=lambda item: item[1],
+                )
+                trailing = clean[first_start + consumed:].strip()
+                log(
+                    "JSON RECOVERY: geçerli ilk nesne kurtarıldı; "
+                    f"sonraki_fazla_karakter={len(trailing)}"
+                )
+                return value
+
+            repaired = re.sub(r",\s*([}\]])", r"\1", clean)
+            if repaired != clean:
+                value = json.loads(repaired)
+                if isinstance(value, dict):
+                    log("JSON RECOVERY: sondaki virgüller temizlendi.")
+                    return value
+            raise strict_error
 
     def json(self, system: str, prompt: str, temperature: float = 0.25) -> tuple[dict[str, Any], str]:
         last_error: Exception | None = None
@@ -141,9 +187,16 @@ class Gemini:
             for attempt in range(1, self.retries + 1):
                 try:
                     log(f"Gemini JSON: {model}, deneme={attempt}/{self.retries}")
+                    strict_suffix = (
+                        ""
+                        if attempt == 1
+                        else "\n\nÇIKTI KURALI: Yalnızca tek bir geçerli JSON "
+                        "nesnesi döndür. İkinci JSON nesnesi, açıklama, "
+                        "markdown ve kod bloğu ekleme."
+                    )
                     response = self.client.models.generate_content(
                         model=model,
-                        contents=f"{system}\n\n{prompt}",
+                        contents=f"{system}\n\n{prompt}{strict_suffix}",
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
                             temperature=temperature,
@@ -958,28 +1011,250 @@ def scene_chunks(text: str, count: int) -> list[str]:
     return chunks
 
 
-def create_scene_plan(root: Path, topic: str, bible: dict[str, Any], chapter: dict[str, Any], script: dict[str, Any], count: int, gemini: Gemini) -> list[dict[str, Any]]:
+def fallback_scene(
+    topic: str,
+    chapter: dict[str, Any],
+    narration: str,
+    scene_id: int,
+    *,
+    reason: str = "",
+) -> dict[str, Any]:
+    compact = " ".join(str(narration).split())
+    contract = compact[:420]
+    return {
+        "scene_id": scene_id,
+        "visual_contract_tr": contract,
+        "prompt_en": (
+            "Premium photorealistic historical documentary reconstruction. "
+            f"Main topic: {topic}. Chapter: {chapter.get('title', '')}. "
+            "Depict the exact concrete historical event described here: "
+            f"{compact[:900]}. Show the central historical person or group, "
+            "their action, and the period location together in one coherent "
+            "widescreen frame. Historically plausible clothing, architecture "
+            "and objects; no generic scenery."
+        ),
+        "must_show": [
+            str(topic),
+            str(chapter.get("title", "")),
+            contract[:180],
+        ],
+        "must_not_show": [
+            "visible text",
+            "letters",
+            "numbers",
+            "subtitle",
+            "logo",
+            "watermark",
+            "modern objects",
+            "generic unrelated scenery",
+        ],
+        "importance": "key" if scene_id in {1, 2} else "normal",
+        "planning_fallback": True,
+        "fallback_reason": reason[:500],
+    }
+
+
+def normalize_scene(
+    raw_scene: Any,
+    topic: str,
+    chapter: dict[str, Any],
+    narration: str,
+    scene_id: int,
+    model: str,
+) -> dict[str, Any]:
+    if not isinstance(raw_scene, dict):
+        scene = fallback_scene(
+            topic,
+            chapter,
+            narration,
+            scene_id,
+            reason="Gemini sahnesi JSON nesnesi değildi.",
+        )
+    else:
+        scene = dict(raw_scene)
+        contract = " ".join(
+            str(scene.get("visual_contract_tr", "")).split()
+        )
+        prompt_en = " ".join(
+            str(scene.get("prompt_en", "")).split()
+        )
+        if len(contract) < 18 or len(prompt_en) < 35:
+            fallback = fallback_scene(
+                topic,
+                chapter,
+                narration,
+                scene_id,
+                reason="Gemini sahnesinde zorunlu alanlar eksikti.",
+            )
+            for key, value in fallback.items():
+                if not scene.get(key):
+                    scene[key] = value
+
+    scene["scene_id"] = scene_id
+    scene["narration"] = narration
+    scene["model"] = model
+    scene["must_show"] = [
+        str(item)
+        for item in scene.get("must_show", [])
+        if str(item).strip()
+    ][:8]
+    scene["must_not_show"] = [
+        str(item)
+        for item in scene.get("must_not_show", [])
+        if str(item).strip()
+    ][:10]
+    if not scene["must_not_show"]:
+        scene["must_not_show"] = [
+            "visible text",
+            "subtitle",
+            "logo",
+            "modern objects",
+        ]
+    if scene.get("importance") not in {"normal", "key"}:
+        scene["importance"] = "normal"
+    return scene
+
+
+def create_scene_plan(
+    root: Path,
+    topic: str,
+    bible: dict[str, Any],
+    chapter: dict[str, Any],
+    script: dict[str, Any],
+    count: int,
+    gemini: Gemini,
+) -> list[dict[str, Any]]:
     target = chapter_dir(root, int(chapter["index"])) / "scenes.json"
     existing = read_json(target)
     if isinstance(existing, list) and len(existing) == count:
         return existing
+
     chunks = scene_chunks(script["narration"], count)
     if len(chunks) != count:
-        raise QualityGateError(f"Metin {count} sahneye ayrılamadı: {len(chunks)}")
-    payload, model = gemini.json("Sen profesyonel tarih belgeseli görsel yönetmenisin.", f'''KONU: {topic}
-GÖRSEL KİMLİK: {bible['visual_identity']}
+        raise QualityGateError(
+            f"Metin {count} sahneye ayrılamadı: {len(chunks)}"
+        )
+
+    batch_size = max(3, math.ceil(count / 2))
+    scenes: list[dict[str, Any]] = []
+    for batch_start in range(0, count, batch_size):
+        batch_chunks = chunks[batch_start:batch_start + batch_size]
+        batch_rows = [
+            {
+                "scene_id": batch_start + offset + 1,
+                "narration": narration,
+            }
+            for offset, narration in enumerate(batch_chunks)
+        ]
+        expected_ids = [row["scene_id"] for row in batch_rows]
+        prompt = f'''KONU: {topic}
+GÖRSEL KİMLİK: {bible.get('visual_identity', '')}
 BÖLÜM: {chapter}
-ANLATIM PARÇALARI: {[{"scene_id": i+1, "narration": t} for i, t in enumerate(chunks)]}
-Geçerli JSON:
-{{"scenes":[{{"scene_id":1,"visual_contract_tr":"kişi+eylem+mekân","prompt_en":"professional English image prompt","must_show":["öğe"],"must_not_show":["öğe"],"importance":"normal|key"}}]}}
-Tam {count} sahne üret. Anlatıcı ne diyorsa o olay görünsün. Genel manzara,
-yazı, tabela, altyazı, logo ve sahte alfabe isteme.''', 0.15)
-    scenes = payload.get("scenes", [])
+BU PARTİDEKİ ANLATIM PARÇALARI: {batch_rows}
+
+Yalnızca tek geçerli JSON nesnesi üret:
+{{"scenes":[{{"scene_id":1,"visual_contract_tr":"kişi+eylem+mekân","prompt_en":"professional English image prompt","must_show":["somut öğe"],"must_not_show":["dönem dışı öğe"],"importance":"normal"}}]}}
+
+Kurallar:
+- Yalnız şu scene_id değerlerini üret: {expected_ids}
+- Tam {len(batch_chunks)} sahne üret.
+- Anlatıcı ne diyorsa aynı kişi, eylem ve mekân karede doğrudan görünsün.
+- Genel manzara, rastgele kalabalık ve sembolik nesneyle kaçma.
+- Görsel içinde yazı, sayı, tabela, altyazı, logo, yazıt ve sahte alfabe olmasın.
+- prompt_en tek bir sinematik tarihsel anı açıkça tarif etsin.
+- İkinci JSON nesnesi veya açıklama ekleme.'''
+
+        model = "deterministic-scene-fallback"
+        raw_scenes: list[Any] = []
+        failure_reason = ""
+        try:
+            payload, model = gemini.json(
+                "Sen profesyonel tarih belgeseli görsel yönetmenisin.",
+                prompt,
+                0.12,
+            )
+            value = payload.get("scenes", [])
+            if isinstance(value, list):
+                raw_scenes = value
+            else:
+                failure_reason = (
+                    "Gemini scenes alanını liste döndürmedi."
+                )
+        except ControlledPause as exc:
+            failure_reason = f"Gemini kota duraklaması: {exc}"
+            log(
+                "SCENE PLAN FAIL-SOFT: Gemini kotası nedeniyle "
+                "anlatım-temelli sahne sözleşmesi kullanılacak."
+            )
+        except Exception as exc:
+            failure_reason = f"{type(exc).__name__}: {exc}"
+            log(
+                "SCENE PLAN FAIL-SOFT: bozuk JSON nedeniyle video "
+                f"üretimi durdurulmadı: {failure_reason}"
+            )
+
+        by_id: dict[int, Any] = {}
+        for raw_scene in raw_scenes:
+            if not isinstance(raw_scene, dict):
+                continue
+            try:
+                raw_id = int(raw_scene.get("scene_id"))
+            except (TypeError, ValueError):
+                continue
+            if raw_id in expected_ids and raw_id not in by_id:
+                by_id[raw_id] = raw_scene
+
+        for offset, narration in enumerate(batch_chunks):
+            scene_id = batch_start + offset + 1
+            raw_scene = by_id.get(scene_id)
+            if raw_scene is None and offset < len(raw_scenes):
+                raw_scene = raw_scenes[offset]
+            if raw_scene is None:
+                raw_scene = fallback_scene(
+                    topic,
+                    chapter,
+                    narration,
+                    scene_id,
+                    reason=(
+                        failure_reason
+                        or "Gemini eksik sahne döndürdü."
+                    ),
+                )
+            scenes.append(
+                normalize_scene(
+                    raw_scene,
+                    topic,
+                    chapter,
+                    narration,
+                    scene_id,
+                    model,
+                )
+            )
+
+        write_json(
+            target.with_name("scenes.partial.json"),
+            scenes,
+        )
+        log(
+            f"Sahne planı checkpoint: {len(scenes)}/{count} "
+            f"(parti={batch_start // batch_size + 1})"
+        )
+
     if len(scenes) != count:
-        raise QualityGateError(f"Görsel plan sayısı hatalı: {len(scenes)}/{count}")
-    for i, (scene, narration) in enumerate(zip(scenes, chunks), 1):
-        scene["scene_id"] = i; scene["narration"] = narration; scene["model"] = model
+        raise QualityGateError(
+            f"Görsel plan iç hata: {len(scenes)}/{count}"
+        )
     write_json(target, scenes)
+    target.with_name("scenes.partial.json").unlink(missing_ok=True)
+    fallback_count = sum(
+        1
+        for scene in scenes
+        if scene.get("planning_fallback")
+    )
+    log(
+        f"Sahne planı hazır: {len(scenes)} sahne, "
+        f"fail_soft={fallback_count}"
+    )
     return scenes
 
 
