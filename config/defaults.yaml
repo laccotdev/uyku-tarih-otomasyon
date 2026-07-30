@@ -1,4 +1,4 @@
-version: 11.1.1
+version: 11.1.2
 project:
   data_root: ./data
   chapters: 6
@@ -7,6 +7,23 @@ project:
   default_minutes: 60
   max_wall_minutes: 210
   maximum_cache_gb: 3.8
+  duration_profiles:
+    '5':
+      chapters: 1
+      scenes_per_chapter: 10
+      script_parts: 2
+    '10':
+      chapters: 2
+      scenes_per_chapter: 10
+      script_parts: 2
+    '30':
+      chapters: 4
+      scenes_per_chapter: 15
+      script_parts: 3
+    '60':
+      chapters: 6
+      scenes_per_chapter: 18
+      script_parts: 4
 gemini:
   text_models:
   - gemini-3.5-flash-lite
