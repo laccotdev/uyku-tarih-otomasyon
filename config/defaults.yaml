@@ -1,4 +1,4 @@
-version: 11.1.5
+version: 11.2.0
 project:
   data_root: ./data
   chapters: 6
@@ -67,6 +67,8 @@ images:
     blurry, washed out, deformed hands, extra fingers, duplicate people.
 
     '
+  quality_mode: production_first
+  hard_fail_on_quality: false
 tts:
   chunk_words: 410
   maximum_chunks_per_run: 8
@@ -81,6 +83,7 @@ tts:
     ton kullanma. Metne hiçbir kelime ekleme, hiçbir kelimeyi çıkarma ve başlık okuma.
 
     '
+  tempo_mode: normalize_and_continue
 render:
   width: 1920
   height: 1080
