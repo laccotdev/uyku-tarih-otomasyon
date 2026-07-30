@@ -1,4 +1,4 @@
-version: 11.3.1
+version: 11.4.0
 project:
   data_root: ./data
   chapters: 6
@@ -73,10 +73,11 @@ images:
   fallback_models:
   - '@cf/bytedance/stable-diffusion-xl-lightning'
   provider_mode: safe_profiles_with_fallback
+  strict_story_mode: true
 tts:
-  chunk_words: 700
-  maximum_chunks_per_run: 8
-  target_wpm: 116
+  chunk_words: 5000
+  maximum_chunks_per_run: 2
+  target_wpm: 108
   minimum_wpm: 95
   maximum_wpm: 138
   output_sample_rate: 48000
@@ -89,9 +90,10 @@ tts:
     fragman, podcast sohbeti veya aşırı uykulu ton kullanma. Metne kelime ekleme,
     kelime çıkarma, başlık okuma veya ses efekti üretme.
   tempo_mode: normalize_and_continue
-  minimum_tempo_factor: 0.92
-  maximum_tempo_factor: 1.06
+  minimum_tempo_factor: 0.97
+  maximum_tempo_factor: 1.03
   chunk_crossfade_seconds: 0.08
+  single_voice_track: true
 render:
   width: 1920
   height: 1080
