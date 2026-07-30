@@ -24,7 +24,7 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "11.1.5"
+VERSION = "11.2.0"
 
 
 class ControlledPause(RuntimeError):
@@ -845,8 +845,64 @@ Geçerli JSON:
  "chapters":[{{"index":1,"title":"ad","objective":"görev","must_cover":["olay"],"opening_bridge":"bağ","closing_bridge":"bağ"}}]
 }}
 Tam {count} bölüm üret; tekrar yapma.''', 0.18)
-    if len(payload.get("chapters", [])) != count:
-        raise QualityGateError("Hikâye anayasası bölüm sayısı hatalı.")
+
+    raw_chapters = payload.get("chapters", [])
+    chapters = [
+        dict(item)
+        for item in raw_chapters
+        if isinstance(item, dict)
+    ][:count]
+    timeline = [
+        str(item).strip()
+        for item in payload.get("timeline", [])
+        if str(item).strip()
+    ]
+
+    while len(chapters) < count:
+        index = len(chapters) + 1
+        timeline_item = (
+            timeline[index - 1]
+            if index - 1 < len(timeline)
+            else f"{topic} anlatısının {index}. aşaması"
+        )
+        chapters.append({
+            "index": index,
+            "title": timeline_item[:90],
+            "objective": (
+                f"{timeline_item} aşamasını neden-sonuç ilişkisiyle anlatmak"
+            ),
+            "must_cover": [timeline_item],
+            "opening_bridge": "Önceki bölümün sonucundan devam eder.",
+            "closing_bridge": "Sonraki tarihsel aşamaya bağlanır.",
+            "planning_fallback": True,
+        })
+
+    for index, chapter in enumerate(chapters, start=1):
+        chapter["index"] = index
+        chapter.setdefault("title", f"Bölüm {index}")
+        chapter.setdefault(
+            "objective",
+            f"{topic} anlatısının {index}. aşamasını açıklamak",
+        )
+        chapter.setdefault("must_cover", [])
+        chapter.setdefault("opening_bridge", "")
+        chapter.setdefault("closing_bridge", "")
+
+    if len(raw_chapters) != count:
+        log(
+            "FAIL-SOFT STORY BIBLE: Gemini bölüm sayısı "
+            f"{len(raw_chapters)}/{count}; yapı otomatik normalleştirildi."
+        )
+
+    payload["chapters"] = chapters
+    payload.setdefault("title", topic)
+    payload.setdefault("central_question", f"{topic} nasıl gelişti?")
+    payload.setdefault("timeline", timeline)
+    payload.setdefault("continuity_rules", [])
+    payload.setdefault(
+        "visual_identity",
+        "Tutarlı, gerçekçi ve dönemsel tarih belgeseli estetiği.",
+    )
     payload["model"] = model
     return payload
 
@@ -1001,13 +1057,33 @@ def scene_chunks(text: str, count: int) -> list[str]:
         chunks.append(" ".join(current))
     while len(chunks) > count:
         chunks[-2] += " " + chunks[-1]; chunks.pop()
-    while len(chunks) < count:
+    while len(chunks) < count and chunks:
         longest = max(range(len(chunks)), key=lambda i: word_count(chunks[i]))
         parts = split_sentences(chunks[longest])
         if len(parts) < 2:
             break
         midpoint = len(parts) // 2
-        chunks[longest:longest + 1] = [" ".join(parts[:midpoint]), " ".join(parts[midpoint:])]
+        chunks[longest:longest + 1] = [
+            " ".join(parts[:midpoint]),
+            " ".join(parts[midpoint:]),
+        ]
+
+    if len(chunks) != count:
+        words = " ".join(str(text).split()).split()
+        if not words:
+            words = ["Anlatım"]
+        chunks = []
+        for index in range(count):
+            start = round(index * len(words) / count)
+            end = round((index + 1) * len(words) / count)
+            piece = " ".join(words[start:end]).strip()
+            if not piece:
+                piece = words[min(start, len(words) - 1)]
+            chunks.append(piece)
+        log(
+            f"FAIL-SOFT SCENE SPLIT: metin kelime ağırlığıyla "
+            f"tam {count} sahneye ayrıldı."
+        )
     return chunks
 
 
@@ -1130,10 +1206,6 @@ def create_scene_plan(
         return existing
 
     chunks = scene_chunks(script["narration"], count)
-    if len(chunks) != count:
-        raise QualityGateError(
-            f"Metin {count} sahneye ayrılamadı: {len(chunks)}"
-        )
 
     batch_size = max(3, math.ceil(count / 2))
     scenes: list[dict[str, Any]] = []
@@ -1241,8 +1313,29 @@ Kurallar:
         )
 
     if len(scenes) != count:
-        raise QualityGateError(
-            f"Görsel plan iç hata: {len(scenes)}/{count}"
+        existing_ids = {
+            int(scene.get("scene_id", 0))
+            for scene in scenes
+            if isinstance(scene, dict)
+        }
+        for scene_id, narration in enumerate(chunks, start=1):
+            if scene_id not in existing_ids:
+                scenes.append(
+                    fallback_scene(
+                        topic,
+                        chapter,
+                        narration,
+                        scene_id,
+                        reason="Eksik sahne otomatik tamamlandı.",
+                    )
+                )
+        scenes = sorted(
+            scenes,
+            key=lambda scene: int(scene.get("scene_id", 0)),
+        )[:count]
+        log(
+            f"FAIL-SOFT SCENE PLAN: sahne planı "
+            f"{len(scenes)}/{count} olarak otomatik tamamlandı."
         )
     write_json(target, scenes)
     target.with_name("scenes.partial.json").unlink(missing_ok=True)
@@ -1428,10 +1521,11 @@ def clip_score(path: Path, text: str) -> float:
                 f"{attempt_index}/2 — {type(exc).__name__}: {exc}"
             )
 
-    raise QualityGateError(
-        "CLIP kalite kontrolü iki güvenli denemede tamamlanamadı: "
-        f"{last_error}"
+    log(
+        "CLIP FAIL-SOFT: kalite skoru hesaplanamadı; "
+        f"görsel üretimi durdurulmadı. Son hata: {last_error}"
     )
+    return 0.0
 
 
 class CloudflareImages:
@@ -1496,7 +1590,12 @@ def make_storyboard(root: Path, chapter: int, scenes: list[dict[str, Any]], reco
         image = ImageOps.fit(Image.open(root / record["selected"]).convert("RGB"), (cell_w, image_h), Image.Resampling.LANCZOS)
         canvas.paste(image, (x, y))
         draw.rectangle((x, y + image_h, x + cell_w, y + image_h + caption_h), fill=(23, 26, 33))
-        caption = f"S{i+1:02d} · CLIP {record['clip_score']:.3f} · {scenes[i]['visual_contract_tr']}"
+        clip_value = float(record.get("clip_score", 0.0) or 0.0)
+        status = str(record.get("quality_status", "unknown")).upper()
+        caption = (
+            f"S{i+1:02d} · {status} · CLIP {clip_value:.3f} · "
+            f"{scenes[i]['visual_contract_tr']}"
+        )
         words, lines, current = caption.split(), [], ""
         for word in words:
             candidate = (current + " " + word).strip()
@@ -1514,33 +1613,236 @@ def make_storyboard(root: Path, chapter: int, scenes: list[dict[str, Any]], reco
     return target
 
 
-def generate_visual_batch(root: Path, pid: str, topic: str, chapter: int, title: str, scenes: list[dict[str, Any]], config: dict[str, Any], budget: int) -> tuple[int, bool]:
+def visual_warnings(
+    record: dict[str, Any],
+    config: dict[str, Any],
+) -> list[str]:
+    warnings: list[str] = []
+    technical = record.get("technical", {})
+    ocr = record.get("ocr", {})
+    clip_value = float(record.get("clip_score", 0.0) or 0.0)
+
+    sharpness = float(technical.get("sharpness", 0.0) or 0.0)
+    brightness = float(technical.get("brightness", 0.0) or 0.0)
+    ocr_chars = int(ocr.get("total_chars", 0) or 0)
+
+    if sharpness < float(config["minimum_sharpness"]):
+        warnings.append(
+            f"soft_image: sharpness={sharpness:.1f}"
+        )
+    if not (
+        float(config["minimum_brightness"])
+        <= brightness
+        <= float(config["maximum_brightness"])
+    ):
+        warnings.append(
+            f"exposure: brightness={brightness:.1f}"
+        )
+    if ocr_chars > int(config["maximum_ocr_chars"]):
+        warnings.append(
+            f"possible_text: ocr_chars={ocr_chars}"
+        )
+    if clip_value < float(config["target_clip_score"]):
+        warnings.append(
+            f"semantic_low: clip={clip_value:.4f}"
+        )
+    return warnings
+
+
+def visual_rank(
+    record: dict[str, Any],
+    config: dict[str, Any],
+) -> float:
+    technical = record.get("technical", {})
+    ocr = record.get("ocr", {})
+
+    clip_value = float(record.get("clip_score", 0.0) or 0.0)
+    sharpness = float(technical.get("sharpness", 0.0) or 0.0)
+    brightness = float(technical.get("brightness", 128.0) or 128.0)
+    ocr_chars = int(ocr.get("total_chars", 0) or 0)
+
+    semantic_points = clip_value * 100.0
+    sharpness_points = min(12.0, sharpness / 8.0)
+    exposure_penalty = min(12.0, abs(brightness - 128.0) / 10.0)
+    ocr_penalty = min(18.0, ocr_chars * 0.75)
+
+    return round(
+        semantic_points
+        + sharpness_points
+        - exposure_penalty
+        - ocr_penalty,
+        4,
+    )
+
+
+def safe_candidate_evaluation(
+    candidate: Path,
+    semantic_text: str,
+    config: dict[str, Any],
+) -> tuple[dict[str, float], dict[str, Any], float, list[str]]:
+    evaluation_warnings: list[str] = []
+
+    try:
+        quality = technical_quality(candidate)
+    except Exception as exc:
+        quality = {
+            "sharpness": 0.0,
+            "brightness": 128.0,
+        }
+        evaluation_warnings.append(
+            f"technical_check_failed: {type(exc).__name__}"
+        )
+
+    try:
+        ocr = ocr_report(
+            candidate,
+            float(config["ocr_confidence"]),
+        )
+    except Exception as exc:
+        ocr = {
+            "tokens": [],
+            "total_chars": 0,
+            "unavailable": True,
+        }
+        evaluation_warnings.append(
+            f"ocr_check_failed: {type(exc).__name__}"
+        )
+
+    try:
+        semantic = clip_score(candidate, semantic_text)
+    except Exception as exc:
+        semantic = 0.0
+        evaluation_warnings.append(
+            f"clip_check_failed: {type(exc).__name__}"
+        )
+
+    return quality, ocr, semantic, evaluation_warnings
+
+
+def write_visual_quality_report(
+    root: Path,
+    chapter: int,
+    records: list[dict[str, Any]],
+) -> None:
+    report = {
+        "version": VERSION,
+        "chapter": chapter,
+        "production_first": True,
+        "total_scenes": len(records),
+        "warning_scenes": sum(
+            1 for record in records if record.get("warnings")
+        ),
+        "scenes": [
+            {
+                "scene_id": record.get("scene_id"),
+                "clip_score": record.get("clip_score"),
+                "quality_rank": record.get("quality_rank"),
+                "quality_status": record.get("quality_status"),
+                "warnings": record.get("warnings", []),
+            }
+            for record in records
+        ],
+    }
+    target = (
+        root
+        / "deliverables"
+        / f"quality-chapter-{chapter:02d}.json"
+    )
+    write_json(target, report)
+
+
+def generate_visual_batch(
+    root: Path,
+    pid: str,
+    topic: str,
+    chapter: int,
+    title: str,
+    scenes: list[dict[str, Any]],
+    config: dict[str, Any],
+    budget: int,
+) -> tuple[int, bool]:
     directory = chapter_dir(root, chapter)
     manifest_file = directory / "visual_manifest.json"
-    records = {int(item["scene_id"]): item for item in read_json(manifest_file, [])}
+    records = {
+        int(item["scene_id"]): item
+        for item in read_json(manifest_file, [])
+        if isinstance(item, dict) and item.get("scene_id") is not None
+    }
     provider = CloudflareImages(config)
     used = 0
+
     for scene in scenes:
         scene_id = int(scene["scene_id"])
-        selected = directory / "visuals" / f"scene-{scene_id:03d}.jpg"
+        selected = (
+            directory
+            / "visuals"
+            / f"scene-{scene_id:03d}.jpg"
+        )
         old = records.get(scene_id)
-        if old and selected.exists() and old.get("accepted"):
+
+        if (
+            old
+            and selected.exists()
+            and old.get("accepted")
+        ):
             continue
+
         if used >= budget:
             return used, False
-        best, repair = None, ""
-        for attempt in range(1, int(config["attempts_per_scene"]) + 1):
+
+        candidates: list[dict[str, Any]] = []
+        repair = ""
+
+        for attempt in range(
+            1,
+            int(config["attempts_per_scene"]) + 1,
+        ):
             if used >= budget:
                 break
-            candidate = selected.with_name(f"scene-{scene_id:03d}-candidate-{attempt}.jpg")
-            prompt = image_prompt(topic, title, scene, config, repair)
-            provider.generate(prompt, deterministic_seed(pid, chapter, scene_id, attempt), candidate)
+
+            candidate = selected.with_name(
+                f"scene-{scene_id:03d}-candidate-{attempt}.jpg"
+            )
+            prompt = image_prompt(
+                topic,
+                title,
+                scene,
+                config,
+                repair,
+            )
+
+            provider.generate(
+                prompt,
+                deterministic_seed(
+                    pid,
+                    chapter,
+                    scene_id,
+                    attempt,
+                ),
+                candidate,
+            )
             used += 1
+
             with Image.open(candidate) as raw:
-                frame = ImageOps.fit(raw.convert("RGB"), (int(config["width"]), int(config["height"])), Image.Resampling.LANCZOS)
-                frame.save(candidate, "JPEG", quality=93, optimize=True)
-            quality = technical_quality(candidate)
-            ocr = ocr_report(candidate, float(config["ocr_confidence"]))
+                frame = ImageOps.fit(
+                    raw.convert("RGB"),
+                    (
+                        int(config["width"]),
+                        int(config["height"]),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+                frame = ImageOps.autocontrast(
+                    frame,
+                    cutoff=0.5,
+                )
+                frame.save(
+                    candidate,
+                    "JPEG",
+                    quality=94,
+                    optimize=True,
+                )
+
             semantic_text = " | ".join((
                 str(scene.get("visual_contract_tr", "")),
                 str(scene.get("prompt_en", "")),
@@ -1549,10 +1851,15 @@ def generate_visual_batch(root: Path, pid: str, topic: str, chapter: int, title:
                     for item in scene.get("must_show", [])[:6]
                 ),
             ))
-            semantic = clip_score(
-                candidate,
-                semantic_text,
+
+            quality, ocr, semantic, evaluation_warnings = (
+                safe_candidate_evaluation(
+                    candidate,
+                    semantic_text,
+                    config,
+                )
             )
+
             record = {
                 "scene_id": scene_id,
                 "candidate": str(candidate.relative_to(root)),
@@ -1560,41 +1867,120 @@ def generate_visual_batch(root: Path, pid: str, topic: str, chapter: int, title:
                 "technical": quality,
                 "ocr": ocr,
                 "prompt": prompt,
+                "attempt": attempt,
                 "accepted": False,
+                "evaluation_warnings": evaluation_warnings,
             }
-            if best is None or semantic > best["clip_score"]:
-                best = record
-            good = (
-                quality["sharpness"] >= float(config["minimum_sharpness"])
-                and float(config["minimum_brightness"]) <= quality["brightness"] <= float(config["maximum_brightness"])
-                and ocr["total_chars"] <= int(config["maximum_ocr_chars"])
-                and semantic >= float(config["target_clip_score"])
+            record["warnings"] = [
+                *evaluation_warnings,
+                *visual_warnings(record, config),
+            ]
+            record["quality_rank"] = visual_rank(
+                record,
+                config,
             )
-            if good:
+            candidates.append(record)
+
+            if not record["warnings"]:
                 break
-            repair = "Previous candidate was rejected. Rebuild exact person, action and place more clearly, with clean exposure and no writing."
-        if not best:
-            return used, False
-        hard_ok = (
-            best["technical"]["sharpness"] >= float(config["minimum_sharpness"])
-            and float(config["minimum_brightness"]) <= best["technical"]["brightness"] <= float(config["maximum_brightness"])
-            and best["ocr"]["total_chars"] <= int(config["maximum_ocr_chars"])
-            and best["clip_score"] >= float(config["minimum_clip_score"])
+
+            repair = (
+                "Previous candidate had quality warnings. "
+                "Keep the exact narrated person, action and place, "
+                "improve clarity and exposure, and remove all visible "
+                "writing, signage and pseudo-letters."
+            )
+
+        existing_candidates = [
+            record
+            for record in candidates
+            if (root / record["candidate"]).exists()
+        ]
+        if not existing_candidates:
+            # This is not a quality rejection. It means the provider did not
+            # create a usable file and should remain a real failure.
+            raise ProviderUnavailable(
+                f"Sahne {scene_id} için hiçbir görsel dosyası üretilemedi."
+            )
+
+        best = max(
+            existing_candidates,
+            key=lambda record: float(
+                record.get("quality_rank", -9999.0)
+            ),
         )
-        if not hard_ok:
-            raise QualityGateError(f"Sahne {scene_id} kalite eşiğini geçemedi: CLIP={best['clip_score']}")
+
         source = root / best["candidate"]
         selected.parent.mkdir(parents=True, exist_ok=True)
         selected.write_bytes(source.read_bytes())
-        for candidate in selected.parent.glob(f"scene-{scene_id:03d}-candidate-*.jpg"):
-            candidate.unlink(missing_ok=True)
-        best.update({"selected": str(selected.relative_to(root)), "accepted": True})
+
+        for candidate_file in selected.parent.glob(
+            f"scene-{scene_id:03d}-candidate-*.jpg"
+        ):
+            candidate_file.unlink(missing_ok=True)
+
+        best.update({
+            "selected": str(selected.relative_to(root)),
+            "accepted": True,
+            "quality_status": (
+                "pass"
+                if not best.get("warnings")
+                else "warning"
+            ),
+            "production_first": True,
+        })
         records[scene_id] = best
-        write_json(manifest_file, sorted(records.values(), key=lambda x: x["scene_id"]))
-        log(f"Görsel seçildi: bölüm={chapter} sahne={scene_id} CLIP={best['clip_score']}")
-    complete = len([x for x in records.values() if x.get("accepted")]) == len(scenes)
+
+        ordered = sorted(
+            records.values(),
+            key=lambda item: int(item["scene_id"]),
+        )
+        write_json(manifest_file, ordered)
+        write_visual_quality_report(
+            root,
+            chapter,
+            ordered,
+        )
+
+        if best.get("warnings"):
+            log(
+                f"Görsel seçildi (uyarıyla): bölüm={chapter} "
+                f"sahne={scene_id} CLIP={best['clip_score']} "
+                f"uyarı={best['warnings']}"
+            )
+        else:
+            log(
+                f"Görsel seçildi: bölüm={chapter} "
+                f"sahne={scene_id} CLIP={best['clip_score']}"
+            )
+
+    ordered = sorted(
+        records.values(),
+        key=lambda item: int(item["scene_id"]),
+    )
+    complete = (
+        len([
+            item
+            for item in ordered
+            if item.get("accepted")
+            and (root / str(item.get("selected", ""))).exists()
+        ])
+        == len(scenes)
+    )
+
     if complete:
-        make_storyboard(root, chapter, scenes, sorted(records.values(), key=lambda x: x["scene_id"]))
+        make_storyboard(
+            root,
+            chapter,
+            scenes,
+            ordered,
+        )
+        write_visual_quality_report(
+            root,
+            chapter,
+            ordered,
+        )
+
     return used, complete
 
 
@@ -1617,18 +2003,75 @@ def write_pcm(path: Path, pcm: bytes, sample_rate: int = 24000) -> None:
         wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(sample_rate); wav.writeframes(pcm)
 
 
-def normalize_voice(raw: Path, target: Path, words: int, config: dict[str, Any]) -> dict[str, float]:
+def atempo_chain(factor: float) -> str:
+    factor = max(0.50, min(2.00, float(factor)))
+    return f"atempo={factor:.5f}"
+
+
+def normalize_voice(raw: Path, target: Path, words: int, config: dict[str, Any]) -> dict[str, Any]:
     seconds = ffprobe_duration(raw)
+    if seconds < 3.0:
+        raise ProviderUnavailable(
+            f"Charon ses dosyası geçersiz veya kesilmiş: {seconds:.2f}s"
+        )
+
     actual = words / max(seconds, 1) * 60
-    if actual < float(config["minimum_wpm"]) * 0.82 or actual > float(config["maximum_wpm"]) * 1.18:
-        raise QualityGateError(f"Charon tempo kabul edilemez: {actual:.1f} WPM")
-    tempo = max(0.90, min(1.10, float(config["target_wpm"]) / max(actual, 1)))
+    requested_tempo = (
+        float(config["target_wpm"])
+        / max(actual, 1.0)
+    )
+    tempo = max(0.62, min(1.55, requested_tempo))
+
+    warnings: list[str] = []
+    if (
+        actual < float(config["minimum_wpm"])
+        or actual > float(config["maximum_wpm"])
+    ):
+        warnings.append(
+            f"raw_tempo={actual:.1f}_wpm"
+        )
+        log(
+            "CHARON FAIL-SOFT TEMPO: ham ses "
+            f"{actual:.1f} WPM; doğal hedefe otomatik ayarlanıyor."
+        )
+    if abs(tempo - requested_tempo) > 0.001:
+        warnings.append(
+            f"tempo_clamped={requested_tempo:.3f}->{tempo:.3f}"
+        )
+
     run([
-        "ffmpeg", "-y", "-i", str(raw), "-af",
-        f"atempo={tempo:.4f},highpass=f=65,lowpass=f=11000,loudnorm=I=-17:TP=-2:LRA=7",
-        "-ar", str(config["output_sample_rate"]), "-ac", "1", "-c:a", "flac", str(target),
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(raw),
+        "-af",
+        (
+            f"{atempo_chain(tempo)},"
+            "highpass=f=65,"
+            "lowpass=f=11000,"
+            "loudnorm=I=-17:TP=-2:LRA=7"
+        ),
+        "-ar",
+        str(config["output_sample_rate"]),
+        "-ac",
+        "1",
+        "-c:a",
+        "flac",
+        str(target),
     ], 300)
-    return {"raw_seconds": round(seconds, 2), "final_seconds": round(ffprobe_duration(target), 2), "raw_wpm": round(actual, 2), "tempo": round(tempo, 4)}
+
+    final_seconds = ffprobe_duration(target)
+    final_wpm = words / max(final_seconds, 1) * 60
+    return {
+        "raw_seconds": round(seconds, 2),
+        "final_seconds": round(final_seconds, 2),
+        "raw_wpm": round(actual, 2),
+        "final_wpm": round(final_wpm, 2),
+        "tempo": round(tempo, 5),
+        "warnings": warnings,
+        "voice": "Charon",
+        "production_first": True,
+    }
 
 
 def generate_tts_batch(root: Path, chapter: int, narration: str, config: dict[str, Any], gemini: Gemini, budget: int) -> tuple[int, bool]:
@@ -1794,6 +2237,10 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
         f"chapter_soft_min={profile['soft_minimum_chapter_words']}, "
         f"chapter_hard_min={profile['hard_minimum_chapter_words']}"
     )
+    log(
+        "PRODUCTION-FIRST MODE: kalite puanları raporlanır; "
+        "üretilmiş görsel veya ses kalite eşiği nedeniyle işi durdurmaz."
+    )
     try:
         research_file = root / "research.json"
         research = read_json(research_file)
@@ -1924,7 +2371,7 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
         report = root / "deliverables" / "ERROR_REPORT.txt"
         report.parent.mkdir(parents=True, exist_ok=True)
         report.write_text(
-            "UYKU VE TARİH V11.1.1 HATA RAPORU\n\n"
+            "UYKU VE TARİH V11.2.0 HATA RAPORU\n\n"
             f"Tür: {type(exc).__name__}\n"
             f"Mesaj: {exc}\n"
             f"Proje: {pid}\n"
