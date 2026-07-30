@@ -1,0 +1,99 @@
+name: Uyku ve Tarih V11.1 - Otomatik Devam
+
+on:
+  schedule:
+    - cron: "20 0,6,12,18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  continue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Aktif projeyi oku
+        id: active
+        run: |
+          echo "active=$(jq -r '.active' control/active_project.json)" >> "$GITHUB_OUTPUT"
+          echo "project_id=$(jq -r '.project_id' control/active_project.json)" >> "$GITHUB_OUTPUT"
+          echo "minutes=$(jq -r '.minutes' control/active_project.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo 'topic<<EOF'
+            jq -r '.topic' control/active_project.json
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        if: steps.active.outputs.active == 'true'
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Araçları kur
+        if: steps.active.outputs.active == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-tur fonts-dejavu-core jq
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          python -m pip install -r requirements.txt
+      - name: CLIP model cache
+        if: steps.active.outputs.active == 'true'
+        uses: actions/cache@v4
+        with:
+          path: .hf-cache
+          key: hf-clip-vit-b32-v1
+      - name: Proje cache geri yükle
+        if: steps.active.outputs.active == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: data/${{ steps.active.outputs.project_id }}
+          key: v111-${{ steps.active.outputs.project_id }}-scheduled-${{ github.run_id }}
+          restore-keys: |
+            v111-${{ steps.active.outputs.project_id }}-
+      - name: Ajanı devam ettir
+        if: steps.active.outputs.active == 'true'
+        id: agent
+        run: |
+          python src/agent.py step --topic "${{ steps.active.outputs.topic }}" --minutes "${{ steps.active.outputs.minutes }}" --project-id "${{ steps.active.outputs.project_id }}" | tee agent.log
+          STATUS="$(grep 'PROJECT_STATUS=' agent.log | tail -1 | cut -d= -f2)"
+          echo "status=${STATUS:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Proje cache kaydet
+        if: always() && steps.active.outputs.active == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data/${{ steps.active.outputs.project_id }}
+          key: v111-${{ steps.active.outputs.project_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Eski proje cachelerini sil
+        if: always() && steps.active.outputs.active == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/prune_project_caches.sh "v111-${{ steps.active.outputs.project_id }}-" "v111-${{ steps.active.outputs.project_id }}-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Rapor ve storyboard artifact
+        if: always() && steps.active.outputs.active == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: v111-${{ steps.active.outputs.project_id }}-${{ github.run_number }}
+          path: |
+            data/${{ steps.active.outputs.project_id }}/state.json
+            data/${{ steps.active.outputs.project_id }}/deliverables/storyboard-*.jpg
+            agent.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Tamamlandıysa projeyi kapat
+        if: steps.agent.outputs.status == 'complete'
+        run: |
+          python src/agent.py control-complete
+          git config user.name "uyku-tarih-agent"
+          git config user.email "actions@users.noreply.github.com"
+          git add control/active_project.json
+          git commit -m "Complete video: ${{ steps.active.outputs.project_id }}" || true
+          git push

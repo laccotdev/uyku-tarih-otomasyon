@@ -1,0 +1,75 @@
+version: "11.1.0"
+project:
+  data_root: "./data"
+  chapters: 6
+  scenes_per_chapter: 18
+  narration_words_per_minute: 132
+  default_minutes: 60
+  max_wall_minutes: 210
+  maximum_cache_gb: 3.8
+gemini:
+  text_models:
+    - "gemini-3.5-flash-lite"
+    - "gemini-3.5-flash"
+    - "gemini-3-flash-preview"
+  tts_model: "gemini-3.1-flash-tts-preview"
+  voice: "Charon"
+  json_retries: 3
+research:
+  languages: ["tr", "en"]
+  results_per_query: 6
+  minimum_sources: 4
+images:
+  model: "@cf/black-forest-labs/flux-1-schnell"
+  steps: 6
+  width: 1344
+  height: 768
+  maximum_images_per_run: 70
+  attempts_per_scene: 2
+  target_clip_score: 0.19
+  minimum_clip_score: 0.155
+  ocr_confidence: 48
+  maximum_ocr_chars: 4
+  minimum_sharpness: 42
+  minimum_brightness: 26
+  maximum_brightness: 228
+  style_bible: >
+    Premium photorealistic historical documentary film still. Historically
+    grounded clothing, architecture, objects and geography. The named person
+    or group, exact action and named place must appear together in one coherent
+    widescreen frame. Serious cinema lighting, natural skin, realistic anatomy,
+    crisp stone wood fabric and metal, rich controlled color, clear focal point,
+    no collage and no generic empty scenery.
+  negative_prompt: >
+    text, words, letters, numbers, title, subtitle, caption, watermark, logo,
+    signage, inscription, fake alphabet, pseudo-language, banner writing,
+    document writing, map labels, infographic, timeline card, user interface,
+    split screen, collage, modern clothing, modern vehicles, electricity,
+    fantasy, cartoon, anime, blurry, washed out, deformed hands, extra fingers,
+    duplicate people.
+tts:
+  chunk_words: 410
+  maximum_chunks_per_run: 8
+  target_wpm: 132
+  minimum_wpm: 105
+  maximum_wpm: 155
+  output_sample_rate: 48000
+  instruction: >
+    Yalnızca Charon sesiyle, tek ve değişmeyen olgun bir Türk tarih belgeseli
+    anlatıcısı olarak oku. Doğal, sakin, ölçülü ve güven veren bir tempoda
+    ilerle. Yaklaşık dakikada 125-140 kelime hedefle. İsimleri, tarihleri ve
+    neden-sonuç cümlelerini acele etmeden söyle. Tiyatro, fragman, reklam,
+    haber spikeri veya aşırı uykulu ton kullanma. Metne hiçbir kelime ekleme,
+    hiçbir kelimeyi çıkarma ve başlık okuma.
+render:
+  width: 1920
+  height: 1080
+  fps: 24
+  crf: 22
+  preset: "veryfast"
+  audio_bitrate: "192k"
+  subtle_zoom: 1.006
+youtube:
+  enabled: false
+  privacy_status: "private"
+  category_id: "27"

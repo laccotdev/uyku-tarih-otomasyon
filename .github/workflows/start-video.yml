@@ -1,0 +1,113 @@
+name: Uyku ve Tarih V11.1 - Yeni Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: "Video konusu"
+        required: true
+        type: string
+      minutes:
+        description: "Hedef süre"
+        required: true
+        default: "60"
+        type: choice
+        options: ["5", "10", "30", "60"]
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Araçları kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-tur fonts-dejavu-core jq
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          python -m pip install -r requirements.txt
+      - name: Projeyi başlat
+        id: project
+        run: |
+          PROJECT_ID="$(python src/agent.py project-id --topic "${{ inputs.topic }}" --minutes "${{ inputs.minutes }}")"
+          echo "id=$PROJECT_ID" >> "$GITHUB_OUTPUT"
+          echo "PROJECT_ID=$PROJECT_ID" >> "$GITHUB_ENV"
+          python src/agent.py control-set --topic "${{ inputs.topic }}" --minutes "${{ inputs.minutes }}" --project-id "$PROJECT_ID"
+      - name: Aktif proje kaydını commit et
+        run: |
+          git config user.name "uyku-tarih-agent"
+          git config user.email "actions@users.noreply.github.com"
+          git add control/active_project.json
+          git commit -m "Start video: $PROJECT_ID" || true
+          git push
+      - name: CLIP model cache
+        uses: actions/cache@v4
+        with:
+          path: .hf-cache
+          key: hf-clip-vit-b32-v1
+      - name: Proje cache geri yükle
+        uses: actions/cache/restore@v4
+        with:
+          path: data/${{ steps.project.outputs.id }}
+          key: v111-${{ steps.project.outputs.id }}-bootstrap
+          restore-keys: |
+            v111-${{ steps.project.outputs.id }}-
+      - name: Ajanı çalıştır
+        id: agent
+        run: |
+          python src/agent.py step --topic "${{ inputs.topic }}" --minutes "${{ inputs.minutes }}" --project-id "${{ steps.project.outputs.id }}" | tee agent.log
+          STATUS="$(grep 'PROJECT_STATUS=' agent.log | tail -1 | cut -d= -f2)"
+          echo "status=${STATUS:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Proje cache kaydet
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/${{ steps.project.outputs.id }}
+          key: v111-${{ steps.project.outputs.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Eski proje cachelerini sil
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/prune_project_caches.sh "v111-${{ steps.project.outputs.id }}-" "v111-${{ steps.project.outputs.id }}-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Rapor ve storyboard artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v111-${{ steps.project.outputs.id }}-${{ github.run_number }}
+          path: |
+            data/${{ steps.project.outputs.id }}/state.json
+            data/${{ steps.project.outputs.id }}/research.json
+            data/${{ steps.project.outputs.id }}/story_bible.json
+            data/${{ steps.project.outputs.id }}/deliverables/storyboard-*.jpg
+            agent.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Kısa pilot videosunu artifact yap
+        if: steps.agent.outputs.status == 'complete' && fromJSON(inputs.minutes) <= 10
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ steps.project.outputs.id }}
+          path: data/${{ steps.project.outputs.id }}/deliverables/final-video.mp4
+          retention-days: 3
+      - name: Tamamlandıysa projeyi kapat
+        if: steps.agent.outputs.status == 'complete'
+        run: |
+          python src/agent.py control-complete
+          git add control/active_project.json
+          git commit -m "Complete video: $PROJECT_ID" || true
+          git push
