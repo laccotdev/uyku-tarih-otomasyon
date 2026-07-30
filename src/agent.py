@@ -24,7 +24,7 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "11.1.2"
+VERSION = "11.1.3"
 
 
 class ControlledPause(RuntimeError):
@@ -511,6 +511,14 @@ def duration_profile(minutes: int, config: dict[str, Any]) -> dict[str, Any]:
     part_words = max(110, round(chapter_words / parts))
     minimum_part_words = max(85, round(part_words * 0.58))
     maximum_part_words = max(minimum_part_words + 30, round(part_words * 1.28))
+    soft_minimum_chapter_words = max(
+        180,
+        round(chapter_words * 0.88),
+    )
+    hard_minimum_chapter_words = max(
+        150,
+        round(chapter_words * 0.60),
+    )
     return {
         "minutes": int(minutes),
         "chapters": chapters,
@@ -521,6 +529,8 @@ def duration_profile(minutes: int, config: dict[str, Any]) -> dict[str, Any]:
         "target_part_words": part_words,
         "minimum_part_words": minimum_part_words,
         "maximum_part_words": maximum_part_words,
+        "soft_minimum_chapter_words": soft_minimum_chapter_words,
+        "hard_minimum_chapter_words": hard_minimum_chapter_words,
         "profile_version": VERSION,
     }
 
@@ -632,6 +642,141 @@ Kurallar:
     )
 
 
+
+def complete_chapter_narration(
+    root: Path,
+    topic: str,
+    bible: dict[str, Any],
+    research: dict[str, Any],
+    chapter: dict[str, Any],
+    previous_summary: str,
+    narration: str,
+    target_words: int,
+    soft_minimum_words: int,
+    hard_minimum_words: int,
+    profile: dict[str, Any],
+    gemini: Gemini,
+) -> tuple[str, list[str], bool]:
+    directory = chapter_dir(root, int(chapter["index"]))
+    completion_dir = directory / "script_completion"
+    completion_dir.mkdir(parents=True, exist_ok=True)
+
+    completed_texts: list[str] = []
+    models: list[str] = []
+
+    for index in range(1, 7):
+        saved = read_json(completion_dir / f"{index:02d}.json")
+        if not isinstance(saved, dict):
+            break
+        saved_text = str(saved.get("text", "")).strip()
+        if not saved_text:
+            break
+        completed_texts.append(saved_text)
+        models.extend(
+            str(model)
+            for model in saved.get("models", [])
+            if str(model).strip()
+        )
+
+    combined = " ".join(
+        item for item in [narration, *completed_texts] if str(item).strip()
+    ).strip()
+
+    for attempt in range(len(completed_texts) + 1, 7):
+        current_words = word_count(combined)
+        if current_words >= soft_minimum_words:
+            break
+
+        missing = max(1, soft_minimum_words - current_words)
+        requested = max(90, min(220, missing + 35))
+        tail = " ".join(combined.split()[-190:])
+        closing_rule = (
+            "Bu ek metinle bölümü doğal bir sonuca bağla."
+            if missing <= 170
+            else "Bölümü henüz sonlandırmadan akışı ilerlet."
+        )
+
+        prompt = f'''KONU: {topic}
+HİKÂYE ANAYASASI: {bible}
+BÖLÜM: {chapter}
+ÖNCEKİ BÖLÜM ÖZETİ: {previous_summary}
+MEVCUT BÖLÜMÜN SONU:
+{tail}
+
+KAYNAKLAR:
+{source_context(research, 12000)}
+
+Mevcut bölüm {current_words} kelime. Kaliteli anlatı için en az
+{soft_minimum_words} kelime gerekiyor. Yalnızca mevcut metnin devamını,
+yaklaşık {requested} Türkçe kelime olarak yaz.
+
+Geçerli JSON:
+{{"text":"yalnız eklenecek devam metni"}}
+
+Kurallar:
+- Baştan başlama ve önceki cümleleri tekrar etme.
+- Yeni bir başlık veya giriş yazma.
+- Somut olay, karar, kişi, mekân ve neden-sonuç ilişkisiyle devam et.
+- Kaynaklarda bulunmayan kesin ayrıntı uydurma.
+- {closing_rule}
+- Kamera komutu, kaynak numarası ve madde işareti yazma.'''
+
+        payload, model = gemini.json(SYSTEM, prompt, 0.22)
+        piece = " ".join(str(payload.get("text", "")).split()).strip()
+        piece_words = word_count(piece)
+
+        if piece_words < 35:
+            log(
+                f"Bölüm tamamlama kısa/boş: bölüm={chapter['index']} "
+                f"deneme={attempt}/6 kelime={piece_words}"
+            )
+            continue
+
+        write_json(
+            completion_dir / f"{attempt:02d}.json",
+            {
+                "index": attempt,
+                "text": piece,
+                "words": piece_words,
+                "models": [model],
+                "generation_profile": profile,
+            },
+        )
+        completed_texts.append(piece)
+        models.append(model)
+        combined = " ".join([combined, piece]).strip()
+        log(
+            f"Bölüm otomatik tamamlandı: bölüm={chapter['index']} "
+            f"ek={attempt}/6 toplam_kelime={word_count(combined)} "
+            f"yumuşak_hedef={soft_minimum_words}"
+        )
+
+    final_words = word_count(combined)
+    below_soft = final_words < soft_minimum_words
+
+    if final_words < hard_minimum_words:
+        raise QualityGateError(
+            "Bölüm metni otomatik tamamlama sonrasında da "
+            f"kullanılamayacak kadar kısa: "
+            f"{final_words}/{hard_minimum_words} kelime."
+        )
+
+    if below_soft:
+        log(
+            "FAIL-SOFT SCRIPT GUARD: bölüm yumuşak hedefin altında kaldı "
+            f"({final_words}/{soft_minimum_words}) fakat güvenli alt sınırı "
+            "geçtiği için üretim durdurulmadı."
+        )
+
+    maximum_words = max(
+        soft_minimum_words,
+        round(target_words * 1.12),
+    )
+    combined = trim_to_sentence_word_limit(combined, maximum_words)
+    return combined, models, below_soft
+
+
+
 def create_story_bible(topic: str, minutes: int, count: int, research: dict[str, Any], gemini: Gemini) -> dict[str, Any]:
     payload, model = gemini.json(SYSTEM, f'''KONU: {topic}
 HEDEF: {minutes} dakika, {count} bölüm
@@ -730,16 +875,37 @@ def build_script_checkpoint(
         return False
 
     narration = " ".join(parts)
-    minimum_chapter = max(180, int(target_words * 0.72))
-    if word_count(narration) < minimum_chapter:
-        raise QualityGateError(
-            f"Bölüm metni hedefin altında: "
-            f"{word_count(narration)}/{minimum_chapter} kelime."
+    soft_minimum = int(
+        profile.get(
+            "soft_minimum_chapter_words",
+            max(180, round(target_words * 0.88)),
         )
-    narration = trim_to_sentence_word_limit(
-        narration,
-        max(minimum_chapter, round(target_words * 1.10)),
     )
+    hard_minimum = int(
+        profile.get(
+            "hard_minimum_chapter_words",
+            max(150, round(target_words * 0.60)),
+        )
+    )
+
+    completion_models: list[str] = []
+    below_soft = False
+    if word_count(narration) < soft_minimum:
+        narration, completion_models, below_soft = complete_chapter_narration(
+            root,
+            topic,
+            bible,
+            research,
+            chapter,
+            previous_summary,
+            narration,
+            target_words,
+            soft_minimum,
+            hard_minimum,
+            profile,
+            gemini,
+        )
+
     summary, model = gemini.json(SYSTEM, f'''Aşağıdaki bölümün 90-150 kelimelik
 sonraki bölüm tutarlılık özetini JSON ver: {{"summary":"..."}}\n{narration}''', 0.05)
     write_json(final, {
@@ -748,10 +914,19 @@ sonraki bölüm tutarlılık özetini JSON ver: {{"summary":"..."}}\n{narration}
         "narration": narration,
         "word_count": word_count(narration),
         "target_words": target_words,
+        "soft_minimum_words": soft_minimum,
+        "hard_minimum_words": hard_minimum,
+        "length_warning": below_soft,
+        "completion_models": completion_models,
         "summary": summary["summary"],
         "summary_model": model,
         "generation_profile": profile,
     })
+    log(
+        f"Bölüm senaryosu hazır: bölüm={chapter['index']} "
+        f"kelime={word_count(narration)} hedef={target_words} "
+        f"minimum={hard_minimum}"
+    )
     return True
 
 
@@ -1205,7 +1380,9 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
         "ADAPTIVE DURATION PROFILE: "
         f"minutes={minutes}, chapters={chapters}, "
         f"scenes/chapter={scenes_per_chapter}, script_parts={script_parts}, "
-        f"target_words={profile['target_total_words']}"
+        f"target_words={profile['target_total_words']}, "
+        f"chapter_soft_min={profile['soft_minimum_chapter_words']}, "
+        f"chapter_hard_min={profile['hard_minimum_chapter_words']}"
     )
     try:
         research_file = root / "research.json"
