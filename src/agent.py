@@ -24,7 +24,7 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "11.1.4"
+VERSION = "11.1.5"
 
 
 class ControlledPause(RuntimeError):
@@ -1299,14 +1299,139 @@ def clip_components():
     return torch, model, processor
 
 
+def compact_clip_text(value: str, max_words: int = 52) -> str:
+    """
+    Keep the exact subject/action/place while removing verbose prompt language.
+
+    CLIP ViT-B/32 supports at most 77 text positions. Word compaction improves
+    relevance; tokenizer truncation below is still the definitive guard.
+    """
+    clean = " ".join(str(value).split())
+    words = clean.split()
+    if len(words) <= max_words:
+        return clean
+
+    # Preserve both the scene identity at the beginning and concrete mandatory
+    # elements often placed near the end.
+    head_count = max(1, round(max_words * 0.72))
+    tail_count = max_words - head_count
+    return " ".join(words[:head_count] + words[-tail_count:])
+
+
+def clip_max_length(model: Any, processor: Any) -> int:
+    values: list[int] = [77]
+
+    text_config = getattr(getattr(model, "config", None), "text_config", None)
+    model_limit = getattr(text_config, "max_position_embeddings", None)
+    if isinstance(model_limit, int) and 2 <= model_limit <= 4096:
+        values.append(model_limit)
+
+    tokenizer_limit = getattr(
+        getattr(processor, "tokenizer", None),
+        "model_max_length",
+        None,
+    )
+    if isinstance(tokenizer_limit, int) and 2 <= tokenizer_limit <= 4096:
+        values.append(tokenizer_limit)
+
+    return min(values)
+
+
+def _clip_inputs(
+    processor: Any,
+    image: Image.Image,
+    text: str,
+    max_length: int,
+) -> dict[str, Any]:
+    """
+    Tokenize text and image separately so truncation is guaranteed before the
+    CLIP model receives input_ids.
+    """
+    text_inputs = processor.tokenizer(
+        [text],
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
+    )
+    image_inputs = processor.image_processor(
+        images=[image],
+        return_tensors="pt",
+    )
+    inputs = {
+        **text_inputs,
+        **image_inputs,
+    }
+
+    input_ids = inputs.get("input_ids")
+    if input_ids is not None and int(input_ids.shape[-1]) > max_length:
+        inputs["input_ids"] = input_ids[..., :max_length]
+        attention = inputs.get("attention_mask")
+        if attention is not None:
+            inputs["attention_mask"] = attention[..., :max_length]
+
+    return inputs
+
+
 def clip_score(path: Path, text: str) -> float:
+    """
+    Safe CLIP image/text score.
+
+    The previous implementation passed 107 tokens into a model with a 77-token
+    position limit. This implementation always truncates at the model's actual
+    limit and retries once with a shorter semantic contract if a processor
+    behaves unexpectedly.
+    """
     torch, model, processor = clip_components()
-    inputs = processor(text=[text], images=[Image.open(path).convert("RGB")], return_tensors="pt", padding=True)
-    with torch.no_grad():
-        output = model(**inputs)
-        image_vector = output.image_embeds / output.image_embeds.norm(dim=-1, keepdim=True)
-        text_vector = output.text_embeds / output.text_embeds.norm(dim=-1, keepdim=True)
-        return round(float((image_vector @ text_vector.T).item()), 4)
+    maximum = clip_max_length(model, processor)
+    image = Image.open(path).convert("RGB")
+
+    attempts = (
+        compact_clip_text(text, 52),
+        compact_clip_text(text, 28),
+    )
+    last_error: Exception | None = None
+
+    for attempt_index, semantic_text in enumerate(attempts, start=1):
+        try:
+            inputs = _clip_inputs(
+                processor,
+                image,
+                semantic_text,
+                maximum,
+            )
+            token_count = int(inputs["input_ids"].shape[-1])
+            log(
+                f"CLIP SAFE SCORE: deneme={attempt_index}/2 "
+                f"token={token_count}/{maximum}"
+            )
+            with torch.no_grad():
+                output = model(**inputs)
+                image_norm = output.image_embeds.norm(
+                    dim=-1,
+                    keepdim=True,
+                ).clamp_min(1e-12)
+                text_norm = output.text_embeds.norm(
+                    dim=-1,
+                    keepdim=True,
+                ).clamp_min(1e-12)
+                image_vector = output.image_embeds / image_norm
+                text_vector = output.text_embeds / text_norm
+                return round(
+                    float((image_vector @ text_vector.T).item()),
+                    4,
+                )
+        except Exception as exc:
+            last_error = exc
+            log(
+                f"CLIP güvenli deneme başarısız: "
+                f"{attempt_index}/2 — {type(exc).__name__}: {exc}"
+            )
+
+    raise QualityGateError(
+        "CLIP kalite kontrolü iki güvenli denemede tamamlanamadı: "
+        f"{last_error}"
+    )
 
 
 class CloudflareImages:
@@ -1416,8 +1541,18 @@ def generate_visual_batch(root: Path, pid: str, topic: str, chapter: int, title:
                 frame.save(candidate, "JPEG", quality=93, optimize=True)
             quality = technical_quality(candidate)
             ocr = ocr_report(candidate, float(config["ocr_confidence"]))
-            semantic_text = " ".join((scene["visual_contract_tr"], scene["prompt_en"], " ".join(str(x) for x in scene.get("must_show", []))))
-            semantic = clip_score(candidate, semantic_text)
+            semantic_text = " | ".join((
+                str(scene.get("visual_contract_tr", "")),
+                str(scene.get("prompt_en", "")),
+                "mandatory: " + ", ".join(
+                    str(item)
+                    for item in scene.get("must_show", [])[:6]
+                ),
+            ))
+            semantic = clip_score(
+                candidate,
+                semantic_text,
+            )
             record = {
                 "scene_id": scene_id,
                 "candidate": str(candidate.relative_to(root)),
