@@ -1,4 +1,4 @@
-version: 11.4.0
+version: 11.4.1
 project:
   data_root: ./data
   chapters: 6
@@ -32,6 +32,14 @@ gemini:
   tts_model: gemini-3.1-flash-tts-preview
   voice: Charon
   json_retries: 3
+  tts_retries: 6
+  tts_retry_waits_seconds:
+  - 10
+  - 20
+  - 40
+  - 70
+  - 110
+  - 150
 research:
   languages:
   - tr
