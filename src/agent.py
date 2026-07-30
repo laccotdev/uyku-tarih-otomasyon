@@ -26,7 +26,7 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "11.4.0"
+VERSION = "11.4.1"
 PIPELINE_SCHEMA = "research-v2_story-v3_scenes-v4_voice-v4_edit-v3"
 VOICE_MASTER_VERSION = "charon-baritone-v4"
 EDITORIAL_RENDER_VERSION = "editorial-transitions-v2"
@@ -115,6 +115,25 @@ def quota_error(exc: Exception) -> bool:
     ))
 
 
+def transient_tts_error(exc: Exception) -> bool:
+    value = str(exc).lower()
+    return any(token in value for token in (
+        "503",
+        "unavailable",
+        "high demand",
+        "temporarily unavailable",
+        "service unavailable",
+        "deadline exceeded",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "internal server error",
+        "500",
+        "502",
+        "504",
+    ))
+
+
 def load_config(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
@@ -129,6 +148,14 @@ class Gemini:
         self.tts_model = str(config["tts_model"])
         self.voice = str(config["voice"])
         self.retries = int(config.get("json_retries", 3))
+        self.tts_retries = int(config.get("tts_retries", 6))
+        self.tts_retry_waits = [
+            float(value)
+            for value in config.get(
+                "tts_retry_waits_seconds",
+                [10, 20, 40, 70, 110, 150],
+            )
+        ]
 
     @staticmethod
     def parse_json(raw: str) -> dict[str, Any]:
@@ -221,33 +248,76 @@ class Gemini:
         raise ProviderUnavailable(f"Gemini JSON başarısız: {last_error}")
 
     def tts_pcm(self, text: str, instruction: str) -> bytes:
-        try:
-            response = self.client.models.generate_content(
-                model=self.tts_model,
-                contents=f"{instruction}\n\nOKUNACAK METİN:\n{text}",
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=self.voice
+        last_error: Exception | None = None
+
+        for attempt in range(1, self.tts_retries + 1):
+            try:
+                log(
+                    f"CHARON SAME-VOICE RETRY: "
+                    f"deneme={attempt}/{self.tts_retries}, "
+                    f"model={self.tts_model}, voice={self.voice}"
+                )
+                response = self.client.models.generate_content(
+                    model=self.tts_model,
+                    contents=f"{instruction}\n\nOKUNACAK METİN:\n{text}",
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=self.voice
+                                )
                             )
-                        )
+                        ),
                     ),
-                ),
-            )
-            for candidate in getattr(response, "candidates", None) or []:
-                content = getattr(candidate, "content", None)
-                for part in getattr(content, "parts", None) or []:
-                    inline = getattr(part, "inline_data", None)
-                    data = getattr(inline, "data", None)
-                    if data:
-                        return data
-            raise ValueError("Charon ses verisi bulunamadı.")
-        except Exception as exc:
-            if quota_error(exc):
-                raise ControlledPause(f"Charon ücretsiz kotası doldu: {exc}") from exc
-            raise ProviderUnavailable(f"Charon başarısız: {exc}") from exc
+                )
+                for candidate in getattr(response, "candidates", None) or []:
+                    content = getattr(candidate, "content", None)
+                    for part in getattr(content, "parts", None) or []:
+                        inline = getattr(part, "inline_data", None)
+                        data = getattr(inline, "data", None)
+                        if data:
+                            return data
+                raise ValueError("Charon ses verisi bulunamadı.")
+            except Exception as exc:
+                last_error = exc
+                if quota_error(exc):
+                    raise ControlledPause(
+                        f"Charon ücretsiz kotası doldu: {exc}"
+                    ) from exc
+
+                if transient_tts_error(exc):
+                    if attempt < self.tts_retries:
+                        wait_index = min(
+                            attempt - 1,
+                            len(self.tts_retry_waits) - 1,
+                        )
+                        wait = (
+                            self.tts_retry_waits[wait_index]
+                            if self.tts_retry_waits
+                            else min(150.0, 10.0 * (2 ** (attempt - 1)))
+                        )
+                        log(
+                            "CHARON TEMPORARY 503: aynı Charon sesiyle "
+                            f"yeniden denenecek; bekleme={wait:.0f}s"
+                        )
+                        time.sleep(wait)
+                        continue
+                    raise ControlledPause(
+                        "Charon servisi geçici olarak yoğun. Başka sese "
+                        "geçilmedi; mevcut görseller ve senaryo korunarak "
+                        "sonraki çalışmada aynı tek Charon izi yeniden "
+                        f"denenecek. Son hata: {exc}"
+                    ) from exc
+
+                raise ProviderUnavailable(
+                    f"Charon başarısız: {exc}"
+                ) from exc
+
+        raise ControlledPause(
+            "Charon geçici yoğunluk nedeniyle tamamlanamadı; "
+            f"checkpoint korundu. Son hata: {last_error}"
+        )
 
 
 WIKI = {
@@ -1528,6 +1598,70 @@ def create_scene_plan(
     return scenes
 
 
+def technical_quality(path: Path) -> dict[str, float]:
+    image = cv2.imread(str(path))
+    if image is None:
+        return {"sharpness": 0.0, "brightness": 0.0}
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return {
+        "sharpness": round(
+            float(cv2.Laplacian(gray, cv2.CV_64F).var()),
+            2,
+        ),
+        "brightness": round(float(gray.mean()), 2),
+    }
+
+
+def ocr_report(path: Path, confidence: float) -> dict[str, Any]:
+    image = ImageOps.autocontrast(
+        Image.open(path).convert("L")
+    )
+    data = pytesseract.image_to_data(
+        image,
+        lang="eng+tur",
+        config="--psm 11",
+        output_type=pytesseract.Output.DICT,
+    )
+    tokens: list[dict[str, Any]] = []
+    total = 0
+    for raw_text, raw_conf in zip(
+        data.get("text", []),
+        data.get("conf", []),
+    ):
+        clean = "".join(
+            char for char in str(raw_text) if char.isalnum()
+        )
+        try:
+            score = float(raw_conf)
+        except (TypeError, ValueError):
+            score = -1
+        if score >= confidence and len(clean) >= 3:
+            tokens.append({
+                "text": clean,
+                "confidence": round(score, 1),
+            })
+            total += len(clean)
+    return {
+        "tokens": tokens[:15],
+        "total_chars": total,
+    }
+
+
+@lru_cache(maxsize=1)
+def clip_components():
+    import torch
+    from transformers import CLIPModel, CLIPProcessor
+
+    name = "openai/clip-vit-base-patch32"
+    model = CLIPModel.from_pretrained(name)
+    processor = CLIPProcessor.from_pretrained(
+        name,
+        use_fast=False,
+    )
+    model.eval()
+    return torch, model, processor
+
+
 def compact_clip_text(value: str, max_words: int = 52) -> str:
     """
     Keep the exact subject/action/place while removing verbose prompt language.
@@ -2201,6 +2335,83 @@ def write_visual_quality_report(
         / f"quality-chapter-{chapter:02d}.json"
     )
     write_json(target, report)
+
+
+def repair_broken_visual_metadata(
+    root: Path,
+    chapter: int,
+    scenes: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> bool:
+    directory = chapter_dir(root, chapter)
+    manifest_file = directory / "visual_manifest.json"
+    manifest = read_json(manifest_file, [])
+    if not isinstance(manifest, list) or not manifest:
+        return False
+
+    by_scene = {
+        int(scene.get("scene_id", 0)): scene
+        for scene in scenes
+        if isinstance(scene, dict)
+    }
+    changed = False
+
+    for record in manifest:
+        if not isinstance(record, dict):
+            continue
+        warnings = [
+            str(item)
+            for item in record.get("evaluation_warnings", [])
+        ]
+        broken = any("NameError" in item for item in warnings)
+        if not broken:
+            continue
+
+        scene_id = int(record.get("scene_id", 0))
+        scene = by_scene.get(scene_id)
+        selected_value = str(record.get("selected", ""))
+        selected = root / selected_value if selected_value else Path()
+        if not scene or not selected.exists():
+            continue
+
+        semantic_text = " | ".join((
+            str(scene.get("visual_contract_tr", "")),
+            str(scene.get("prompt_en", "")),
+            "mandatory: " + ", ".join(
+                str(item)
+                for item in scene.get("must_show", [])[:6]
+            ),
+        ))
+        quality, ocr, semantic, evaluation_warnings = (
+            safe_candidate_evaluation(
+                selected,
+                semantic_text,
+                config,
+            )
+        )
+        record["technical"] = quality
+        record["ocr"] = ocr
+        record["clip_score"] = semantic
+        record["evaluation_warnings"] = evaluation_warnings
+        record["warnings"] = [
+            *evaluation_warnings,
+            *visual_warnings(record, config),
+        ]
+        record["quality_rank"] = visual_rank(record, config)
+        record["quality_status"] = (
+            "pass" if not record["warnings"] else "warning"
+        )
+        record["quality_repaired_v1141"] = True
+        changed = True
+        log(
+            f"V11.4.1 QUALITY RESTORE: bölüm={chapter} "
+            f"sahne={scene_id} CLIP={semantic}"
+        )
+
+    if changed:
+        write_json(manifest_file, manifest)
+        write_visual_quality_report(root, chapter, manifest)
+    return changed
 
 
 def generate_visual_batch(
@@ -3182,6 +3393,10 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
     log(
         "V11.4 STRICT STORY LOCK: cümle-görsel kilidi, tek Charon ses izi ve anlatım odaklı sahne planı aktif."
     )
+    log(
+        "V11.4.1 CHARON RESILIENCE: 503 aynı sesle yeniden denenir; "
+        "başka sese geçilmez ve yoğunlukta checkpoint korunur."
+    )
     try:
         research_file = root / "research.json"
         research = read_json(research_file)
@@ -3258,6 +3473,16 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
                     break
                 if cstate.get("tts") == "ready":
                     continue
+                scenes = read_json(
+                    chapter_dir(root, index) / "scenes.json",
+                    [],
+                )
+                repair_broken_visual_metadata(
+                    root,
+                    index,
+                    scenes,
+                    config["images"],
+                )
                 script = read_json(chapter_dir(root, index) / "script.json")
                 used, complete = generate_tts_batch(root, index, script["narration"], config["tts"], gemini, tts_budget)
                 tts_budget -= used
@@ -3318,7 +3543,7 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
         report = root / "deliverables" / "ERROR_REPORT.txt"
         report.parent.mkdir(parents=True, exist_ok=True)
         report.write_text(
-            "UYKU VE TARİH V11.4.0 HATA RAPORU\n\n"
+            "UYKU VE TARİH V11.4.1 HATA RAPORU\n\n"
             f"Tür: {type(exc).__name__}\n"
             f"Mesaj: {exc}\n"
             f"Proje: {pid}\n"
