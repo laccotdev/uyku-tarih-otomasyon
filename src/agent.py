@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import time
 import wave
+import unicodedata
+from io import BytesIO
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -24,7 +26,7 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "11.3.0"
+VERSION = "11.3.1"
 PIPELINE_SCHEMA = "research-v2_story-v3_scenes-v3_voice-v3_edit-v2"
 VOICE_MASTER_VERSION = "charon-baritone-v3"
 EDITORIAL_RENDER_VERSION = "editorial-transitions-v2"
@@ -1759,34 +1761,319 @@ def clip_score(path: Path, text: str) -> float:
 
 
 class CloudflareImages:
+    """
+    Resilient Workers AI image provider.
+
+    FLUX.1 schnell's strict documented payload is prompt + optional steps.
+    A repaired prompt at the schema edge or an optional field can produce
+    HTTP 400 / code 8001. Each scene therefore uses progressively safer
+    request profiles and a second free Cloudflare-hosted image model.
+    """
+
     def __init__(self, config: dict[str, Any]):
         account = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
         token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
         if not account or not token:
-            raise ProviderUnavailable("Cloudflare account ID veya API token eksik.")
+            raise ProviderUnavailable(
+                "Cloudflare account ID veya API token eksik."
+            )
         self.config = config
-        self.endpoint = f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{config['model']}"
-        self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    def generate(self, prompt: str, seed: int, target: Path) -> None:
-        response = requests.post(
-            self.endpoint,
-            headers=self.headers,
-            json={"prompt": prompt[:2048], "steps": int(self.config["steps"]), "seed": int(seed)},
-            timeout=180,
+        self.account = account
+        self.base = (
+            "https://api.cloudflare.com/client/v4/accounts/"
+            f"{account}/ai/run"
         )
-        if response.status_code >= 400:
-            error = RuntimeError(f"Cloudflare HTTP {response.status_code}: {response.text[:1000]}")
-            if quota_error(error):
-                raise ControlledPause(str(error)) from error
-            raise ProviderUnavailable(str(error)) from error
-        payload = response.json()
-        result = payload.get("result", payload)
-        encoded = result.get("image") if isinstance(result, dict) else None
-        if not encoded:
-            raise ProviderUnavailable("Cloudflare görsel döndürmedi.")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(base64.b64decode(encoded))
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        self.primary_model = str(config["model"])
+        self.fallback_models = [
+            str(model)
+            for model in config.get(
+                "fallback_models",
+                ["@cf/bytedance/stable-diffusion-xl-lightning"],
+            )
+            if str(model).strip()
+        ]
+
+    @staticmethod
+    def safe_ascii(value: str) -> str:
+        normalized = unicodedata.normalize(
+            "NFKD",
+            str(value),
+        )
+        ascii_text = normalized.encode(
+            "ascii",
+            "ignore",
+        ).decode("ascii")
+        ascii_text = "".join(
+            char
+            if char.isprintable()
+            else " "
+            for char in ascii_text
+        )
+        return " ".join(ascii_text.split()).strip()
+
+    @classmethod
+    def byte_limited_prompt(
+        cls,
+        value: str,
+        maximum_bytes: int,
+    ) -> str:
+        clean = cls.safe_ascii(value)
+        if not clean:
+            clean = (
+                "Photorealistic historical documentary scene, "
+                "cinematic natural lighting, no visible writing."
+            )
+        while (
+            len(clean.encode("utf-8")) > maximum_bytes
+            and len(clean.split()) > 12
+        ):
+            words = clean.split()
+            keep = max(12, int(len(words) * 0.88))
+            clean = " ".join(words[:keep])
+        encoded = clean.encode("utf-8")[:maximum_bytes]
+        clean = encoded.decode("utf-8", "ignore").strip(" ,.;:-")
+        return clean or "Photorealistic historical documentary scene"
+
+    def endpoint(self, model: str) -> str:
+        return f"{self.base}/{model}"
+
+    @staticmethod
+    def decode_image_response(
+        response: requests.Response,
+    ) -> bytes:
+        content_type = str(
+            response.headers.get("Content-Type", "")
+        ).lower()
+
+        if content_type.startswith("image/"):
+            data = bytes(response.content)
+        else:
+            try:
+                payload = response.json()
+            except Exception as exc:
+                # Some diffusion models return a raw image stream without a
+                # reliable content-type header.
+                raw = bytes(response.content)
+                if raw.startswith((b"\xff\xd8", b"\x89PNG")):
+                    data = raw
+                else:
+                    raise ValueError(
+                        f"Cloudflare görsel cevabı çözülemedi: {exc}"
+                    ) from exc
+            else:
+                result = (
+                    payload.get("result", payload)
+                    if isinstance(payload, dict)
+                    else {}
+                )
+                encoded = (
+                    result.get("image")
+                    if isinstance(result, dict)
+                    else None
+                )
+                if not encoded:
+                    raise ValueError(
+                        "Cloudflare cevabında image alanı yok."
+                    )
+                data = base64.b64decode(encoded)
+
+        if len(data) < 1000:
+            raise ValueError(
+                f"Cloudflare görsel verisi çok küçük: {len(data)} bayt."
+            )
+        with Image.open(BytesIO(data)) as probe:
+            probe.verify()
+        return data
+
+    def request_profiles(
+        self,
+        prompt: str,
+        seed: int,
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        primary_long = self.byte_limited_prompt(
+            prompt,
+            int(self.config.get("prompt_max_bytes", 1250)),
+        )
+        primary_short = self.byte_limited_prompt(
+            prompt,
+            820,
+        )
+        primary_minimal = self.byte_limited_prompt(
+            prompt,
+            520,
+        )
+        safe_seed = int(seed) % 2_000_000_000
+        steps = max(
+            1,
+            min(8, int(self.config.get("steps", 4))),
+        )
+
+        profiles: list[tuple[str, str, dict[str, Any]]] = [
+            (
+                "flux-safe",
+                self.primary_model,
+                {
+                    "prompt": primary_long,
+                    "steps": steps,
+                },
+            ),
+            (
+                "flux-compact",
+                self.primary_model,
+                {
+                    "prompt": primary_short,
+                    "steps": min(4, steps),
+                },
+            ),
+            (
+                "flux-minimal",
+                self.primary_model,
+                {
+                    "prompt": primary_minimal,
+                },
+            ),
+        ]
+
+        negative = self.byte_limited_prompt(
+            str(self.config.get("negative_prompt", "")),
+            480,
+        )
+        for model in self.fallback_models:
+            profiles.append((
+                "sdxl-fallback",
+                model,
+                {
+                    "prompt": primary_short,
+                    "negative_prompt": negative,
+                    "width": 1024,
+                    "height": 576,
+                    "num_steps": 4,
+                    "guidance": 7.0,
+                    "seed": safe_seed,
+                },
+            ))
+            profiles.append((
+                "sdxl-minimal",
+                model,
+                {
+                    "prompt": primary_minimal,
+                },
+            ))
+        return profiles
+
+    def generate(
+        self,
+        prompt: str,
+        seed: int,
+        target: Path,
+    ) -> None:
+        failures: list[str] = []
+
+        for profile_name, model, payload in self.request_profiles(
+            prompt,
+            seed,
+        ):
+            endpoint = self.endpoint(model)
+
+            for transient_attempt in range(1, 3):
+                try:
+                    response = requests.post(
+                        endpoint,
+                        headers=self.headers,
+                        json=payload,
+                        timeout=180,
+                    )
+                except requests.RequestException as exc:
+                    failures.append(
+                        f"{profile_name}:network:{exc}"
+                    )
+                    if transient_attempt < 2:
+                        time.sleep(2.0)
+                        continue
+                    break
+
+                if response.status_code == 429:
+                    raise ControlledPause(
+                        "Cloudflare ücretsiz günlük görsel kotası doldu. "
+                        "Mevcut checkpointler korunarak sonraki çalışmada "
+                        "devam edilecek."
+                    )
+
+                if response.status_code in {401, 403, 404}:
+                    raise ProviderUnavailable(
+                        f"Cloudflare yetki/model hatası "
+                        f"HTTP {response.status_code}: "
+                        f"{response.text[:800]}"
+                    )
+
+                if response.status_code == 400:
+                    failures.append(
+                        f"{profile_name}:HTTP400:{response.text[:300]}"
+                    )
+                    log(
+                        "CLOUDFLARE INPUT GUARD: profil reddedildi; "
+                        f"sonraki güvenli profil deneniyor: "
+                        f"{profile_name}"
+                    )
+                    break
+
+                if response.status_code in {
+                    408, 500, 502, 503, 504,
+                }:
+                    failures.append(
+                        f"{profile_name}:HTTP{response.status_code}"
+                    )
+                    if transient_attempt < 2:
+                        time.sleep(2.5 * transient_attempt)
+                        continue
+                    break
+
+                if response.status_code >= 400:
+                    failures.append(
+                        f"{profile_name}:HTTP"
+                        f"{response.status_code}:"
+                        f"{response.text[:300]}"
+                    )
+                    break
+
+                try:
+                    data = self.decode_image_response(response)
+                except Exception as exc:
+                    failures.append(
+                        f"{profile_name}:decode:{exc}"
+                    )
+                    log(
+                        "CLOUDFLARE RESPONSE GUARD: görsel cevabı "
+                        f"geçersiz; sonraki profil deneniyor: "
+                        f"{profile_name}"
+                    )
+                    break
+
+                target.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+                target.write_bytes(data)
+                log(
+                    "Cloudflare görsel başarılı: "
+                    f"profil={profile_name}, model={model}, "
+                    f"prompt_bytes="
+                    f"{len(str(payload.get('prompt', '')).encode('utf-8'))}"
+                )
+                return
+
+        failure_text = " | ".join(failures[-8:])
+        raise ControlledPause(
+            "Cloudflare görsel servisi bütün güvenli istek "
+            "profillerini geçici olarak reddetti. Workflow kırılmadı; "
+            "checkpoint kaydedildi ve sonraki çalışmada aynı sahneden "
+            f"devam edecek. Ayrıntı: {failure_text}"
+        )
+
 
 
 def deterministic_seed(pid: str, chapter: int, scene: int, attempt: int) -> int:
@@ -1794,19 +2081,57 @@ def deterministic_seed(pid: str, chapter: int, scene: int, attempt: int) -> int:
     return int(hashlib.sha256(raw.encode()).hexdigest()[:8], 16)
 
 
-def image_prompt(topic: str, chapter_title: str, scene: dict[str, Any], config: dict[str, Any], repair: str = "") -> str:
-    return " ".join((
-        str(config["style_bible"]),
-        f"Main topic: {topic}.",
-        f"Chapter: {chapter_title}.",
-        f"Exact narrated event: {scene['narration']}",
-        f"Visual contract: {scene['visual_contract_tr']}.",
-        f"Scene direction: {scene['prompt_en']}.",
-        "Mandatory: " + ", ".join(str(x) for x in scene.get("must_show", [])) + ".",
-        "Never show: " + ", ".join(str(x) for x in scene.get("must_not_show", [])) + ".",
-        str(config["negative_prompt"]), repair,
-        "Absolutely no visible writing anywhere in the pixels.",
-    ))[:2048]
+def image_prompt(
+    topic: str,
+    chapter_title: str,
+    scene: dict[str, Any],
+    config: dict[str, Any],
+    repair: str = "",
+) -> str:
+    """
+    Produce a concise image-model prompt.
+
+    The full Turkish narration is intentionally not sent to Cloudflare.
+    scene.prompt_en already represents the exact narrated event and produces
+    better relevance with a much smaller, schema-safe request.
+    """
+    must_show = ", ".join(
+        str(item)
+        for item in scene.get("must_show", [])[:6]
+    )
+    must_not_show = ", ".join(
+        str(item)
+        for item in scene.get("must_not_show", [])[:6]
+    )
+    style = str(config.get("style_bible", "")).split(".")[0].strip()
+
+    prompt = " ".join((
+        style + ".",
+        f"Historical subject: {topic}.",
+        f"Story chapter: {chapter_title}.",
+        f"Exact scene: {scene.get('prompt_en', '')}.",
+        (
+            f"Required visible details: {must_show}."
+            if must_show
+            else ""
+        ),
+        (
+            f"Avoid: {must_not_show}."
+            if must_not_show
+            else ""
+        ),
+        "Photorealistic documentary film still, coherent single frame, "
+        "cinematic natural light, historically plausible clothing and "
+        "architecture, realistic anatomy, crisp detail, no collage.",
+        "No words, letters, numbers, captions, signs, logos, maps, "
+        "watermarks or pseudo-writing.",
+        repair,
+    ))
+    return CloudflareImages.byte_limited_prompt(
+        prompt,
+        int(config.get("prompt_max_bytes", 1250)),
+    )
+
 
 
 def make_storyboard(root: Path, chapter: int, scenes: list[dict[str, Any]], records: list[dict[str, Any]]) -> Path:
@@ -2022,6 +2347,7 @@ def generate_visual_batch(
 
         candidates: list[dict[str, Any]] = []
         repair = ""
+        pause_after_scene = False
 
         for attempt in range(
             1,
@@ -2041,16 +2367,36 @@ def generate_visual_batch(
                 repair,
             )
 
-            provider.generate(
-                prompt,
-                deterministic_seed(
-                    pid,
-                    chapter,
-                    scene_id,
-                    attempt,
-                ),
-                candidate,
-            )
+            try:
+                provider.generate(
+                    prompt,
+                    deterministic_seed(
+                        pid,
+                        chapter,
+                        scene_id,
+                        attempt,
+                    ),
+                    candidate,
+                )
+            except ControlledPause as exc:
+                if candidates:
+                    log(
+                        "CLOUDFLARE FAIL-SOFT: yeni aday üretilemedi; "
+                        f"mevcut sahne adayı seçilerek checkpoint "
+                        f"kaydedilecek. Sahne={scene_id}, hata={exc}"
+                    )
+                    pause_after_scene = True
+                    break
+                raise
+            except ProviderUnavailable as exc:
+                if candidates:
+                    log(
+                        "CLOUDFLARE FAIL-SOFT: ikinci aday başarısız; "
+                        f"ilk geçerli aday kullanılacak. "
+                        f"Sahne={scene_id}, hata={exc}"
+                    )
+                    break
+                raise
             used += 1
 
             with Image.open(candidate) as raw:
@@ -2183,6 +2529,9 @@ def generate_visual_batch(
                 f"Görsel seçildi: bölüm={chapter} "
                 f"sahne={scene_id} CLIP={best['clip_score']}"
             )
+
+        if pause_after_scene:
+            return used, False
 
     ordered = sorted(
         records.values(),
