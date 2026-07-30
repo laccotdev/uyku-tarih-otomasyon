@@ -26,9 +26,9 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "11.3.1"
-PIPELINE_SCHEMA = "research-v2_story-v3_scenes-v3_voice-v3_edit-v2"
-VOICE_MASTER_VERSION = "charon-baritone-v3"
+VERSION = "11.4.0"
+PIPELINE_SCHEMA = "research-v2_story-v3_scenes-v4_voice-v4_edit-v3"
+VOICE_MASTER_VERSION = "charon-baritone-v4"
 EDITORIAL_RENDER_VERSION = "editorial-transitions-v2"
 
 
@@ -1271,47 +1271,88 @@ def split_sentences(text: str) -> list[str]:
     return [item.strip() for item in re.split(r"(?<=[.!?])\s+", text) if item.strip()]
 
 
+def split_clauses(text: str) -> list[str]:
+    units: list[str] = []
+    for sentence in split_sentences(text):
+        sentence = " ".join(str(sentence).split())
+        if not sentence:
+            continue
+        pieces = [
+            piece.strip(" ,;:-")
+            for piece in re.split(r"(?<=[,;:])\s+", sentence)
+            if piece.strip(" ,;:-")
+        ]
+        if len(pieces) <= 1:
+            units.append(sentence)
+            continue
+        current: list[str] = []
+        current_words = 0
+        for piece in pieces:
+            words = word_count(piece)
+            if current and current_words + words > 14:
+                units.append(" ".join(current).strip())
+                current = []
+                current_words = 0
+            current.append(piece)
+            current_words += words
+        if current:
+            units.append(" ".join(current).strip())
+    return [unit for unit in units if unit]
+
+
 def scene_chunks(text: str, count: int) -> list[str]:
-    sentences = split_sentences(text)
-    total = max(1, sum(word_count(item) for item in sentences))
-    target = total / count
-    chunks, current, current_words = [], [], 0
-    for sentence in sentences:
-        words = word_count(sentence)
-        if current and current_words + words > target * 1.22 and len(chunks) < count - 1:
-            chunks.append(" ".join(current)); current = []; current_words = 0
-        current.append(sentence); current_words += words
-    if current:
-        chunks.append(" ".join(current))
+    units = split_clauses(text)
+    if not units:
+        units = split_sentences(text)
+    if not units:
+        return ["Anlatım yok."] * count
+
+    chunks = [" ".join(str(unit).split()) for unit in units if str(unit).strip()]
+
     while len(chunks) > count:
-        chunks[-2] += " " + chunks[-1]; chunks.pop()
-    while len(chunks) < count and chunks:
+        merge_index = min(
+            range(len(chunks) - 1),
+            key=lambda i: word_count(chunks[i]) + word_count(chunks[i + 1]),
+        )
+        chunks[merge_index:merge_index + 2] = [
+            f"{chunks[merge_index]} {chunks[merge_index + 1]}".strip()
+        ]
+
+    while len(chunks) < count:
         longest = max(range(len(chunks)), key=lambda i: word_count(chunks[i]))
-        parts = split_sentences(chunks[longest])
-        if len(parts) < 2:
+        pieces = [
+            piece.strip()
+            for piece in re.split(r"(?<=[,;:])\s+", chunks[longest])
+            if piece.strip()
+        ]
+        if len(pieces) >= 2:
+            midpoint = len(pieces) // 2
+            chunks[longest:longest + 1] = [
+                " ".join(pieces[:midpoint]).strip(),
+                " ".join(pieces[midpoint:]).strip(),
+            ]
+            continue
+        words = chunks[longest].split()
+        if len(words) < 8:
             break
-        midpoint = len(parts) // 2
+        midpoint = max(3, len(words) // 2)
         chunks[longest:longest + 1] = [
-            " ".join(parts[:midpoint]),
-            " ".join(parts[midpoint:]),
+            " ".join(words[:midpoint]).strip(),
+            " ".join(words[midpoint:]).strip(),
         ]
 
     if len(chunks) != count:
         words = " ".join(str(text).split()).split()
-        if not words:
-            words = ["Anlatım"]
         chunks = []
         for index in range(count):
             start = round(index * len(words) / count)
             end = round((index + 1) * len(words) / count)
             piece = " ".join(words[start:end]).strip()
             if not piece:
-                piece = words[min(start, len(words) - 1)]
+                piece = words[min(start, len(words) - 1)] if words else "Anlatım"
             chunks.append(piece)
-        log(
-            f"FAIL-SOFT SCENE SPLIT: metin kelime ağırlığıyla "
-            f"tam {count} sahneye ayrıldı."
-        )
+        log(f"STRICT STORY LOCK: anlatım tam {count} sahneye zorlandı.")
+
     return chunks
 
 
@@ -1434,194 +1475,57 @@ def create_scene_plan(
         return existing
 
     chunks = scene_chunks(script["narration"], count)
-
-    batch_size = max(3, math.ceil(count / 2))
     scenes: list[dict[str, Any]] = []
-    for batch_start in range(0, count, batch_size):
-        batch_chunks = chunks[batch_start:batch_start + batch_size]
-        batch_rows = [
-            {
-                "scene_id": batch_start + offset + 1,
-                "narration": narration,
-            }
-            for offset, narration in enumerate(batch_chunks)
+
+    for scene_id, narration in enumerate(chunks, start=1):
+        base = fallback_scene(
+            topic,
+            chapter,
+            narration,
+            scene_id,
+            reason="Strict story lock",
+        )
+        compact = " ".join(str(narration).split())
+        base["visual_contract_tr"] = compact[:420]
+        base["prompt_en"] = (
+            "Photorealistic historical documentary frame. "
+            f"Topic: {topic}. Chapter: {chapter.get('title', '')}. "
+            "Show exactly the narrated beat in a single coherent frame. "
+            f"Narration anchor: {compact[:700]}. "
+            "The main person or group, their visible action, and the place must all be on screen together. "
+            "Do not symbolize or generalize. No unrelated scenery. No visible text or letters."
+        )
+        base["must_show"] = [
+            compact[:180],
+            str(topic),
+            str(chapter.get("title", "")),
         ]
-        expected_ids = [row["scene_id"] for row in batch_rows]
-        prompt = f'''KONU: {topic}
-GÖRSEL KİMLİK: {bible.get('visual_identity', '')}
-BÖLÜM: {chapter}
-BU PARTİDEKİ ANLATIM PARÇALARI: {batch_rows}
-
-Yalnızca tek geçerli JSON nesnesi üret:
-{{"scenes":[{{"scene_id":1,"visual_contract_tr":"kişi+eylem+mekân","prompt_en":"professional English image prompt","must_show":["somut öğe"],"must_not_show":["dönem dışı öğe"],"importance":"normal"}}]}}
-
-Kurallar:
-- Yalnız şu scene_id değerlerini üret: {expected_ids}
-- Tam {len(batch_chunks)} sahne üret.
-- Anlatıcı ne diyorsa aynı kişi, eylem ve mekân karede doğrudan görünsün.
-- Genel manzara, rastgele kalabalık ve sembolik nesneyle kaçma.
-- Görsel içinde yazı, sayı, tabela, altyazı, logo, yazıt ve sahte alfabe olmasın.
-- prompt_en tek bir sinematik tarihsel anı açıkça tarif etsin.
-- Her sahne yalnız kendi anlatım parçasını görselleştirsin; önceki veya sonraki
-  olayları aynı kareye doldurma.
-- Art arda iki sahnede aynı kişi kadrajını veya aynı kamera ölçeğini tekrar etme.
-- importance değerini dönüm noktası, ilk sahne ve sonuç sahnesinde key yap.
-- İkinci JSON nesnesi veya açıklama ekleme.'''
-
-        model = "deterministic-scene-fallback"
-        raw_scenes: list[Any] = []
-        failure_reason = ""
-        try:
-            payload, model = gemini.json(
-                "Sen profesyonel tarih belgeseli görsel yönetmenisin.",
-                prompt,
-                0.12,
+        base["must_not_show"] = [
+            "unrelated scenery",
+            "symbolic abstraction",
+            "visible text",
+            "letters",
+            "numbers",
+            "subtitle",
+            "logo",
+            "watermark",
+            "modern objects",
+        ]
+        base["strict_story_lock"] = True
+        scenes.append(
+            normalize_scene(
+                base,
+                topic,
+                chapter,
+                narration,
+                scene_id,
+                "strict-story-lock",
             )
-            value = payload.get("scenes", [])
-            if isinstance(value, list):
-                raw_scenes = value
-            else:
-                failure_reason = (
-                    "Gemini scenes alanını liste döndürmedi."
-                )
-        except ControlledPause as exc:
-            failure_reason = f"Gemini kota duraklaması: {exc}"
-            log(
-                "SCENE PLAN FAIL-SOFT: Gemini kotası nedeniyle "
-                "anlatım-temelli sahne sözleşmesi kullanılacak."
-            )
-        except Exception as exc:
-            failure_reason = f"{type(exc).__name__}: {exc}"
-            log(
-                "SCENE PLAN FAIL-SOFT: bozuk JSON nedeniyle video "
-                f"üretimi durdurulmadı: {failure_reason}"
-            )
-
-        by_id: dict[int, Any] = {}
-        for raw_scene in raw_scenes:
-            if not isinstance(raw_scene, dict):
-                continue
-            try:
-                raw_id = int(raw_scene.get("scene_id"))
-            except (TypeError, ValueError):
-                continue
-            if raw_id in expected_ids and raw_id not in by_id:
-                by_id[raw_id] = raw_scene
-
-        for offset, narration in enumerate(batch_chunks):
-            scene_id = batch_start + offset + 1
-            raw_scene = by_id.get(scene_id)
-            if raw_scene is None and offset < len(raw_scenes):
-                raw_scene = raw_scenes[offset]
-            if raw_scene is None:
-                raw_scene = fallback_scene(
-                    topic,
-                    chapter,
-                    narration,
-                    scene_id,
-                    reason=(
-                        failure_reason
-                        or "Gemini eksik sahne döndürdü."
-                    ),
-                )
-            scenes.append(
-                normalize_scene(
-                    raw_scene,
-                    topic,
-                    chapter,
-                    narration,
-                    scene_id,
-                    model,
-                )
-            )
-
-        write_json(
-            target.with_name("scenes.partial.json"),
-            scenes,
-        )
-        log(
-            f"Sahne planı checkpoint: {len(scenes)}/{count} "
-            f"(parti={batch_start // batch_size + 1})"
         )
 
-    if len(scenes) != count:
-        existing_ids = {
-            int(scene.get("scene_id", 0))
-            for scene in scenes
-            if isinstance(scene, dict)
-        }
-        for scene_id, narration in enumerate(chunks, start=1):
-            if scene_id not in existing_ids:
-                scenes.append(
-                    fallback_scene(
-                        topic,
-                        chapter,
-                        narration,
-                        scene_id,
-                        reason="Eksik sahne otomatik tamamlandı.",
-                    )
-                )
-        scenes = sorted(
-            scenes,
-            key=lambda scene: int(scene.get("scene_id", 0)),
-        )[:count]
-        log(
-            f"FAIL-SOFT SCENE PLAN: sahne planı "
-            f"{len(scenes)}/{count} olarak otomatik tamamlandı."
-        )
     write_json(target, scenes)
-    target.with_name("scenes.partial.json").unlink(missing_ok=True)
-    fallback_count = sum(
-        1
-        for scene in scenes
-        if scene.get("planning_fallback")
-    )
-    log(
-        f"Sahne planı hazır: {len(scenes)} sahne, "
-        f"fail_soft={fallback_count}"
-    )
+    log(f"STRICT STORY LOCK: sahne planı hazır: {len(scenes)} sahne")
     return scenes
-
-
-def technical_quality(path: Path) -> dict[str, float]:
-    image = cv2.imread(str(path))
-    if image is None:
-        return {"sharpness": 0.0, "brightness": 0.0}
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    return {
-        "sharpness": round(float(cv2.Laplacian(gray, cv2.CV_64F).var()), 2),
-        "brightness": round(float(gray.mean()), 2),
-    }
-
-
-def ocr_report(path: Path, confidence: float) -> dict[str, Any]:
-    image = ImageOps.autocontrast(Image.open(path).convert("L"))
-    data = pytesseract.image_to_data(
-        image, lang="eng+tur", config="--psm 11",
-        output_type=pytesseract.Output.DICT,
-    )
-    tokens, total = [], 0
-    for raw_text, raw_conf in zip(data.get("text", []), data.get("conf", [])):
-        clean = "".join(char for char in str(raw_text) if char.isalnum())
-        try:
-            score = float(raw_conf)
-        except (TypeError, ValueError):
-            score = -1
-        if score >= confidence and len(clean) >= 3:
-            tokens.append({"text": clean, "confidence": round(score, 1)})
-            total += len(clean)
-    return {"tokens": tokens[:15], "total_chars": total}
-
-
-@lru_cache(maxsize=1)
-def clip_components():
-    import torch
-    from transformers import CLIPModel, CLIPProcessor
-    name = "openai/clip-vit-base-patch32"
-    model = CLIPModel.from_pretrained(name)
-    processor = CLIPProcessor.from_pretrained(name)
-    model.eval()
-    return torch, model, processor
 
 
 def compact_clip_text(value: str, max_words: int = 52) -> str:
@@ -2088,13 +1992,6 @@ def image_prompt(
     config: dict[str, Any],
     repair: str = "",
 ) -> str:
-    """
-    Produce a concise image-model prompt.
-
-    The full Turkish narration is intentionally not sent to Cloudflare.
-    scene.prompt_en already represents the exact narrated event and produces
-    better relevance with a much smaller, schema-safe request.
-    """
     must_show = ", ".join(
         str(item)
         for item in scene.get("must_show", [])[:6]
@@ -2104,11 +2001,14 @@ def image_prompt(
         for item in scene.get("must_not_show", [])[:6]
     )
     style = str(config.get("style_bible", "")).split(".")[0].strip()
+    narration_anchor = CloudflareImages.safe_ascii(scene.get("narration", ""))[:700]
 
     prompt = " ".join((
         style + ".",
         f"Historical subject: {topic}.",
         f"Story chapter: {chapter_title}.",
+        "Strict rule: depict only the exact narrated moment; the narration anchor is the highest-priority instruction.",
+        f"Narration anchor: {narration_anchor}.",
         f"Exact scene: {scene.get('prompt_en', '')}.",
         (
             f"Required visible details: {must_show}."
@@ -2120,18 +2020,15 @@ def image_prompt(
             if must_not_show
             else ""
         ),
-        "Photorealistic documentary film still, coherent single frame, "
-        "cinematic natural light, historically plausible clothing and "
-        "architecture, realistic anatomy, crisp detail, no collage.",
-        "No words, letters, numbers, captions, signs, logos, maps, "
-        "watermarks or pseudo-writing.",
+        "Photorealistic documentary film still, coherent single frame, cinematic natural light, historically plausible clothing and architecture, realistic anatomy, crisp detail.",
+        "No words, letters, numbers, captions, signs, logos, watermarks or pseudo-writing.",
+        "No symbolic cutaways, no generic scenery, no unrelated atmosphere shots.",
         repair,
     ))
     return CloudflareImages.byte_limited_prompt(
         prompt,
         int(config.get("prompt_max_bytes", 1250)),
     )
-
 
 
 def make_storyboard(root: Path, chapter: int, scenes: list[dict[str, Any]], records: list[dict[str, Any]]) -> Path:
@@ -2564,16 +2461,10 @@ def generate_visual_batch(
 
 
 def audio_chunks(text: str, target_words: int) -> list[str]:
-    sentences = split_sentences(text)
-    output, current, current_words = [], [], 0
-    for sentence in sentences:
-        words = word_count(sentence)
-        if current and current_words + words > target_words:
-            output.append(" ".join(current)); current = []; current_words = 0
-        current.append(sentence); current_words += words
-    if current:
-        output.append(" ".join(current))
-    return output
+    clean = " ".join(str(text).split())
+    if not clean:
+        return []
+    return [clean]
 
 
 def write_pcm(path: Path, pcm: bytes, sample_rate: int = 24000) -> None:
@@ -2602,9 +2493,9 @@ def normalize_voice(
     actual_wpm = words / max(seconds, 1) * 60
     requested = float(config["target_wpm"]) / max(actual_wpm, 1.0)
     tempo = max(
-        float(config.get("minimum_tempo_factor", 0.92)),
+        float(config.get("minimum_tempo_factor", 0.97)),
         min(
-            float(config.get("maximum_tempo_factor", 1.06)),
+            float(config.get("maximum_tempo_factor", 1.03)),
             requested,
         ),
     )
@@ -2617,13 +2508,13 @@ def normalize_voice(
 
     audio_filter = ",".join((
         atempo_chain(tempo),
-        "highpass=f=52",
-        "lowpass=f=10500",
-        "equalizer=f=115:t=q:w=0.8:g=3.2",
-        "equalizer=f=220:t=q:w=1.0:g=1.8",
-        "equalizer=f=3500:t=q:w=1.2:g=-1.2",
-        "acompressor=threshold=-22dB:ratio=2.2:attack=20:release=220:makeup=2",
-        "loudnorm=I=-16:TP=-1.5:LRA=6",
+        "highpass=f=48",
+        "lowpass=f=9800",
+        "equalizer=f=105:t=q:w=0.8:g=4.0",
+        "equalizer=f=185:t=q:w=1.0:g=2.4",
+        "equalizer=f=3200:t=q:w=1.1:g=-1.4",
+        "acompressor=threshold=-23dB:ratio=2.4:attack=18:release=240:makeup=2.5",
+        "loudnorm=I=-16:TP=-1.5:LRA=5.5",
     ))
 
     run([
@@ -3202,36 +3093,48 @@ def reset_for_pipeline_upgrade(
     state: dict[str, Any],
 ) -> None:
     previous = state.get("pipeline_schema", "legacy")
-    for path in (
-        root / "research.json",
-        root / "story_bible.json",
-    ):
-        path.unlink(missing_ok=True)
-    shutil.rmtree(root / "chapters", ignore_errors=True)
+    chapters_root = root / "chapters"
+    if chapters_root.exists():
+        for chapter_dir_path in sorted(chapters_root.glob("[0-9][0-9]")):
+            for name in [
+                "scenes.json",
+                "scenes.partial.json",
+                "visual_manifest.json",
+                "voice-report.json",
+                "narration.flac",
+                "chapter.mp4",
+                "render-version.json",
+            ]:
+                (chapter_dir_path / name).unlink(missing_ok=True)
+            shutil.rmtree(chapter_dir_path / "visuals", ignore_errors=True)
+            shutil.rmtree(chapter_dir_path / "tts", ignore_errors=True)
+            shutil.rmtree(chapter_dir_path / "render", ignore_errors=True)
     shutil.rmtree(root / "deliverables", ignore_errors=True)
-    state.clear()
+
+    chapters_state = state.setdefault("chapters", {})
+    for _, chapter_state in list(chapters_state.items()):
+        if isinstance(chapter_state, dict):
+            chapter_state.pop("scenes", None)
+            chapter_state.pop("visuals", None)
+            chapter_state.pop("tts", None)
+            chapter_state.pop("render", None)
+            chapter_state.pop("video_seconds", None)
+            chapter_state["script"] = "ready"
     state.update({
         "version": VERSION,
         "pipeline_schema": PIPELINE_SCHEMA,
         "status": "created",
-        "chapters": {},
         "migration": {
             "from": previous,
             "to": PIPELINE_SCHEMA,
-            "reason": (
-                "Yeni araştırma filtresi, hikâye editörü, tok Charon "
-                "masteringi ve profesyonel geçiş kurgusu"
-            ),
-            "at": time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ",
-                time.gmtime(),
-            ),
+            "reason": "Strict story lock: cümle-görsel eşleşmesi ve tek Charon anlatıcı izi",
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
     })
     log(
-        "V11.3 EDITORIAL MIGRATION: eski senaryo/ses/render "
-        "checkpointleri temizlendi; konu baştan profesyonel akışla kuruluyor."
+        "V11.4 STRICT STORY MIGRATION: araştırma ve senaryo korundu; sahne planı, görseller, ses ve render strict lock ile yeniden kurulacak."
     )
+
 
 def state_template(pid: str, topic: str, minutes: int) -> dict[str, Any]:
     return {
@@ -3277,8 +3180,7 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
         f"chapter_hard_min={profile['hard_minimum_chapter_words']}"
     )
     log(
-        "V11.3 EDITORIAL DIRECTOR: güçlü hikâye omurgası, daha sık sahne, "
-        "gerçek geçişler ve tok Charon mastering aktif."
+        "V11.4 STRICT STORY LOCK: cümle-görsel kilidi, tek Charon ses izi ve anlatım odaklı sahne planı aktif."
     )
     try:
         research_file = root / "research.json"
@@ -3416,7 +3318,7 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
         report = root / "deliverables" / "ERROR_REPORT.txt"
         report.parent.mkdir(parents=True, exist_ok=True)
         report.write_text(
-            "UYKU VE TARİH V11.3.0 HATA RAPORU\n\n"
+            "UYKU VE TARİH V11.4.0 HATA RAPORU\n\n"
             f"Tür: {type(exc).__name__}\n"
             f"Mesaj: {exc}\n"
             f"Proje: {pid}\n"
