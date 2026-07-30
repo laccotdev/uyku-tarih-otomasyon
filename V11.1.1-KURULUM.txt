@@ -1,0 +1,23 @@
+V11.1.1 — RELIABLE RESEARCH HOTFIX
+
+Artifact sonucu:
+- ZIP 1.096 bayt
+- Yalnız state.json ve agent.log
+- Video, research.json ve story_bible.json yok
+- Wikipedia 429 hataları
+- İkinci Gemini çağrısından sonra sessiz kesilme
+
+Düzeltmeler:
+- Wikipedia arama ve içerik tek istekte
+- Sorgu sayısı azaltıldı
+- 429 Retry-After ve exponential backoff
+- İstekler arasında bekleme
+- Eksik Gemini kaynak listesi güvenli tamamlanır
+- set -o pipefail ve stderr loglama
+- Bilinmeyen hata state.json ve ERROR_REPORT.txt içinde kalır
+
+Yüklenecek dosyalar:
+src/agent.py
+config/defaults.yaml
+.github/workflows/start-video.yml
+.github/workflows/continue-video.yml

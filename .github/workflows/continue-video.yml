@@ -62,7 +62,8 @@ jobs:
         if: steps.active.outputs.active == 'true'
         id: agent
         run: |
-          python src/agent.py step --topic "${{ steps.active.outputs.topic }}" --minutes "${{ steps.active.outputs.minutes }}" --project-id "${{ steps.active.outputs.project_id }}" | tee agent.log
+          set -o pipefail
+          python src/agent.py step --topic "${{ steps.active.outputs.topic }}" --minutes "${{ steps.active.outputs.minutes }}" --project-id "${{ steps.active.outputs.project_id }}" 2>&1 | tee agent.log
           STATUS="$(grep 'PROJECT_STATUS=' agent.log | tail -1 | cut -d= -f2)"
           echo "status=${STATUS:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Proje cache kaydet
@@ -85,6 +86,7 @@ jobs:
           path: |
             data/${{ steps.active.outputs.project_id }}/state.json
             data/${{ steps.active.outputs.project_id }}/deliverables/storyboard-*.jpg
+            data/${{ steps.active.outputs.project_id }}/deliverables/ERROR_REPORT.txt
             agent.log
           if-no-files-found: ignore
           retention-days: 7

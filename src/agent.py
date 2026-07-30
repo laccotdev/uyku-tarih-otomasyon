@@ -24,7 +24,7 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "11.1.0"
+VERSION = "11.1.1"
 
 
 class ControlledPause(RuntimeError):
@@ -198,31 +198,127 @@ WIKI = {
 }
 
 
-def wiki_search(session: requests.Session, language: str, query: str, limit: int) -> list[dict[str, Any]]:
+def wiki_request(
+    session: requests.Session,
+    endpoint: str,
+    params: dict[str, Any],
+    *,
+    attempts: int = 5,
+) -> requests.Response:
+    """Wikimedia-friendly request with Retry-After and exponential backoff."""
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.get(
+                endpoint,
+                params={**params, "maxlag": 5},
+                timeout=45,
+            )
+            if response.status_code == 429:
+                retry_header = response.headers.get("Retry-After", "").strip()
+                try:
+                    wait = float(retry_header)
+                except ValueError:
+                    wait = min(35.0, 3.5 * (2 ** (attempt - 1)))
+                log(
+                    "Wikipedia 429; yeniden denenecek: "
+                    f"deneme={attempt}/{attempts}, bekleme={wait:.1f}s"
+                )
+                time.sleep(wait)
+                continue
+            if response.status_code in {500, 502, 503, 504}:
+                wait = min(30.0, 2.5 * (2 ** (attempt - 1)))
+                log(
+                    "Wikipedia geçici sunucu hatası; yeniden denenecek: "
+                    f"HTTP={response.status_code}, bekleme={wait:.1f}s"
+                )
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            wait = min(30.0, 2.5 * (2 ** (attempt - 1)))
+            log(
+                "Wikipedia bağlantısı yeniden denenecek: "
+                f"deneme={attempt}/{attempts}, bekleme={wait:.1f}s, hata={exc}"
+            )
+            time.sleep(wait)
+    raise ProviderUnavailable(
+        f"Wikipedia isteği {attempts} denemede tamamlanamadı: {last_error}"
+    )
+
+
+def wiki_search(
+    session: requests.Session,
+    language: str,
+    query: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Search and fetch extracts in one MediaWiki request."""
     endpoint = WIKI[language]
-    response = session.get(endpoint, params={
-        "action": "query", "list": "search", "srsearch": query,
-        "srnamespace": 0, "srlimit": limit, "format": "json", "formatversion": 2,
-    }, timeout=30)
-    response.raise_for_status()
-    ids = [str(item["pageid"]) for item in response.json().get("query", {}).get("search", [])]
-    if not ids:
-        return []
-    response = session.get(endpoint, params={
-        "action": "query", "pageids": "|".join(ids), "prop": "extracts|info",
-        "explaintext": 1, "exchars": 6000, "inprop": "url",
-        "format": "json", "formatversion": 2,
-    }, timeout=30)
-    response.raise_for_status()
+    response = wiki_request(
+        session,
+        endpoint,
+        {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrnamespace": 0,
+            "gsrlimit": max(2, min(limit, 5)),
+            "prop": "extracts|info",
+            "explaintext": 1,
+            "exchars": 6000,
+            "inprop": "url",
+            "format": "json",
+            "formatversion": 2,
+        },
+    )
+    pages = response.json().get("query", {}).get("pages", [])
     return [{
         "language": language,
         "title": page.get("title", ""),
         "url": page.get("fullurl", ""),
         "extract": " ".join(page.get("extract", "").split()),
-    } for page in response.json().get("query", {}).get("pages", [])]
+    } for page in pages]
 
 
-def build_research(topic: str, config: dict[str, Any], gemini: Gemini) -> dict[str, Any]:
+def research_terms(value: str) -> set[str]:
+    ignored = {
+        "ve", "ile", "bir", "bu", "şu", "icin", "için", "nasil", "nasıl",
+        "nedir", "kimdir", "nerede", "neden", "tarihi", "history", "the",
+        "and", "of", "in", "how", "what", "why",
+    }
+    return {
+        token
+        for token in slugify(value).replace("-", " ").split()
+        if len(token) >= 3 and token not in ignored
+    }
+
+
+def lexical_source_score(
+    source: dict[str, Any],
+    reference: str,
+) -> int:
+    reference_terms = research_terms(reference)
+    title_terms = research_terms(str(source.get("title", "")))
+    extract_terms = research_terms(str(source.get("extract", ""))[:1500])
+    title_overlap = len(reference_terms & title_terms)
+    extract_overlap = len(reference_terms & extract_terms)
+    return (
+        title_overlap * 50
+        + min(35, extract_overlap * 5)
+        + (10 if len(str(source.get("extract", ""))) >= 600 else 0)
+    )
+
+
+def build_research(
+    topic: str,
+    config: dict[str, Any],
+    gemini: Gemini,
+) -> dict[str, Any]:
     resolver, resolver_model = gemini.json(
         "Sen evrensel bir tarih araştırma editörüsün.",
         f'''KONU: {topic}
@@ -230,26 +326,53 @@ Geçerli JSON üret:
 {{
   "canonical_tr": "doğru kısa Türkçe ad",
   "canonical_en": "uluslararası veya İngilizce ad",
-  "queries_tr": ["6 somut arama sorgusu"],
-  "queries_en": ["6 concrete search queries"],
+  "queries_tr": ["en fazla 4 somut arama sorgusu"],
+  "queries_en": ["at most 4 concrete search queries"],
   "scope": "konunun sınırı ve yanlış benzer eşleşmeler"
 }}
-Kurallar: soru eklerini temizle, özel isimleri doğru çöz, konuya özel sabit kod kullanma.''',
+Kurallar:
+- Soru eklerini ve gündelik ifadeleri kanonik addan çıkar.
+- Özel isimleri, savaşları, eserleri, kişileri ve olayları doğru çöz.
+- Konuya özel sabit kod kullanma.
+- Aynı anlamı taşıyan gereksiz sorgular üretme.''',
         0.15,
     )
     queries = {
-        "tr": [resolver["canonical_tr"], *resolver.get("queries_tr", [])],
-        "en": [resolver["canonical_en"], *resolver.get("queries_en", [])],
+        "tr": list(dict.fromkeys([
+            str(resolver.get("canonical_tr", topic)),
+            *[str(item) for item in resolver.get("queries_tr", [])],
+        ]))[:4],
+        "en": list(dict.fromkeys([
+            str(resolver.get("canonical_en", topic)),
+            *[str(item) for item in resolver.get("queries_en", [])],
+        ]))[:4],
     }
+
     session = requests.Session()
-    session.headers["User-Agent"] = "UykuTarihV11.1/1.0"
-    candidates, seen = [], set()
+    session.headers.update({
+        "User-Agent": (
+            "UykuTarihV11.1.1/1.0 "
+            "(GitHub Actions educational documentary research)"
+        ),
+        "Accept": "application/json",
+    })
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for language in config["languages"]:
-        for query in queries[language][:7]:
+        for query_index, query in enumerate(queries[language], start=1):
             try:
-                results = wiki_search(session, language, query, int(config["results_per_query"]))
+                results = wiki_search(
+                    session,
+                    language,
+                    query,
+                    min(int(config["results_per_query"]), 5),
+                )
             except Exception as exc:
-                log(f"Wikipedia atlandı ({language}/{query}): {exc}")
+                log(
+                    f"Wikipedia sorgusu kullanılamadı "
+                    f"({language}/{query}): {exc}"
+                )
                 continue
             for item in results:
                 key = item.get("url") or f"{language}:{item['title']}"
@@ -257,34 +380,99 @@ Kurallar: soru eklerini temizle, özel isimleri doğru çöz, konuya özel sabit
                     seen.add(key)
                     item["matched_query"] = query
                     candidates.append(item)
+            if query_index < len(queries[language]):
+                time.sleep(1.4)
+
     if not candidates:
-        raise QualityGateError("Araştırma adayı bulunamadı.")
+        raise QualityGateError(
+            "Araştırma adayı bulunamadı. Wikipedia geçici olarak "
+            "kullanılamadıysa checkpoint korunarak sonraki çalışmada yeniden denenir."
+        )
+
+    reference = " | ".join((
+        topic,
+        str(resolver.get("canonical_tr", "")),
+        str(resolver.get("canonical_en", "")),
+        str(resolver.get("scope", "")),
+    ))
+    for item in candidates:
+        item["lexical_score"] = lexical_source_score(item, reference)
+    candidates.sort(
+        key=lambda item: int(item.get("lexical_score", 0)),
+        reverse=True,
+    )
+
     compact = [{
-        "id": i, "title": item["title"], "language": item["language"],
+        "id": index,
+        "title": item["title"],
+        "language": item["language"],
+        "matched_query": item.get("matched_query", ""),
         "extract": item["extract"][:900],
-    } for i, item in enumerate(candidates[:30], 1)]
+    } for index, item in enumerate(candidates[:30], 1)]
+
     selection, selection_model = gemini.json(
         "Sen kaynak alaka denetçisisin. Yalnız verilen adayları değerlendir.",
         f'''KONU: {topic}
 KANONİK KONU: {resolver}
 ADAYLAR: {compact}
+
 Geçerli JSON:
-{{"selected_ids":[4-12 id],"research_summary":"seçilen kaynaklara dayalı özet"}}
-Benzer isimli farklı kişi veya olayları reddet.''',
+{{
+  "selected_ids": [1, 2, 3, 4],
+  "research_summary": "yalnız seçilen kaynaklara dayalı özet",
+  "rejected_examples": ["yanlış eşleşmelerin kısa nedenleri"]
+}}
+
+Kurallar:
+- 4 ile 12 arasında geçerli aday kimliği seç.
+- Benzer isimli farklı kişi veya olayları reddet.
+- Başlıkta tek bir ortak kelime bulunması yeterli değildir.''',
         0.05,
     )
-    wanted = {int(value) for value in selection.get("selected_ids", [])}
-    selected = [item for i, item in enumerate(candidates[:30], 1) if i in wanted]
-    if len(selected) < int(config["minimum_sources"]):
-        raise QualityGateError(f"Alakalı kaynak yetersiz: {len(selected)}/{config['minimum_sources']}")
+
+    valid_ids = set(range(1, len(compact) + 1))
+    wanted: list[int] = []
+    for value in selection.get("selected_ids", []):
+        try:
+            candidate_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if candidate_id in valid_ids and candidate_id not in wanted:
+            wanted.append(candidate_id)
+
+    minimum = int(config["minimum_sources"])
+    if len(wanted) < minimum:
+        log(
+            "Gemini kaynak listesi eksik döndü; kanonik konuya göre "
+            "deterministik kaynak tamamlama uygulanıyor."
+        )
+        for candidate_id in range(1, len(compact) + 1):
+            if candidate_id not in wanted:
+                wanted.append(candidate_id)
+            if len(wanted) >= minimum:
+                break
+
+    selected = [
+        candidates[candidate_id - 1]
+        for candidate_id in wanted[:12]
+    ]
+    if len(selected) < minimum:
+        raise QualityGateError(
+            f"Alakalı kaynak yetersiz: {len(selected)}/{minimum}"
+        )
+
     return {
         "topic": topic,
         "resolver": resolver,
         "resolver_model": resolver_model,
         "selection_model": selection_model,
         "research_summary": selection.get("research_summary", ""),
+        "rejected_examples": selection.get("rejected_examples", []),
         "sources": selected,
+        "research_version": VERSION,
     }
+
+
 
 
 SYSTEM = '''Sen kıdemli tarih belgeseli yazarı ve editörüsün. Yalnız verilen
@@ -921,9 +1109,45 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
             state["status"] = "waiting_for_next_run"
             write_json(state_file, state)
     except ControlledPause as exc:
-        state["status"] = "paused_quota"; state["pause_reason"] = str(exc); write_json(state_file, state)
+        state["status"] = "paused_quota"
+        state["pause_reason"] = str(exc)
+        write_json(state_file, state)
         log(f"KONTROLLÜ DURAKLAMA: {exc}")
-    state["storage"] = clean_project(root, float(config["project"]["maximum_cache_gb"]))
+    except Exception as exc:
+        state["status"] = "failed"
+        state["error_type"] = type(exc).__name__
+        state["error_message"] = str(exc)
+        state["failed_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(),
+        )
+        write_json(state_file, state)
+        report = root / "deliverables" / "ERROR_REPORT.txt"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(
+            "UYKU VE TARİH V11.1.1 HATA RAPORU\n\n"
+            f"Tür: {type(exc).__name__}\n"
+            f"Mesaj: {exc}\n"
+            f"Proje: {pid}\n"
+            f"Konu: {topic}\n",
+            encoding="utf-8",
+        )
+        log(
+            "FATAL ERROR SAVED: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        try:
+            state["storage"] = clean_project(
+                root,
+                float(config["project"]["maximum_cache_gb"]),
+            )
+            write_json(state_file, state)
+        finally:
+            raise
+    state["storage"] = clean_project(
+        root,
+        float(config["project"]["maximum_cache_gb"]),
+    )
     write_json(state_file, state)
     return state
 

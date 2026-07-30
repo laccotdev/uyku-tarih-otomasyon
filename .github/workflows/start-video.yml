@@ -69,7 +69,8 @@ jobs:
       - name: Ajanı çalıştır
         id: agent
         run: |
-          python src/agent.py step --topic "${{ inputs.topic }}" --minutes "${{ inputs.minutes }}" --project-id "${{ steps.project.outputs.id }}" | tee agent.log
+          set -o pipefail
+          python src/agent.py step --topic "${{ inputs.topic }}" --minutes "${{ inputs.minutes }}" --project-id "${{ steps.project.outputs.id }}" 2>&1 | tee agent.log
           STATUS="$(grep 'PROJECT_STATUS=' agent.log | tail -1 | cut -d= -f2)"
           echo "status=${STATUS:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Proje cache kaydet
@@ -94,6 +95,7 @@ jobs:
             data/${{ steps.project.outputs.id }}/research.json
             data/${{ steps.project.outputs.id }}/story_bible.json
             data/${{ steps.project.outputs.id }}/deliverables/storyboard-*.jpg
+            data/${{ steps.project.outputs.id }}/deliverables/ERROR_REPORT.txt
             agent.log
           if-no-files-found: ignore
           retention-days: 7
