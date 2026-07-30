@@ -24,7 +24,10 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "11.2.0"
+VERSION = "11.3.0"
+PIPELINE_SCHEMA = "research-v2_story-v3_scenes-v3_voice-v3_edit-v2"
+VOICE_MASTER_VERSION = "charon-baritone-v3"
+EDITORIAL_RENDER_VERSION = "editorial-transitions-v2"
 
 
 class ControlledPause(RuntimeError):
@@ -375,21 +378,19 @@ def build_research(
     resolver, resolver_model = gemini.json(
         "Sen evrensel bir tarih araştırma editörüsün.",
         f'''KONU: {topic}
-Geçerli JSON üret:
+Geçerli JSON:
 {{
   "canonical_tr": "doğru kısa Türkçe ad",
   "canonical_en": "uluslararası veya İngilizce ad",
-  "queries_tr": ["en fazla 4 somut arama sorgusu"],
-  "queries_en": ["at most 4 concrete search queries"],
-  "scope": "konunun sınırı ve yanlış benzer eşleşmeler"
+  "queries_tr": ["en fazla 4 somut sorgu"],
+  "queries_en": ["at most 4 concrete queries"],
+  "scope": "konunun sınırı ve karıştırılmaması gereken benzer konular"
 }}
-Kurallar:
-- Soru eklerini ve gündelik ifadeleri kanonik addan çıkar.
-- Özel isimleri, savaşları, eserleri, kişileri ve olayları doğru çöz.
-- Konuya özel sabit kod kullanma.
-- Aynı anlamı taşıyan gereksiz sorgular üretme.''',
-        0.15,
+Soru eklerini temizle. Özel isim, savaş, kişi, eser ve olayı kanonik biçimde
+çöz. Aynı anlamı taşıyan gereksiz sorgular üretme.''',
+        0.12,
     )
+
     queries = {
         "tr": list(dict.fromkeys([
             str(resolver.get("canonical_tr", topic)),
@@ -404,7 +405,7 @@ Kurallar:
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
-            "UykuTarihV11.1.1/1.0 "
+            "UykuTarihV11.3/1.0 "
             "(GitHub Actions educational documentary research)"
         ),
         "Accept": "application/json",
@@ -427,20 +428,19 @@ Kurallar:
                     f"({language}/{query}): {exc}"
                 )
                 continue
+
             for item in results:
                 key = item.get("url") or f"{language}:{item['title']}"
                 if key not in seen and len(item.get("extract", "")) >= 250:
                     seen.add(key)
                     item["matched_query"] = query
                     candidates.append(item)
+
             if query_index < len(queries[language]):
                 time.sleep(1.4)
 
     if not candidates:
-        raise QualityGateError(
-            "Araştırma adayı bulunamadı. Wikipedia geçici olarak "
-            "kullanılamadıysa checkpoint korunarak sonraki çalışmada yeniden denenir."
-        )
+        raise QualityGateError("Araştırma adayı bulunamadı.")
 
     reference = " | ".join((
         topic,
@@ -460,58 +460,84 @@ Kurallar:
         "title": item["title"],
         "language": item["language"],
         "matched_query": item.get("matched_query", ""),
-        "extract": item["extract"][:900],
+        "lexical_score": item.get("lexical_score", 0),
+        "extract": item["extract"][:1000],
     } for index, item in enumerate(candidates[:30], 1)]
 
     selection, selection_model = gemini.json(
-        "Sen kaynak alaka denetçisisin. Yalnız verilen adayları değerlendir.",
+        "Sen çok katı bir kaynak alaka denetçisisin.",
         f'''KONU: {topic}
 KANONİK KONU: {resolver}
 ADAYLAR: {compact}
 
 Geçerli JSON:
 {{
-  "selected_ids": [1, 2, 3, 4],
-  "research_summary": "yalnız seçilen kaynaklara dayalı özet",
-  "rejected_examples": ["yanlış eşleşmelerin kısa nedenleri"]
+  "selected_ids": [gerçekten doğrudan alakalı 1-8 id],
+  "rejected_ids": [benzer isimli, yan konu veya alakasız id],
+  "research_summary": "yalnız seçilen kaynaklara dayalı araştırma çerçevesi",
+  "story_facts": ["hikâyede mutlaka korunacak somut olay ve bilgiler"]
 }}
 
 Kurallar:
-- 4 ile 12 arasında geçerli aday kimliği seç.
-- Benzer isimli farklı kişi veya olayları reddet.
-- Başlıkta tek bir ortak kelime bulunması yeterli değildir.''',
-        0.05,
+- Kaynak sayısını doldurmak için alakasız aday seçme.
+- Başlığında tek ortak kelime olması yeterli değildir.
+- Başka destan, başka kişi, başka savaş veya yalnız anlatım tekniğini açıklayan
+  yan maddeleri ana kaynak olarak seçme.
+- Bir veya iki güçlü kaynak, dört zayıf kaynaktan daha iyidir.''',
+        0.03,
     )
 
     valid_ids = set(range(1, len(compact) + 1))
+    rejected: set[int] = set()
+    for value in selection.get("rejected_ids", []):
+        try:
+            candidate_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if candidate_id in valid_ids:
+            rejected.add(candidate_id)
+
     wanted: list[int] = []
     for value in selection.get("selected_ids", []):
         try:
             candidate_id = int(value)
         except (TypeError, ValueError):
             continue
-        if candidate_id in valid_ids and candidate_id not in wanted:
+        if (
+            candidate_id in valid_ids
+            and candidate_id not in rejected
+            and candidate_id not in wanted
+        ):
             wanted.append(candidate_id)
 
-    minimum = int(config["minimum_sources"])
+    minimum = max(1, int(config.get("minimum_sources", 2)))
     if len(wanted) < minimum:
-        log(
-            "Gemini kaynak listesi eksik döndü; kanonik konuya göre "
-            "deterministik kaynak tamamlama uygulanıyor."
-        )
-        for candidate_id in range(1, len(compact) + 1):
-            if candidate_id not in wanted:
-                wanted.append(candidate_id)
+        for candidate_id, item in enumerate(candidates[:30], start=1):
+            if candidate_id in rejected or candidate_id in wanted:
+                continue
+            if int(item.get("lexical_score", 0)) < 20:
+                continue
+            wanted.append(candidate_id)
             if len(wanted) >= minimum:
+                break
+
+    if not wanted:
+        for candidate_id in range(1, len(compact) + 1):
+            if candidate_id not in rejected:
+                wanted.append(candidate_id)
                 break
 
     selected = [
         candidates[candidate_id - 1]
-        for candidate_id in wanted[:12]
+        for candidate_id in wanted[:8]
     ]
+    if not selected:
+        raise QualityGateError("Alakalı araştırma kaynağı seçilemedi.")
+
     if len(selected) < minimum:
-        raise QualityGateError(
-            f"Alakalı kaynak yetersiz: {len(selected)}/{minimum}"
+        log(
+            "FAIL-SOFT RESEARCH: yalnız "
+            f"{len(selected)} güçlü kaynak bulundu; alakasız kaynak eklenmedi."
         )
 
     return {
@@ -520,19 +546,24 @@ Kurallar:
         "resolver_model": resolver_model,
         "selection_model": selection_model,
         "research_summary": selection.get("research_summary", ""),
-        "rejected_examples": selection.get("rejected_examples", []),
+        "story_facts": selection.get("story_facts", []),
+        "rejected_ids": sorted(rejected),
         "sources": selected,
         "research_version": VERSION,
     }
 
+SYSTEM = '''Sen kıdemli bir tarih belgeseli yazarı, hikâye editörü ve
+anlatı yönetmenisin. Yalnız seçilmiş kaynaklara bağlı kal; kaynaklarda olmayan
+kesin ayrıntı uydurma. Metni makale veya ansiklopedi özeti gibi değil, tek bir
+ana soruyu cevaplayan akıcı bir belgesel hikâyesi olarak kur.
 
-
-
-SYSTEM = '''Sen kıdemli tarih belgeseli yazarı ve editörüsün. Yalnız verilen
-araştırma çerçevesine bağlı kal. Kaynakta olmayan kesin ayrıntı uydurma.
-Olayları neden-sonuç ilişkisiyle anlat. Gereksiz şiirsel betimleme, tekrar,
-madde listesi ve genel tarih dersi kullanma. Her paragraf somut biçimde
-görselleştirilebilir kişi, eylem, nesne veya mekân taşısın.'''
+Her bölümde somut bir başlangıç anı, açık bağlam, giderek yükselen engel veya
+gerilim, belirgin dönüm noktası, sonuç ve anlam bulunmalı. Paragraflar birbirine
+neden-sonuç veya zaman bağıyla bağlanmalı. Gereksiz şiirsel betimleme, akademik
+yan tartışma, aynı bilginin tekrarı, madde listesi, soyut dolgu ve genel tarih
+dersi kullanma. Her paragraf ekranda gösterilebilecek kişi, eylem, nesne veya
+mekân taşısın. Anlatıcı sakin, güven veren ve bilgili olsun; fragman, reklam,
+tiyatro veya yapay zekâ metni gibi konuşmasın.'''
 
 
 def source_context(research: dict[str, Any], limit: int = 18000) -> str:
@@ -643,7 +674,23 @@ def generate_script_part_resilient(
 ) -> tuple[str, list[str]]:
     accumulated = ""
     models: list[str] = []
-    tail = " ".join(" ".join(existing_parts).split()[-150:])
+    tail = " ".join(" ".join(existing_parts).split()[-170:])
+
+    if part_index == 1:
+        arc_task = (
+            "Somut bir anla aç; ana soruyu hissettir; kısa bağlamdan sonra "
+            "hikâyeyi harekete geçiren olaya geç."
+        )
+    elif part_index == part_count:
+        arc_task = (
+            "Önceki gerilimi dönüm noktası ve sonuçla çöz; son paragrafta "
+            "konunun kalıcı anlamını tek güçlü fikirle kapat."
+        )
+    else:
+        arc_task = (
+            "Engelleri ve kararları giderek yükselen neden-sonuç zinciriyle "
+            "ilerlet; bir sonraki parçaya açık gerilimle bağlan."
+        )
 
     for attempt in range(1, 4):
         if attempt == 1:
@@ -651,50 +698,74 @@ def generate_script_part_resilient(
                 f"Bu bölümün {part_index}/{part_count}. parçasını "
                 f"{minimum_words}-{maximum_words} Türkçe kelime arasında yaz."
             )
-            continuation_context = ""
+            continuation = ""
         else:
             task = (
-                "Aşağıdaki kısa taslağı tekrar etmeden doğrudan devam ettir ve "
-                f"toplam uzunluğu en az {minimum_words}, tercihen {target_words} "
-                "kelimeye tamamla. Yalnız eklenecek devam metnini yaz."
+                "Kısa kalan taslağı tekrar etmeden doğrudan devam ettir. "
+                f"Toplam uzunluğu en az {minimum_words}, tercihen "
+                f"{target_words} kelimeye tamamla."
             )
-            continuation_context = f"KISA TASLAK:\n{accumulated}\n"
+            continuation = f"KISA TASLAK:\n{accumulated}\n"
 
-        payload, model = gemini.json(SYSTEM, f'''KONU: {topic}
-HİKÂYE ANAYASASI: {bible}
+        payload, model = gemini.json(
+            SYSTEM,
+            f'''KONU: {topic}
+ANA SORU: {bible.get('central_question', '')}
+HİKÂYE OMURGASI: {bible.get('story_spine', {})}
 BÖLÜM: {chapter}
 ÖNCEKİ BÖLÜM ÖZETİ: {previous_summary}
 ÖNCEKİ PARÇALARIN SONU: {tail}
-{continuation_context}
-KAYNAKLAR:\n{source_context(research, 13000)}
+{continuation}
+KAYNAKLAR:
+{source_context(research, 13000)}
 
 GÖREV: {task}
-Geçerli JSON: {{"text":"yalnız anlatıcının okuyacağı akıcı metin"}}
+BU PARÇANIN HİKÂYE İŞLEVİ: {arc_task}
+
+Geçerli JSON:
+{{"text":"yalnız anlatıcının okuyacağı akıcı belgesel metni"}}
+
 Kurallar:
-- Yeni giriş yapma; önceki akıştan devam et.
-- Somut kişi, karar, olay, nesne ve mekân anlat.
-- Kamera komutu, başlık, madde işareti ve kaynak numarası yazma.
-- Aynı cümleyi veya olayı tekrar etme.
-- Nihai parça değilse bölümü erkenden bitirme.''', 0.26)
+- İlk iki cümlede soyut özet değil, kişi/eylem/mekân içeren somut anlatım kullan.
+- Her paragraf önceki paragrafın sonucu veya devamı olsun.
+- Akademik yan tartışmayı ana olay akışının önüne geçirme.
+- Aynı olayı, sıfatı veya giriş cümlesini tekrar etme.
+- Gereksiz mekân tasviri, şiirsel dolgu ve uzun isim listeleri kullanma.
+- Başlık, kamera komutu, madde işareti ve kaynak numarası yazma.''',
+            0.22,
+        )
         piece = " ".join(str(payload.get("text", "")).split())
         models.append(model)
         if piece and not (accumulated and piece in accumulated):
-            accumulated = " ".join(item for item in (accumulated, piece) if item).strip()
+            accumulated = " ".join(
+                item for item in (accumulated, piece) if item
+            ).strip()
         current_words = word_count(accumulated)
         log(
-            f"Senaryo parçası kalite kontrolü: bölüm={chapter['index']} "
+            f"Senaryo parçası: bölüm={chapter['index']} "
             f"parça={part_index}/{part_count} deneme={attempt}/3 "
             f"kelime={current_words} minimum={minimum_words}"
         )
         if current_words >= minimum_words:
-            return trim_to_sentence_word_limit(accumulated, maximum_words), models
+            return trim_to_sentence_word_limit(
+                accumulated,
+                maximum_words,
+            ), models
+
+    if word_count(accumulated) >= max(70, round(minimum_words * 0.72)):
+        log(
+            "FAIL-SOFT SCRIPT PART: parça hedefin altında fakat "
+            "hikâye editörüne gönderilmek üzere korundu."
+        )
+        return trim_to_sentence_word_limit(
+            accumulated,
+            maximum_words,
+        ), models
 
     raise QualityGateError(
-        f"Bölüm {chapter['index']} parça {part_index} üç denemede kısa kaldı: "
-        f"{word_count(accumulated)}/{minimum_words} kelime."
+        f"Bölüm {chapter['index']} parça {part_index} kullanılamayacak "
+        f"kadar kısa: {word_count(accumulated)} kelime."
     )
-
-
 
 def complete_chapter_narration(
     root: Path,
@@ -830,26 +901,170 @@ Kurallar:
 
 
 
-def create_story_bible(topic: str, minutes: int, count: int, research: dict[str, Any], gemini: Gemini) -> dict[str, Any]:
-    payload, model = gemini.json(SYSTEM, f'''KONU: {topic}
-HEDEF: {minutes} dakika, {count} bölüm
-ARAŞTIRMA: {research.get('research_summary', '')}
-KAYNAKLAR:\n{source_context(research)}
+def polish_narration(
+    root: Path,
+    topic: str,
+    bible: dict[str, Any],
+    research: dict[str, Any],
+    chapter: dict[str, Any],
+    narration: str,
+    target_words: int,
+    gemini: Gemini,
+) -> tuple[str, str, list[str]]:
+    directory = chapter_dir(root, int(chapter["index"]))
+    checkpoint = directory / "script-polished.json"
+    saved = read_json(checkpoint)
+    if (
+        isinstance(saved, dict)
+        and saved.get("narrative_version") == PIPELINE_SCHEMA
+        and word_count(saved.get("narration", "")) >= round(target_words * 0.75)
+    ):
+        return (
+            str(saved["narration"]),
+            str(saved.get("model", "checkpoint")),
+            list(saved.get("warnings", [])),
+        )
+
+    warnings: list[str] = []
+    try:
+        payload, model = gemini.json(
+            SYSTEM,
+            f'''KONU: {topic}
+ANA SORU: {bible.get('central_question', '')}
+HİKÂYE OMURGASI: {bible.get('story_spine', {})}
+BÖLÜM: {chapter}
+HEDEF UZUNLUK: yaklaşık {target_words} Türkçe kelime
+KAYNAKLAR:
+{source_context(research, 12000)}
+
+HAM METİN:
+{narration}
+
+Geçerli JSON:
+{{"narration":"baştan sona düzeltilmiş tek parça anlatım"}}
+
+EDITÖR GÖREVİ:
+- Ham metindeki doğru bilgileri koru; yeni kesin bilgi uydurma.
+- Metni baştan sona tek yazarın kaleminden çıkmış gibi akıcı hale getir.
+- İlk 25-40 saniyede somut ve merak uyandıran bir sahne kur.
+- Bağlamı kısa tut; olayları zaman ve neden-sonuç bağıyla ilerlet.
+- Engeller, kararlar ve sonuçlar arasında gerilim yükselsin.
+- Belirgin dönüm noktası ve sonuç bulunsun.
+- Son paragraf ana soruyu cevaplayıp güçlü fakat abartısız bir anlamla kapansın.
+- Tekrarları, uzun coğrafya tartışmalarını, ansiklopedi dilini ve aşırı
+  betimlemeyi çıkar.
+- Başlık, bölüm etiketi, kamera komutu veya kaynak numarası yazma.
+- Metni {round(target_words * 0.82)} ile {round(target_words * 1.08)}
+  kelime arasında tut.''',
+            0.18,
+        )
+        polished = " ".join(
+            str(payload.get("narration", "")).split()
+        ).strip()
+        polished_words = word_count(polished)
+        if not (
+            round(target_words * 0.72)
+            <= polished_words
+            <= round(target_words * 1.16)
+        ):
+            warnings.append(
+                f"polish_length={polished_words}/{target_words}"
+            )
+            raise ValueError("Editör metni güvenli uzunluk aralığı dışında.")
+    except ControlledPause:
+        raise
+    except Exception as exc:
+        log(
+            "NARRATIVE POLISH FAIL-SOFT: ham anlatım korunuyor: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return narration, "original-fallback", [
+            f"polish_failed={type(exc).__name__}"
+        ]
+
+    write_json(checkpoint, {
+        "narration": polished,
+        "words": word_count(polished),
+        "model": model,
+        "warnings": warnings,
+        "narrative_version": PIPELINE_SCHEMA,
+    })
+    log(
+        f"NARRATIVE DIRECTOR: bölüm={chapter['index']} "
+        f"ham={word_count(narration)} kelime "
+        f"final={word_count(polished)} kelime"
+    )
+    return polished, model, warnings
+
+def create_story_bible(
+    topic: str,
+    minutes: int,
+    count: int,
+    research: dict[str, Any],
+    gemini: Gemini,
+) -> dict[str, Any]:
+    payload, model = gemini.json(
+        SYSTEM,
+        f'''KONU: {topic}
+HEDEF: {minutes} dakika
+BÖLÜM SAYISI: {count}
+ARAŞTIRMA ÖZETİ: {research.get('research_summary', '')}
+HİKÂYEDE KORUNACAK OLGULAR: {research.get('story_facts', [])}
+KAYNAKLAR:
+{source_context(research)}
+
 Geçerli JSON:
 {{
- "title":"video başlığı",
- "central_question":"ana soru",
- "timeline":["olay sırası"],
- "continuity_rules":["tutarlılık kuralları"],
- "visual_identity":"tek sinematik dünya",
- "chapters":[{{"index":1,"title":"ad","objective":"görev","must_cover":["olay"],"opening_bridge":"bağ","closing_bridge":"bağ"}}]
+  "title": "güçlü fakat abartısız video başlığı",
+  "central_question": "videonun cevapladığı tek ana soru",
+  "narrative_mode": "chronological|causal|biographical|investigative",
+  "story_spine": {{
+    "cold_open": "ilk 20-35 saniyedeki somut ve merak uyandıran an",
+    "context": "izleyicinin bilmesi gereken kısa bağlam",
+    "inciting_event": "hikâyeyi harekete geçiren olay",
+    "escalation": ["giderek büyüyen engeller veya gelişmeler"],
+    "turning_point": "yönü değiştiren karar veya olay",
+    "climax": "ana sorunun düğümünün çözüldüğü an",
+    "aftermath": "doğrudan sonuç",
+    "reflection": "bugüne kalan anlamı tek güçlü fikirle kapat"
+  }},
+  "timeline": ["yalnız ana hikâye için gerekli olay sırası"],
+  "continuity_rules": ["isim, dönem, mekân ve neden-sonuç tutarlılığı"],
+  "visual_identity": "tek ve tutarlı sinematik tarihsel dünya",
+  "chapters": [
+    {{
+      "index": 1,
+      "title": "bölüm adı",
+      "objective": "bu bölümün hikâyedeki görevi",
+      "opening_bridge": "önceki bölümden doğal geçiş",
+      "must_cover": ["somut kişi, olay, karar ve sonuçlar"],
+      "beats": [
+        {{
+          "type": "hook|context|escalation|turning_point|climax|aftermath|reflection",
+          "event": "somut olay",
+          "purpose": "hikâyedeki işlevi"
+        }}
+      ],
+      "closing_bridge": "sonraki bölüm veya kapanışa doğal bağ"
+    }}
+  ]
 }}
-Tam {count} bölüm üret; tekrar yapma.''', 0.18)
 
-    raw_chapters = payload.get("chapters", [])
-    chapters = [
+Kurallar:
+- Tam {count} bölüm üret.
+- Konuyu makale başlıklarına değil, tek bir hikâye omurgasına böl.
+- İlk bölüm doğrudan somut bir anla açılsın; uzun genel giriş yapma.
+- Olayların sırası anlaşılır olsun; neden olduğu açıklanmadan sonuç söyleme.
+- Yan akademik tartışmaları yalnız ana hikâyeye doğrudan hizmet ediyorsa kullan.
+- Eser veya mitolojik yolculuk anlatılıyorsa, gerçek olay akışını izleyip
+  kahramanın kararlarını, engelleri ve dönüşümünü merkeze al.
+- Aynı olayı iki farklı bölümde tekrar etme.''',
+        0.14,
+    )
+
+    raw_chapters = [
         dict(item)
-        for item in raw_chapters
+        for item in payload.get("chapters", [])
         if isinstance(item, dict)
     ][:count]
     timeline = [
@@ -858,54 +1073,51 @@ Tam {count} bölüm üret; tekrar yapma.''', 0.18)
         if str(item).strip()
     ]
 
-    while len(chapters) < count:
-        index = len(chapters) + 1
-        timeline_item = (
+    while len(raw_chapters) < count:
+        index = len(raw_chapters) + 1
+        event = (
             timeline[index - 1]
             if index - 1 < len(timeline)
-            else f"{topic} anlatısının {index}. aşaması"
+            else f"{topic} anlatısının {index}. ana aşaması"
         )
-        chapters.append({
+        raw_chapters.append({
             "index": index,
-            "title": timeline_item[:90],
-            "objective": (
-                f"{timeline_item} aşamasını neden-sonuç ilişkisiyle anlatmak"
-            ),
-            "must_cover": [timeline_item],
-            "opening_bridge": "Önceki bölümün sonucundan devam eder.",
-            "closing_bridge": "Sonraki tarihsel aşamaya bağlanır.",
+            "title": event[:90],
+            "objective": f"{event} aşamasını neden-sonuç ilişkisiyle anlatmak",
+            "opening_bridge": "",
+            "must_cover": [event],
+            "beats": [{
+                "type": "escalation",
+                "event": event,
+                "purpose": "Ana hikâyeyi ilerletmek",
+            }],
+            "closing_bridge": "",
             "planning_fallback": True,
         })
 
-    for index, chapter in enumerate(chapters, start=1):
+    for index, chapter in enumerate(raw_chapters, start=1):
         chapter["index"] = index
         chapter.setdefault("title", f"Bölüm {index}")
-        chapter.setdefault(
-            "objective",
-            f"{topic} anlatısının {index}. aşamasını açıklamak",
-        )
-        chapter.setdefault("must_cover", [])
+        chapter.setdefault("objective", "")
         chapter.setdefault("opening_bridge", "")
+        chapter.setdefault("must_cover", [])
+        chapter.setdefault("beats", [])
         chapter.setdefault("closing_bridge", "")
 
-    if len(raw_chapters) != count:
-        log(
-            "FAIL-SOFT STORY BIBLE: Gemini bölüm sayısı "
-            f"{len(raw_chapters)}/{count}; yapı otomatik normalleştirildi."
-        )
-
-    payload["chapters"] = chapters
+    payload["chapters"] = raw_chapters
     payload.setdefault("title", topic)
     payload.setdefault("central_question", f"{topic} nasıl gelişti?")
+    payload.setdefault("narrative_mode", "chronological")
+    payload.setdefault("story_spine", {})
     payload.setdefault("timeline", timeline)
     payload.setdefault("continuity_rules", [])
     payload.setdefault(
         "visual_identity",
-        "Tutarlı, gerçekçi ve dönemsel tarih belgeseli estetiği.",
+        "Gerçekçi, tutarlı ve dönemsel tarih belgeseli estetiği.",
     )
     payload["model"] = model
+    payload["narrative_version"] = PIPELINE_SCHEMA
     return payload
-
 
 def chapter_dir(root: Path, index: int) -> Path:
     path = root / "chapters" / f"{index:02d}"
@@ -1015,12 +1227,26 @@ def build_script_checkpoint(
             gemini,
         )
 
+    narration, polish_model, polish_warnings = polish_narration(
+        root,
+        topic,
+        bible,
+        research,
+        chapter,
+        narration,
+        target_words,
+        gemini,
+    )
+
     summary, model = gemini.json(SYSTEM, f'''Aşağıdaki bölümün 90-150 kelimelik
 sonraki bölüm tutarlılık özetini JSON ver: {{"summary":"..."}}\n{narration}''', 0.05)
     write_json(final, {
         "chapter_index": chapter["index"],
         "chapter_title": chapter["title"],
         "narration": narration,
+        "narrative_version": PIPELINE_SCHEMA,
+        "polish_model": polish_model,
+        "polish_warnings": polish_warnings,
         "word_count": word_count(narration),
         "target_words": target_words,
         "soft_minimum_words": soft_minimum,
@@ -1234,6 +1460,10 @@ Kurallar:
 - Genel manzara, rastgele kalabalık ve sembolik nesneyle kaçma.
 - Görsel içinde yazı, sayı, tabela, altyazı, logo, yazıt ve sahte alfabe olmasın.
 - prompt_en tek bir sinematik tarihsel anı açıkça tarif etsin.
+- Her sahne yalnız kendi anlatım parçasını görselleştirsin; önceki veya sonraki
+  olayları aynı kareye doldurma.
+- Art arda iki sahnede aynı kişi kadrajını veya aynı kamera ölçeğini tekrar etme.
+- importance değerini dönüm noktası, ilk sahne ve sonuç sahnesinde key yap.
 - İkinci JSON nesnesi veya açıklama ekleme.'''
 
         model = "deterministic-scene-fallback"
@@ -2008,36 +2238,44 @@ def atempo_chain(factor: float) -> str:
     return f"atempo={factor:.5f}"
 
 
-def normalize_voice(raw: Path, target: Path, words: int, config: dict[str, Any]) -> dict[str, Any]:
+def normalize_voice(
+    raw: Path,
+    target: Path,
+    words: int,
+    config: dict[str, Any],
+) -> dict[str, Any]:
     seconds = ffprobe_duration(raw)
     if seconds < 3.0:
         raise ProviderUnavailable(
-            f"Charon ses dosyası geçersiz veya kesilmiş: {seconds:.2f}s"
+            f"Charon ses dosyası boş veya kesilmiş: {seconds:.2f}s"
         )
 
-    actual = words / max(seconds, 1) * 60
-    requested_tempo = (
-        float(config["target_wpm"])
-        / max(actual, 1.0)
+    actual_wpm = words / max(seconds, 1) * 60
+    requested = float(config["target_wpm"]) / max(actual_wpm, 1.0)
+    tempo = max(
+        float(config.get("minimum_tempo_factor", 0.92)),
+        min(
+            float(config.get("maximum_tempo_factor", 1.06)),
+            requested,
+        ),
     )
-    tempo = max(0.62, min(1.55, requested_tempo))
 
     warnings: list[str] = []
-    if (
-        actual < float(config["minimum_wpm"])
-        or actual > float(config["maximum_wpm"])
-    ):
+    if abs(tempo - requested) > 0.002:
         warnings.append(
-            f"raw_tempo={actual:.1f}_wpm"
+            f"tempo_protected={requested:.3f}->{tempo:.3f}"
         )
-        log(
-            "CHARON FAIL-SOFT TEMPO: ham ses "
-            f"{actual:.1f} WPM; doğal hedefe otomatik ayarlanıyor."
-        )
-    if abs(tempo - requested_tempo) > 0.001:
-        warnings.append(
-            f"tempo_clamped={requested_tempo:.3f}->{tempo:.3f}"
-        )
+
+    audio_filter = ",".join((
+        atempo_chain(tempo),
+        "highpass=f=52",
+        "lowpass=f=10500",
+        "equalizer=f=115:t=q:w=0.8:g=3.2",
+        "equalizer=f=220:t=q:w=1.0:g=1.8",
+        "equalizer=f=3500:t=q:w=1.2:g=-1.2",
+        "acompressor=threshold=-22dB:ratio=2.2:attack=20:release=220:makeup=2",
+        "loudnorm=I=-16:TP=-1.5:LRA=6",
+    ))
 
     run([
         "ffmpeg",
@@ -2045,12 +2283,7 @@ def normalize_voice(raw: Path, target: Path, words: int, config: dict[str, Any])
         "-i",
         str(raw),
         "-af",
-        (
-            f"{atempo_chain(tempo)},"
-            "highpass=f=65,"
-            "lowpass=f=11000,"
-            "loudnorm=I=-17:TP=-2:LRA=7"
-        ),
+        audio_filter,
         "-ar",
         str(config["output_sample_rate"]),
         "-ac",
@@ -2058,52 +2291,176 @@ def normalize_voice(raw: Path, target: Path, words: int, config: dict[str, Any])
         "-c:a",
         "flac",
         str(target),
-    ], 300)
+    ], 360)
 
     final_seconds = ffprobe_duration(target)
     final_wpm = words / max(final_seconds, 1) * 60
     return {
         "raw_seconds": round(seconds, 2),
         "final_seconds": round(final_seconds, 2),
-        "raw_wpm": round(actual, 2),
+        "raw_wpm": round(actual_wpm, 2),
         "final_wpm": round(final_wpm, 2),
         "tempo": round(tempo, 5),
         "warnings": warnings,
         "voice": "Charon",
-        "production_first": True,
+        "voice_master_version": VOICE_MASTER_VERSION,
+        "mastering": "baritone_documentary",
     }
 
+def combine_voice_chunks(
+    files: list[Path],
+    target: Path,
+    config: dict[str, Any],
+) -> None:
+    if not files:
+        raise ProviderUnavailable("Birleştirilecek Charon parçası yok.")
+    if len(files) == 1:
+        shutil.copy2(files[0], target)
+        return
 
-def generate_tts_batch(root: Path, chapter: int, narration: str, config: dict[str, Any], gemini: Gemini, budget: int) -> tuple[int, bool]:
+    command = ["ffmpeg", "-y"]
+    for path in files:
+        command.extend(["-i", str(path)])
+
+    duration = float(config.get("chunk_crossfade_seconds", 0.08))
+    filters: list[str] = []
+    previous = "[0:a]"
+    for index in range(1, len(files)):
+        output = f"[a{index}]"
+        filters.append(
+            f"{previous}[{index}:a]"
+            f"acrossfade=d={duration:.3f}:c1=tri:c2=tri"
+            f"{output}"
+        )
+        previous = output
+
+    command.extend([
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        previous,
+        "-ar",
+        str(config["output_sample_rate"]),
+        "-ac",
+        "1",
+        "-c:a",
+        "flac",
+        str(target),
+    ])
+    run(command, 1200)
+
+def generate_tts_batch(
+    root: Path,
+    chapter: int,
+    narration: str,
+    config: dict[str, Any],
+    gemini: Gemini,
+    budget: int,
+) -> tuple[int, bool]:
     directory = chapter_dir(root, chapter) / "tts"
     directory.mkdir(parents=True, exist_ok=True)
     manifest_file = directory / "manifest.json"
-    manifest = read_json(manifest_file, {"voice": "Charon", "chunks": []})
-    records = {int(item["index"]): item for item in manifest.get("chunks", [])}
-    parts = audio_chunks(narration, int(config["chunk_words"]))
+    manifest = read_json(
+        manifest_file,
+        {"voice": "Charon", "chunks": []},
+    )
+    records = {
+        int(item["index"]): item
+        for item in manifest.get("chunks", [])
+        if isinstance(item, dict) and item.get("index") is not None
+    }
+
+    parts = audio_chunks(
+        narration,
+        int(config["chunk_words"]),
+    )
     used = 0
-    for i, text in enumerate(parts, 1):
-        target = directory / f"chunk-{i:02d}.flac"
-        if i in records and target.exists() and records[i].get("voice") == "Charon":
+
+    for index, chunk_text in enumerate(parts, start=1):
+        target = directory / f"chunk-{index:02d}.flac"
+        old = records.get(index)
+        if (
+            old
+            and target.exists()
+            and old.get("voice") == "Charon"
+            and old.get("voice_master_version") == VOICE_MASTER_VERSION
+        ):
             continue
+
         if used >= budget:
             return used, False
-        raw = directory / f"chunk-{i:02d}-raw.wav"
-        log(f"Charon: bölüm={chapter} parça={i}/{len(parts)}")
-        write_pcm(raw, gemini.tts_pcm(text, str(config["instruction"])))
-        info = normalize_voice(raw, target, word_count(text), config)
-        raw.unlink(missing_ok=True)
-        records[i] = {"index": i, "file": str(target.relative_to(root)), "voice": "Charon", "words": word_count(text), **info}
-        write_json(manifest_file, {"voice": "Charon", "chunks": sorted(records.values(), key=lambda x: x["index"])})
-        used += 1
-    complete = len(records) == len(parts)
-    if complete:
-        concat = directory / "concat.txt"
-        concat.write_text("\n".join(f"file '{(directory / f'chunk-{i:02d}.flac').as_posix()}'" for i in range(1, len(parts)+1)), encoding="utf-8")
-        final = chapter_dir(root, chapter) / "narration.flac"
-        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat), "-c:a", "flac", str(final)], 900)
-    return used, complete
 
+        raw = directory / f"chunk-{index:02d}-raw.wav"
+        log(
+            f"CHARON BARITONE: bölüm={chapter} "
+            f"parça={index}/{len(parts)}"
+        )
+        write_pcm(
+            raw,
+            gemini.tts_pcm(
+                chunk_text,
+                str(config["instruction"]),
+            ),
+        )
+        info = normalize_voice(
+            raw,
+            target,
+            word_count(chunk_text),
+            config,
+        )
+        raw.unlink(missing_ok=True)
+        records[index] = {
+            "index": index,
+            "file": str(target.relative_to(root)),
+            "voice": "Charon",
+            "words": word_count(chunk_text),
+            **info,
+        }
+        write_json(manifest_file, {
+            "voice": "Charon",
+            "voice_master_version": VOICE_MASTER_VERSION,
+            "chunks": sorted(
+                records.values(),
+                key=lambda item: item["index"],
+            ),
+        })
+        used += 1
+
+    valid_records = [
+        records.get(index)
+        for index in range(1, len(parts) + 1)
+    ]
+    complete = all(
+        isinstance(record, dict)
+        and (
+            directory / f"chunk-{index:02d}.flac"
+        ).exists()
+        and record.get("voice_master_version") == VOICE_MASTER_VERSION
+        for index, record in enumerate(valid_records, start=1)
+    )
+
+    if complete:
+        final = chapter_dir(root, chapter) / "narration.flac"
+        combine_voice_chunks(
+            [
+                directory / f"chunk-{index:02d}.flac"
+                for index in range(1, len(parts) + 1)
+            ],
+            final,
+            config,
+        )
+        write_json(
+            chapter_dir(root, chapter) / "voice-report.json",
+            {
+                "voice": "Charon",
+                "voice_master_version": VOICE_MASTER_VERSION,
+                "chunks": len(parts),
+                "seconds": round(ffprobe_duration(final), 2),
+                "style": "tok_dogal_tarih_belgeseli",
+            },
+        )
+
+    return used, complete
 
 def scene_durations(scenes: list[dict[str, Any]], audio_seconds: float) -> list[float]:
     weights = [max(1, word_count(scene["narration"])) for scene in scenes]
@@ -2113,53 +2470,340 @@ def scene_durations(scenes: list[dict[str, Any]], audio_seconds: float) -> list[
     return values
 
 
-def render_chapter(root: Path, chapter: int, scenes: list[dict[str, Any]], config: dict[str, Any]) -> Path:
+def motion_filter(
+    scene_id: int,
+    frames: int,
+    width: int,
+    height: int,
+    fps: int,
+    maximum_zoom: float,
+) -> str:
+    frames = max(2, int(frames))
+    zoom_delta = max(0.000001, (maximum_zoom - 1.0) / frames)
+    mode = scene_id % 4
+
+    denominator = max(1, frames - 1)
+    if mode == 0:
+        x_expr = f"(iw-iw/zoom)*on/{denominator}"
+        y_expr = "(ih-ih/zoom)/2"
+    elif mode == 1:
+        x_expr = f"(iw-iw/zoom)*(1-on/{denominator})"
+        y_expr = "(ih-ih/zoom)/2"
+    elif mode == 2:
+        x_expr = "(iw-iw/zoom)/2"
+        y_expr = f"(ih-ih/zoom)*on/{denominator}"
+    else:
+        x_expr = "(iw-iw/zoom)/2"
+        y_expr = f"(ih-ih/zoom)*(1-on/{denominator})"
+
+    return (
+        f"scale={width + 120}:{height + 68}:"
+        "force_original_aspect_ratio=increase,"
+        f"crop={width + 96}:{height + 54},"
+        f"zoompan=z='min(zoom+{zoom_delta:.9f},{maximum_zoom})':"
+        f"x='{x_expr}':y='{y_expr}':"
+        f"d={frames}:s={width}x{height}:fps={fps},"
+        "eq=contrast=1.025:saturation=1.035,"
+        "format=yuv420p"
+    )
+
+
+def render_main_still(
+    image: Path,
+    target: Path,
+    seconds: float,
+    scene_id: int,
+    first: bool,
+    last: bool,
+    config: dict[str, Any],
+) -> None:
+    fps = int(config["fps"])
+    frames = max(2, round(seconds * fps))
+    filters = [
+        motion_filter(
+            scene_id,
+            frames,
+            int(config["width"]),
+            int(config["height"]),
+            fps,
+            float(config["subtle_zoom"]),
+        )
+    ]
+    if first:
+        filters.append("fade=t=in:st=0:d=0.75")
+    if last and seconds > 1.0:
+        filters.append(
+            f"fade=t=out:st={max(0.0, seconds - 0.85):.3f}:d=0.85"
+        )
+
+    run([
+        "ffmpeg",
+        "-y",
+        "-loop",
+        "1",
+        "-i",
+        str(image),
+        "-vf",
+        ",".join(filters),
+        "-t",
+        f"{seconds:.3f}",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        str(config["preset"]),
+        "-crf",
+        str(config["crf"]),
+        "-r",
+        str(fps),
+        str(target),
+    ], 1800)
+
+
+def transition_name(
+    index: int,
+    total_scenes: int,
+    config: dict[str, Any],
+) -> str:
+    first_act = max(1, round(total_scenes / 3))
+    second_act = max(first_act + 1, round(total_scenes * 2 / 3))
+    if index in {first_act, second_act}:
+        return "fadeblack"
+    transitions = list(
+        config.get(
+            "transitions",
+            ["dissolve", "fade", "smoothleft", "smoothright"],
+        )
+    )
+    return transitions[(index - 1) % len(transitions)]
+
+
+def render_transition(
+    first_image: Path,
+    second_image: Path,
+    target: Path,
+    seconds: float,
+    transition: str,
+    config: dict[str, Any],
+) -> None:
+    width = int(config["width"])
+    height = int(config["height"])
+    fps = int(config["fps"])
+
+    run([
+        "ffmpeg",
+        "-y",
+        "-loop",
+        "1",
+        "-t",
+        f"{seconds:.3f}",
+        "-i",
+        str(first_image),
+        "-loop",
+        "1",
+        "-t",
+        f"{seconds:.3f}",
+        "-i",
+        str(second_image),
+        "-filter_complex",
+        (
+            f"[0:v]scale={width}:{height}:"
+            "force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},format=yuv420p[v0];"
+            f"[1:v]scale={width}:{height}:"
+            "force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},format=yuv420p[v1];"
+            f"[v0][v1]xfade=transition={transition}:"
+            f"duration={seconds:.3f}:offset=0[v]"
+        ),
+        "-map",
+        "[v]",
+        "-t",
+        f"{seconds:.3f}",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        str(config["preset"]),
+        "-crf",
+        str(config["crf"]),
+        "-r",
+        str(fps),
+        str(target),
+    ], 900)
+
+def render_chapter(
+    root: Path,
+    chapter: int,
+    scenes: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> Path:
     directory = chapter_dir(root, chapter)
     target = directory / "chapter.mp4"
-    if target.exists() and ffprobe_duration(target) > 120:
-        return target
-    audio = directory / "narration.flac"
-    manifest = read_json(directory / "visual_manifest.json", [])
-    selected = {int(item["scene_id"]): root / item["selected"] for item in manifest if item.get("accepted")}
-    if len(selected) != len(scenes):
-        raise RuntimeError("Görseller tamamlanmadan render başlatılamaz.")
-    values = scene_durations(scenes, ffprobe_duration(audio))
-    render_dir = directory / "render"
-    render_dir.mkdir(exist_ok=True)
-    clips = []
-    fps, zoom = int(config["fps"]), float(config["subtle_zoom"])
-    for scene, seconds in zip(scenes, values):
-        sid = int(scene["scene_id"])
-        clip = render_dir / f"scene-{sid:03d}.mp4"
-        frames = max(1, round(seconds * fps))
-        zoom_step = max(0.000001, (zoom - 1.0) / frames)
-        run([
-            "ffmpeg", "-y", "-loop", "1", "-i", str(selected[sid]),
-            "-vf",
-            f"scale={config['width']}:{config['height']}:force_original_aspect_ratio=increase,"
-            f"crop={config['width']}:{config['height']},"
-            f"zoompan=z='min(zoom+{zoom_step:.8f},{zoom})':"
-            "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-            f"d={frames}:s={config['width']}x{config['height']}:fps={fps},format=yuv420p",
-            "-t", f"{seconds:.3f}", "-an", "-c:v", "libx264",
-            "-preset", str(config["preset"]), "-crf", str(config["crf"]),
-            "-r", str(fps), str(clip),
-        ], 1500)
-        clips.append(clip)
-    concat = render_dir / "concat.txt"
-    concat.write_text("\n".join(f"file '{clip.as_posix()}'" for clip in clips), encoding="utf-8")
-    silent = render_dir / "silent.mp4"
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat), "-c:v", "copy", str(silent)], 3600)
-    run([
-        "ffmpeg", "-y", "-i", str(silent), "-i", str(audio),
-        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
-        "-c:a", "aac", "-profile:a", "aac_low", "-b:a", str(config["audio_bitrate"]),
-        "-ar", "48000", "-ac", "2", "-shortest", "-movflags", "+faststart", str(target),
-    ], 3600)
-    for item in clips + [silent, concat]:
-        item.unlink(missing_ok=True)
-    return target
+    version_file = directory / "render-version.json"
+    version_info = read_json(version_file, {})
 
+    if (
+        target.exists()
+        and ffprobe_duration(target) > 60
+        and version_info.get("render_version") == EDITORIAL_RENDER_VERSION
+    ):
+        return target
+
+    audio = directory / "narration.flac"
+    manifest = read_json(
+        directory / "visual_manifest.json",
+        [],
+    )
+    selected = {
+        int(item["scene_id"]): root / item["selected"]
+        for item in manifest
+        if item.get("accepted")
+    }
+    if len(selected) != len(scenes):
+        raise RuntimeError(
+            "Görseller tamamlanmadan edit renderı başlatılamaz."
+        )
+
+    audio_seconds = ffprobe_duration(audio)
+    values = scene_durations(scenes, audio_seconds)
+    transition_seconds = float(
+        config.get("transition_seconds", 0.58)
+    )
+    render_dir = directory / "render"
+    shutil.rmtree(render_dir, ignore_errors=True)
+    render_dir.mkdir(exist_ok=True)
+
+    clips: list[Path] = []
+    edit_rows: list[dict[str, Any]] = []
+    total_scenes = len(scenes)
+
+    if total_scenes == 1:
+        main_duration = values[0]
+        main = render_dir / "main-001.mp4"
+        render_main_still(
+            selected[int(scenes[0]["scene_id"])],
+            main,
+            main_duration,
+            1,
+            True,
+            True,
+            config,
+        )
+        clips.append(main)
+    else:
+        for position, (scene, allocated) in enumerate(
+            zip(scenes, values),
+            start=1,
+        ):
+            reduction = (
+                transition_seconds / 2
+                if position in {1, total_scenes}
+                else transition_seconds
+            )
+            main_duration = max(
+                1.2,
+                float(allocated) - reduction,
+            )
+            main = render_dir / f"main-{position:03d}.mp4"
+            render_main_still(
+                selected[int(scene["scene_id"])],
+                main,
+                main_duration,
+                position,
+                position == 1,
+                position == total_scenes,
+                config,
+            )
+            clips.append(main)
+            edit_rows.append({
+                "scene_id": int(scene["scene_id"]),
+                "allocated_seconds": round(float(allocated), 3),
+                "main_seconds": round(main_duration, 3),
+            })
+
+            if position < total_scenes:
+                next_scene = scenes[position]
+                transition = transition_name(
+                    position,
+                    total_scenes,
+                    config,
+                )
+                transition_file = (
+                    render_dir
+                    / f"transition-{position:03d}-{transition}.mp4"
+                )
+                render_transition(
+                    selected[int(scene["scene_id"])],
+                    selected[int(next_scene["scene_id"])],
+                    transition_file,
+                    transition_seconds,
+                    transition,
+                    config,
+                )
+                clips.append(transition_file)
+                edit_rows[-1]["transition_after"] = transition
+                edit_rows[-1]["transition_seconds"] = transition_seconds
+
+    concat = render_dir / "concat.txt"
+    concat.write_text(
+        "\n".join(f"file '{clip.as_posix()}'" for clip in clips),
+        encoding="utf-8",
+    )
+    silent = render_dir / "silent.mp4"
+    run([
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat),
+        "-c:v",
+        "copy",
+        str(silent),
+    ], 5400)
+
+    run([
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(silent),
+        "-i",
+        str(audio),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-profile:a",
+        "aac_low",
+        "-b:a",
+        str(config["audio_bitrate"]),
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(target),
+    ], 5400)
+
+    write_json(version_file, {
+        "render_version": EDITORIAL_RENDER_VERSION,
+        "audio_seconds": round(audio_seconds, 3),
+        "video_seconds": round(ffprobe_duration(target), 3),
+        "transition_seconds": transition_seconds,
+        "edit_rows": edit_rows,
+    })
+
+    shutil.rmtree(render_dir, ignore_errors=True)
+    return target
 
 def assemble_final(root: Path, count: int, config: dict[str, Any]) -> Path:
     deliverables = root / "deliverables"
@@ -2204,9 +2848,46 @@ def clean_project(root: Path, maximum_gb: float) -> dict[str, float]:
     return {"size_gb": round(size, 3), "maximum_gb": maximum_gb}
 
 
+def reset_for_pipeline_upgrade(
+    root: Path,
+    state: dict[str, Any],
+) -> None:
+    previous = state.get("pipeline_schema", "legacy")
+    for path in (
+        root / "research.json",
+        root / "story_bible.json",
+    ):
+        path.unlink(missing_ok=True)
+    shutil.rmtree(root / "chapters", ignore_errors=True)
+    shutil.rmtree(root / "deliverables", ignore_errors=True)
+    state.clear()
+    state.update({
+        "version": VERSION,
+        "pipeline_schema": PIPELINE_SCHEMA,
+        "status": "created",
+        "chapters": {},
+        "migration": {
+            "from": previous,
+            "to": PIPELINE_SCHEMA,
+            "reason": (
+                "Yeni araştırma filtresi, hikâye editörü, tok Charon "
+                "masteringi ve profesyonel geçiş kurgusu"
+            ),
+            "at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ",
+                time.gmtime(),
+            ),
+        },
+    })
+    log(
+        "V11.3 EDITORIAL MIGRATION: eski senaryo/ses/render "
+        "checkpointleri temizlendi; konu baştan profesyonel akışla kuruluyor."
+    )
+
 def state_template(pid: str, topic: str, minutes: int) -> dict[str, Any]:
     return {
         "version": VERSION,
+        "pipeline_schema": PIPELINE_SCHEMA,
         "project_id": pid,
         "topic": topic,
         "minutes": minutes,
@@ -2220,7 +2901,16 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
     max_minutes = int(config["project"]["max_wall_minutes"])
     state_file = root / "state.json"
     state = read_json(state_file, state_template(pid, topic, minutes))
-    state.update({"version": VERSION, "project_id": pid, "topic": topic, "minutes": minutes, "status": "running"})
+    if state.get("pipeline_schema") != PIPELINE_SCHEMA:
+        reset_for_pipeline_upgrade(root, state)
+    state.update({
+        "version": VERSION,
+        "pipeline_schema": PIPELINE_SCHEMA,
+        "project_id": pid,
+        "topic": topic,
+        "minutes": minutes,
+        "status": "running",
+    })
     write_json(state_file, state)
     gemini = Gemini(config["gemini"])
     profile = duration_profile(minutes, config)
@@ -2238,8 +2928,8 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
         f"chapter_hard_min={profile['hard_minimum_chapter_words']}"
     )
     log(
-        "PRODUCTION-FIRST MODE: kalite puanları raporlanır; "
-        "üretilmiş görsel veya ses kalite eşiği nedeniyle işi durdurmaz."
+        "V11.3 EDITORIAL DIRECTOR: güçlü hikâye omurgası, daha sık sahne, "
+        "gerçek geçişler ve tok Charon mastering aktif."
     )
     try:
         research_file = root / "research.json"
@@ -2348,7 +3038,13 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
                     assemble_final(root, chapters, config["render"])
                     state["final"] = "ready"; state["final_seconds"] = round(ffprobe_duration(final), 2)
                     write_json(state_file, state); progress = True; continue
-                state["status"] = "complete"; write_json(state_file, state); break
+                state["status"] = "complete"
+                state["pipeline_schema"] = PIPELINE_SCHEMA
+                (root / "deliverables" / "ERROR_REPORT.txt").unlink(
+                    missing_ok=True
+                )
+                write_json(state_file, state)
+                break
             if not progress:
                 state["status"] = "waiting_for_next_run"; write_json(state_file, state); break
         if state.get("status") == "running":
@@ -2371,7 +3067,7 @@ def run_project(root: Path, pid: str, topic: str, minutes: int, config: dict[str
         report = root / "deliverables" / "ERROR_REPORT.txt"
         report.parent.mkdir(parents=True, exist_ok=True)
         report.write_text(
-            "UYKU VE TARİH V11.2.0 HATA RAPORU\n\n"
+            "UYKU VE TARİH V11.3.0 HATA RAPORU\n\n"
             f"Tür: {type(exc).__name__}\n"
             f"Mesaj: {exc}\n"
             f"Proje: {pid}\n"
